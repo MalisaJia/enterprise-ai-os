@@ -1,0 +1,83 @@
+# Built application files
+*.apk
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
+bin/
+gen/
+out/
+
+# Gradle files
+.gradle/
+build/
+/build
+/*/build/
+
+# Module-specific build dirs
+/wkbase/build
+/wklogin/build
+/wkscan/build
+/wkpush/build
+/wkuikit/build
+
+# Release output
+app/release/
+
+# Bugly 符号表上传工具的产物（buglySymbolAndroid.jar 的工作目录，不是模块）
+/buglybin/
+
+# Local configuration file (sdk path, etc)
+local.properties
+/local.properties
+
+# Android Studio
+*.iml
+.idea/
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Keystore files (keep out of repo)
+*.jks
+*.keystore
+
+# AAR libraries (should use Maven/Gradle dependencies)
+*.aar
+# 例外：AdaptiveCards SDK 自编 AAR（源码 MIT，来自 Teams-AdaptiveCards-Mobile）
+# 因 Microsoft 官方 Maven 二进制走 EULA 禁分发，我们必须自编并入库
+!wkuikit/libs/adaptivecards-*.aar
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+/.vscode
+*.swp
+
+# Google services (may contain API keys)
+google-services.json
+
+# Internal scripts (not part of open source)
+scripts/
+
+# Local dev / agent tooling workspace files (personal, not project-wide)
+/AGENTS.md
+/HEARTBEAT.md
+/IDENTITY.md
+/SOUL.md
+/TOOLS.md
+/USER.md
+/openclaw-workspace-state.json
+/.claude/
+/.kotlin/
+/.octospec/
+/app/prod/

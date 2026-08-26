@@ -1,0 +1,23 @@
+
+.wk-message-system {
+    display: block;
+    box-sizing: border-box;
+    width: fit-content;
+    max-width: 100%;
+    margin: 0 auto;
+    text-align: center;
+    font-size: var(--wk-text-size-xs);
+    font-weight: var(--wk-font-regular);
+    line-height: var(--wk-leading-normal);
+    color: var(--wk-text-tertiary);
+    background: var(--wk-border-subtle);
+    border-radius: min(var(--wk-r-full), var(--wk-r-xl));
+    padding: var(--wk-sp-1) var(--wk-sp-2);
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+.wk-message-approve {
+    margin-left: var(--wk-sp-1);
+    color: var(--wk-text-accent);
+    text-decoration: none;
+}

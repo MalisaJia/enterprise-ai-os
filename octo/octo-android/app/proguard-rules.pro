@@ -1,0 +1,384 @@
+# Add project specific ProGuard rules here.
+# You can control the set of applied configuration files using the
+# proguardFiles setting in build.gradle.
+#
+# For more details, see
+#   http://developer.android.com/guide/developing/tools/proguard.html
+
+# If your project uses WebView with JS, uncomment the following
+# and specify the fully qualified class name to the JavaScript interface
+# class:
+#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
+#   public *;
+#}
+
+# Uncomment this to preserve the line number information for
+# debugging stack traces.
+#-keepattributes SourceFile,LineNumberTable
+
+# If you keep the line number information, uncomment this to
+# hide the original source file name.
+#-renamesourcefileattribute SourceFile
+
+
+-optimizationpasses 5
+
+#包明不混合大小写
+-dontusemixedcaseclassnames
+
+#不去忽略非公共的库类
+-dontskipnonpubliclibraryclasses
+-dontskipnonpubliclibraryclassmembers
+
+# keep 泛型
+-keepattributes Signature
+-keep public class * extends androidx.appcompat.app.AppCompatActivity
+-keep public class * extends androidx.multidex.MultiDexApplication
+-keep public class * extends androidx.fragment.app.Fragment
+-keep public class * extends android.app.Service
+-keep public class * extends android.content.BroadcastReceiver
+-keep public class * extends android.content.ContentProvider
+-keep public class * extends android.app.backup.BackupAgentHelper
+-keep public class * extends android.preference.Preference
+-keep interface android.database.Cursor { *; }
+
+-keep class androidx.databinding.** { *; }
+-keep public class * extends androidx.databinding.DataBinderMapper
+
+# 保持自定义控件类不被混淆
+-keepclassmembers class * extends androidx.appcompat.app.AppCompatActivity{
+    public void *(android.view.View);
+}
+
+# 自定义view
+-keep public class * extends android.view.View{
+        *** get*();
+        void set*(***);
+        public <init>(android.content.Context);
+        public <init>(android.content.Context,android.util.AttributeSet);
+        public <init>(android.content.Context,android.util.AttributeSet,int);
+}
+
+-keep class androidx.appcompat.widget.** { *; }
+
+# 保持native方法不被混淆
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
+
+#枚举不被混淆
+-keepclassmembers enum * {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}
+
+ # 保持Parcelable不被混淆
+-keep class * implements android.os.Parcel {
+    public static final android.os.Parcelable$Creator *;
+}
+-keepclassmembers class * implements android.os.Parcelable{*;}
+
+#xpopu
+-dontwarn com.lxj.xpopup.widget.**
+-keep class com.lxj.xpopup.widget.**{*;}
+
+#okhttp
+-dontwarn okhttp3.**
+-keep class okhttp3.**{*;}
+#okio
+-dontwarn okio.**
+-keep class okio.**{*;}
+
+-keep class * implements java.io.Serializable { *; }
+-keepattributes *Annotation
+-keep class * implements java.lang.annotation.Annotation { *; }
+-keep class com.alibaba.fastjson.* { *; }
+-keep class com.ling.fast.bean** { *; }
+#PictureSelector 2.0
+-keep class com.luck.picture.lib.** { *; }
+#Ucrop
+-dontwarn com.yalantis.ucrop**
+-keep class com.yalantis.ucrop** { *; }
+-keep interface com.yalantis.ucrop** { *; }
+
+# Bugly 符号表还原：保留源文件名和行号，使用标准格式（兼容 R8 8.x）
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
+
+#华为
+-ignorewarnings
+-keepattributes *Annotation*
+-keepattributes Exceptions
+-keepattributes InnerClasses
+-keepattributes Signature
+-keepattributes SourceFile,LineNumberTable
+-keep class com.huawei.updatesdk.**{*;}
+-keep class com.huawei.hms.**{*;}
+-keep class com.huawei.android.hms.agent.**{*;}
+-keep class com.huawei.hianalytics.**{*;}
+
+-keepattributes Signature
+-keepattributes Exceptions
+
+#高德地图
+-keep class com.amap.api.maps.**{*;}
+-keep class com.autonavi.**{*;}
+-keep class com.amap.api.trace.**{*;}
+-keep class com.amap.api.location.**{*;}
+-keep class com.amap.api.fence.**{*;}
+-keep class com.loc.**{*;}
+-keep class com.autonavi.aps.amapapi.model.**{*;}
+-keep class com.amap.api.services.**{*;}
+-keep class com.chat.map.ui.DatasKey { *; }
+
+
+#实体类不需要混淆[需要和网络交换的实体]
+#----------悟空 sdk 数据如果不需要sdk的实体参与网络数据交互就不需要混淆
+-dontwarn com.xinbida.wukongim.**
+-keep class com.xinbida.wukongim.**{*;}
+
+#数据库加密
+-keep,includedescriptorclasses class net.sqlcipher.** { *; }
+-keep,includedescriptorclasses interface net.sqlcipher.** { *; }
+
+#--------- 混淆dh curve25519-------
+-keep class org.whispersystems.curve25519.**{*;}
+-keep class org.whispersystems.** { *; }
+-keep class org.thoughtcrime.securesms.** { *; }
+
+-dontwarn org.xsocket.**
+-keep class org.xsocket.** {*;}
+
+#----------消息 Provider 反射实例化（ChatAdapter / WKMsgItemViewManager）---
+-keepclassmembers class * extends com.chad.library.adapter.base.provider.BaseItemProvider {
+    <init>(...);
+}
+
+#----------UI-------------------
+-keep class com.chat.base.entity.** { *; }
+-keep class com.chat.base.base.** { *; }
+-keep class com.chat.base.net.entity.** { *; }
+-keep class com.chat.base.msg.model.** { *; }
+-keep class com.chat.base.msgcontent.** { *; }
+# 频道内搜索 DTO：CursorList/FileHit/MediaHit/MessageHit/CombinedHit/AroundResult/Pagination
+# 走 FastJson 反射按字段名映射 JSON，不 keep 会被 R8 重命名字段导致反序列化产物类型错乱 → checkcast CCE
+-keep class com.chat.base.search.channel.dto.** { *; }
+# 全局聚合搜索 DTO (L1 _search_global_groups / L2 _search_global_messages)：同上 FastJson 反射映射，
+# release 构建 R8 rename 会导致 L1 groups[] 解析为空/lateinit 崩，PR #95 review 阻塞级。
+-keep class com.chat.base.search.global.dto.** { *; }
+#----------登录模块---------------
+-keep class com.chat.login.entity.** { *; }
+#----------uikit模块--------------
+-keep class com.chat.uikit.category.** { *; }
+-keep class com.chat.uikit.contacts.FriendUIEntity { *; }
+-keep class com.chat.uikit.chat.msgmodel.** { *; }
+-keep class com.chat.uikit.enity.** { *; }
+-keep class com.chat.uikit.thread.service.entity.** { *; }
+-keep class com.chat.uikit.thread.msgmodel.** { *; }
+-keep class com.chat.uikit.sidebar.SidebarItemEntity { *; }
+-keep class com.chat.uikit.sidebar.SidebarSyncResponse { *; }
+-keep class com.chat.uikit.sidebar.FollowModel$FollowSortItem { *; }
+-keep class com.chat.uikit.category.CategoryEntity { *; }
+-keep class com.chat.uikit.category.CategoryEntity$CategoryGroup { *; }
+-keep class com.chat.uikit.group.service.entity.** { *; }
+-keep class com.chat.uikit.group.GroupEntity { *; }
+-keep class com.chat.uikit.group.GroupMemberEntity { *; }
+-keep class com.chat.uikit.message.Ipentity { *; }
+-keep class com.chat.uikit.message.SyncMsg { *; }
+-keep class com.chat.uikit.message.SyncMsgHeader { *; }
+-keep class com.chat.uikit.search.SearchUserEntity { *; }
+-keep class com.chat.uikit.robot.entity.** { *; }
+#----------群管理-----------------
+-keep class com.chat.groupmanage.entity.** { *; }
+#----------文件模块----------------
+-keep class com.chat.file.msgitem.FileContent { *; }
+#----------收藏模块----------------
+-keep class com.chat.favorite.entity.**{ *; }
+#----------扫一扫模块----------------
+-keep class com.chat.scan.entity.** { *; }
+#----------朋友圈模块----------------
+-keep class com.chat.moments.entity.** { *; }
+#----------标签模块------------------
+-keep class com.chat.label.entity.** { *; }
+#----------表情模块------------------
+-keep class com.chat.sticker.entity.** { *; }
+# 自定义贴纸 (uikit) DTO：WKSticker / ListStickerResp / StickerService
+# 走 FastJson 反射按字段名映射 JSON ({"list":[...]})，不 keep 会被 R8 重命名字段
+# 导致 collect / list 反序列化失败 → release 包"添加到我的表情"回调走 onFail
+-keep class com.chat.uikit.chat.sticker.** { *; }
+-keep interface com.chat.uikit.chat.sticker.StickerService { *; }
+# 内置表情 manifest DTO (wkbase)：EmojiManifestResp / EmojiManifestItem
+# GET /v1/common/emojis 走 FastJson 反射按字段名映射 {version, list:[{key,name,url}]}，
+# 不 keep 会被 R8 重命名字段 → 反序列化出空对象 → refreshFromServer 静默失败
+# → 无法应用服务端新增 emoji（同 sticker/search 类型问题的第 3 次踩坑）
+-keep class com.chat.base.emoji.EmojiManifestResp { *; }
+-keep class com.chat.base.emoji.EmojiManifestItem { *; }
+
+#---------AdaptiveCards SDK (SWIG native binding) — 交互式卡片 type=17---------
+# wkuikit/libs/adaptivecards-3.7.0-teams.aar 是 Microsoft 编译的 SWIG C++ 绑定，
+# 1079 个 Java 类 + libadaptivecards-native-lib.so (arm64/armv7/x86)。JNI 侧按类名 /
+# 字段名 (swigCPtr / swigCMemOwn) / 枚举 SwigNext 反查 Java 侧，任何 R8 rename 都会让
+# SDK 崩在：
+#   · SWIG director 回调（C++ 触发 Java 的 ICardActionHandler.onAction 时找不到方法名）
+#   · dynamic_cast 走 SDK 内部反射（OpenUrlAction.dynamic_cast 等）
+#   · enum SwigNext 表被 optimize 后 swigToEnum(int) 返回 null
+# AAR 内**没有** consumer-proguard-rules.txt，必须在这里显式 keep 整包，否则 release
+# 交互式卡片按钮点无反应 / 卡片渲染为空 / native crash SIGSEGV。
+-keep class io.adaptivecards.** { *; }
+-keepclassmembers class io.adaptivecards.** { *; }
+-dontwarn io.adaptivecards.**
+#----------客服------------------
+-keep class com.chat.customerservice.entity.** { *; }
+#----------隐私安全------------------
+-keep class com.chat.security.entity.** { *; }
+#----------旗舰模块------------------
+-keep class com.chat.advanced.entity.** { *; }
+#----------音视频------------------
+-keep class com.chat.rtc.entity.** { *; }
+-keep class owt.**{*;}
+-keep class org.webrtc.**{*;}
+#----------社区------------------
+-keep class com.community.entity.** { *; }
+#----------用户名登录------------------
+-keep class com.chat.wkusernamelogin.entity.**{*;}
+#----------web3------------------
+-keep class com.chat.wkweb3.entity.**{*;}
+#----------工作台------------------
+-keep class com.chat.workplace.entity.**{*;}
+#----------组织架构------------------
+-keep class com.chat.organization.entity.**{*;}
+#----------消息置顶------------------
+-keep class com.chat.pinned.message.entity.**{*;}
+#---------注册邀请模块-------------
+-keep class com.chat.invite.entity.**{*;}
+#---------Space 模块-------------
+-keep class com.chat.uikit.space.**{*;}
+
+#---------智能总结模块-------------
+# 1. com.chat.base.summary.api.*  —  request body 类用 @field:JSONField + FastJson
+#    JSON.toJSONString(value) 反射写出, 字段名混淆会让序列化产物变成 {"a":..,"b":..}
+#    (注解只控制 JSON key, 控制不了 java field name 被读这一步).
+#    Retrofit interface SummaryApiService 的方法注解走 -keepattributes *Annotation*,
+#    但方法本身得在, 否则代理生成失败.
+# 2. com.chat.base.summary.model.*  —  手写 fromJson(JSONObject) 不靠注解反射, 但
+#    data class 的 copy/componentN 内部对字段引用保留即可; 这里全 keep 防御 R8
+#    某些 case 下把未被外部直读的 val 内联掉影响 toJson 出口字段.
+# 3. SummaryEnums (TaskStatus / SourceType 等)  —  raw: Int 由 fromJson 用,
+#    全局 -keepclassmembers enum * { values; valueOf; } 保不到 raw 字段.
+-keep class com.chat.base.summary.** { *; }
+
+# Markwon HeadingSpan.level 反射 (SmartSummaryDetailActivity.applyTypography 拿 level
+# 决定 H1/H2/H3 字号 patch). 当前 fail 路径有 WKLogUtils + 退化到 markwon 默认字号,
+# 但 keep 字段后能保持 1:1 对齐 iOS 字号梯度.
+-keepclassmembers class io.noties.markwon.core.spans.HeadingSpan {
+    int level;
+}
+-dontwarn io.noties.markwon.**
+
+-keep class org.web3j.**{*;}
+-dontwarn org.web3j.**
+
+#---------rxjava retrofit 混淆-----------------
+-dontnote retrofit2.Platform
+-keep class retrofit2.**{}
+-keep class io.reactivex.rxjava3.**{}
+
+# RxJava RxAndroid
+-dontwarn sun.misc.**
+-keepclassmembers class rx.internal.util.unsafe.*ArrayQueue*Field* {
+    long producerIndex;
+    long consumerIndex;
+}
+
+
+#-------------gsy混淆-----------------
+-keep class com.shuyu.gsyvideoplayer.** { *; }
+-keep class com.shuyu.gsyvideoplayer.video.** { *; }
+-dontwarn com.shuyu.gsyvideoplayer.video.**
+-keep class com.shuyu.gsyvideoplayer.video.base.** { *; }
+-dontwarn com.shuyu.gsyvideoplayer.video.base.**
+-keep class com.shuyu.gsyvideoplayer.utils.** { *; }
+-dontwarn com.shuyu.gsyvideoplayer.utils.**
+-keep class tv.danmaku.ijk.** { *; }
+-dontwarn tv.danmaku.ijk.**
+-keep class androidx.media3.** {*;}
+-keep interface androidx.media3.**
+
+-keep class com.shuyu.alipay.** {*;}
+-keep interface com.shuyu.alipay.**
+
+-keep public class * extends android.view.View{
+    *** get*();
+    void set*(***);
+    public <init>(android.content.Context);
+    public <init>(android.content.Context, java.lang.Boolean);
+    public <init>(android.content.Context, android.util.AttributeSet);
+    public <init>(android.content.Context, android.util.AttributeSet, int);
+}
+#--------角标---------
+-keep class me.leolin.shortcutbadger.**{*;}
+#-------------x5webview------------
+-dontwarn dalvik.**
+-dontwarn com.tencent.smtt.**
+
+-keep class com.tencent.smtt.** {
+    *;
+}
+-keep class com.tencent.tbs.** {
+    *;
+}
+-dontwarn com.tencent.bugly.**
+-keep public class com.tencent.bugly.**{*;}
+
+-keep class com.tbruyelle.rxpermissions3.**{*;}
+
+#-------------小米推送-----------
+#这里com.xiaomi.mipushdemo.DemoMessageRreceiver改成app中定义的完整类名
+-keep class com.chat.push.push.XiaoMiMessageReceiver {*;}
+#可以防止一个误报的 warning 导致无法成功编译，如果编译使用的 Android 版本是 23。
+-dontwarn com.xiaomi.push.**
+
+#-----------oppo----------------
+-keep public class * extends android.app.Service
+-keep class com.heytap.msp.** { *;}
+
+#------------FMC---------------
+# 保留Firebase的类和成员不被混淆
+-keep class com.google.firebase.** { *; }
+-keep class org.apache.** { *; }
+-keep class javax.** { *; }
+-keep class uk.** { *; }
+
+# 如果你使用Firebase动态链接或通知等，还需要添加以下规则
+-keep class com.google.firebase.dynamiclinks.** { *; }
+-keep class com.google.firebase.messaging.** { *; }
+
+# 如果你使用Firebase Remote Config
+-keep class com.google.firebase.remoteconfig.** { *; }
+
+# 如果你使用Firebase Crashlytics
+-keep class com.google.firebase.crash.** { *; }
+-keep class com.crashlytics.** { *; }
+-dontwarn com.crashlytics.**
+
+#---------音视频------------------
+-dontwarn org.json.**
+-keep class org.json.** {*;}
+-dontwarn com.google.gson.**
+-keep class com.google.gson.** {*;}
+-dontwarn aidl.**
+-keep class aidl.** { *; }
+-keep class io.socket.** {*;}
+-dontwarn io.socket.**
+
+-keep class com.xinbida.rtc.WKRTCApplication {*;}
+-keep class com.xinbida.rtc.WKRTCCallType {*;}
+-keep class com.xinbida.rtc.utils.WKRTCManager {*;}
+-keep class com.xinbida.rtc.inters.** {*;}
+-keep class owt.** {*;}
+-keep class org.webrtc.** {*;}
+
+-keep public class * implements com.bumptech.glide.module.GlideModule
+-keep public enum com.bumptech.glide.load.resource.bitmap.ImageHeaderParser$** {
+  **[] $VALUES;  public *;
+}

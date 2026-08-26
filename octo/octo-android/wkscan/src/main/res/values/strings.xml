@@ -1,0 +1,18 @@
+<resources>
+    <string name="wk_scan_module_other_result">扫描结果</string>
+    <string name="wk_scan_module_scan">扫一扫</string>
+    <string name="wk_scan_module_scan_no_result">未找到内容</string>
+    <string name="album">相册</string>
+    <string name="tips_scan_code">扫二维码 / 条形码</string>
+    <string name="scan_remove_group">您已被移除该群</string>
+    <string name="scan_join_group_title">加入群聊</string>
+    <string name="scan_join_group_msg">是否加入该群聊？</string>
+    <string name="scan_join_group_confirm">加入</string>
+    <string name="scan_join_group_success">已成功加入群聊</string>
+    <string name="scan_join_group_confirm_full">加入群聊</string>
+    <string name="scan_enter_group">进入群聊</string>
+    <string name="scan_join_group_member_count">%d位成员</string>
+    <string name="scan_join_group_info">群聊信息</string>
+    <!--  Phase 2 · 零 Space 用户扫码入群 need_space 提示 -->
+    <string name="scan_join_group_need_space">请先加入一个 Space 后再加入群聊</string>
+</resources>

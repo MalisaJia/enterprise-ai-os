@@ -1,0 +1,41 @@
+OCTO iOS
+Copyright 2026 MININGLAMP Technology and the OCTO contributors
+
+This product includes software developed by the following projects:
+
+* TangSengDaoDaoiOS
+  https://github.com/TangSengDaoDao/TangSengDaoDaoiOS
+  Copyright TangSengDaoDao contributors
+  Licensed under the Apache License, Version 2.0
+  OCTO iOS is a derivative work with significant modifications.
+
+* WuKongIM
+  https://github.com/WuKongIM/WuKongIM
+  Copyright WuKongIM contributors
+  Licensed under the Apache License, Version 2.0
+  Used as the underlying real-time messaging core via octo-server.
+
+See LICENSE for full license text.
+
+--------------------------------------------------------------------
+Third-party components requiring attribution
+--------------------------------------------------------------------
+
+The OCTO iOS client bundles third-party SDKs and libraries typical for
+a modern native iOS application:
+
+  - Swift standard library (Apache-2.0) — Apple
+  - SDWebImage (MIT) — image caching
+  - SnapKit (MIT) — Auto Layout DSL
+  - Firebase Messaging iOS SDK (Apache-2.0) — Google
+    (BYO-Firebase-project; see overlay/octo-ios/firebase-template.md)
+  - WuKongIM iOS client SDK (Apache-2.0)
+
+A full per-dependency license inventory should be regenerated via
+`pod outdated` / Swift Package Manager before shipping a downstream
+release.
+
+The fork ships with a placeholder Bundle Identifier `com.example.octo`.
+See `README-BUNDLE-ID.md` for the full set of changes needed before
+building, signing, or distributing. Universal Links configuration is
+documented in `universal-link-setup.md`.

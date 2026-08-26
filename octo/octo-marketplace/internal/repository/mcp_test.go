@@ -1,0 +1,513 @@
+//go:build integration
+
+// This file holds DB-backed concurrency tests for the uniqueness lock. They are
+// gated behind the `integration` build tag AND the MARKETPLACE_TEST_MYSQL_DSN
+// environment variable so the default `go test ./...` never needs an external
+// service (AGENTS.md "Tests should not require external services unless marked
+// as integration").
+//
+// Run against the docker-compose MySQL:
+//
+//	docker compose up -d mysql
+//	MARKETPLACE_TEST_MYSQL_DSN='root:root@tcp(127.0.0.1:3306)/marketplace?parseTime=true&multiStatements=true' \
+//	  go test -tags integration ./internal/repository/ -run TestConcurrent -v
+//
+// The suite proves the SELECT ... FOR UPDATE recipe in mcp.go actually blocks
+// concurrent inserts of the same (owner_uid, space_id, name) triple — the
+// property the fake-store unit test in the service package cannot demonstrate.
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"testing"
+	"time"
+
+	marketdb "github.com/Mininglamp-OSS/octo-marketplace/internal/db"
+	"github.com/Mininglamp-OSS/octo-marketplace/internal/id"
+	"github.com/Mininglamp-OSS/octo-marketplace/internal/model"
+)
+
+// openTestDB opens the DSN from MARKETPLACE_TEST_MYSQL_DSN, applies migrations,
+// and returns a ready handle. The test is skipped when the DSN is unset so the
+// tagged suite still no-ops on a machine without MySQL.
+func openTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := os.Getenv("MARKETPLACE_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("MARKETPLACE_TEST_MYSQL_DSN not set; skipping DB-backed concurrency test")
+	}
+	database, err := marketdb.Open(dsn)
+	if err != nil {
+		t.Fatalf("open test db: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+	if _, err := marketdb.RunMigrations(database); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	return database
+}
+
+// cleanTuple removes any prior rows for the (owner, space, name) triple so the
+// test starts from a known-empty state and can be re-run.
+func cleanTuple(t *testing.T, database *sql.DB, owner, space, name string) {
+	t.Helper()
+	if _, err := database.ExecContext(context.Background(),
+		`DELETE FROM mcp_servers WHERE owner_uid = ? AND space_id <=> ? AND name = ?`,
+		owner, nullableString(space), name,
+	); err != nil {
+		t.Fatalf("clean tuple: %v", err)
+	}
+}
+
+func countLive(t *testing.T, database *sql.DB, owner, space, name string) int {
+	t.Helper()
+	var n int
+	if err := database.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM mcp_servers
+		  WHERE owner_uid = ? AND space_id <=> ? AND name = ? AND deleted_at IS NULL`,
+		owner, nullableString(space), name,
+	).Scan(&n); err != nil {
+		t.Fatalf("count live: %v", err)
+	}
+	return n
+}
+
+func newTestMCP(name, owner, space string) *model.MCP {
+	now := time.Now()
+	return &model.MCP{
+		ID:   id.New(),
+		Name: name,
+		// Slug empty → generated column slug_live = NULL → excluded from the
+		// per-Space slug UNIQUE index. Tests that specifically exercise slug
+		// uniqueness set Slug on the returned struct before Create.
+		Slug:          "",
+		Category:      "dev",
+		Visibility:    model.VisibilityPrivate,
+		OwnerUID:      owner,
+		SpaceID:       space,
+		CreatedByType: model.CreatedByHuman,
+		Transport:     model.TransportStdio,
+		Connection:    model.Connection{Command: "npx"},
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+}
+
+// TestConcurrentCreateSameName fires N Create calls for the identical
+// (owner_uid, space_id, name) triple at once and asserts exactly one wins while
+// the rest get ErrNameTaken, and that the table holds exactly one live row.
+// This is the positive concurrency proof the migration comment and doc §7
+// require (no check-then-insert double-insert).
+func TestConcurrentCreateSameName(t *testing.T) {
+	database := openTestDB(t)
+
+	const (
+		owner = "owner-concurrency"
+		space = "space-concurrency"
+		name  = "Concurrent MCP"
+		n     = 16
+	)
+	cleanTuple(t, database, owner, space, name)
+	t.Cleanup(func() { cleanTuple(t, database, owner, space, name) })
+
+	repo := New(database)
+
+	var (
+		start   = make(chan struct{})
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		success int
+		taken   int
+		others  []error
+	)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			m := newTestMCP(name, owner, space) // distinct PK, same uniqueness triple
+			<-start                             // barrier: release all goroutines together
+			err := repo.Create(context.Background(), m)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				success++
+			case errors.Is(err, ErrNameTaken):
+				taken++
+			default:
+				others = append(others, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(others) > 0 {
+		t.Fatalf("unexpected errors from concurrent Create: %v", others)
+	}
+	if success != 1 {
+		t.Fatalf("success=%d want=1 (exactly one create must win)", success)
+	}
+	if taken != n-1 {
+		t.Fatalf("name_taken=%d want=%d", taken, n-1)
+	}
+	if live := countLive(t, database, owner, space, name); live != 1 {
+		t.Fatalf("live rows=%d want=1 (row lock failed to prevent double-insert)", live)
+	}
+}
+
+// TestConcurrentRenameCollision seeds two live records with different names,
+// then fires N Update calls that all rename the second record onto the first's
+// name. Exactly zero renames may succeed (the target name is already live and
+// owned by the same caller), every attempt must return ErrNameTaken, and the
+// original name must remain single-owner.
+func TestConcurrentRenameCollision(t *testing.T) {
+	database := openTestDB(t)
+
+	const (
+		owner    = "owner-rename"
+		space    = "space-rename"
+		nameA    = "Existing MCP"
+		nameB    = "Rename Source MCP"
+		attempts = 12
+	)
+	cleanTuple(t, database, owner, space, nameA)
+	cleanTuple(t, database, owner, space, nameB)
+	t.Cleanup(func() {
+		cleanTuple(t, database, owner, space, nameA)
+		cleanTuple(t, database, owner, space, nameB)
+	})
+
+	repo := New(database)
+	ctx := context.Background()
+
+	if err := repo.Create(ctx, newTestMCP(nameA, owner, space)); err != nil {
+		t.Fatalf("seed A: %v", err)
+	}
+	source := newTestMCP(nameB, owner, space)
+	if err := repo.Create(ctx, source); err != nil {
+		t.Fatalf("seed B: %v", err)
+	}
+
+	var (
+		start   = make(chan struct{})
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		success int
+		taken   int
+		others  []error
+	)
+	wg.Add(attempts)
+	for i := 0; i < attempts; i++ {
+		go func() {
+			defer wg.Done()
+			m := *source
+			m.Name = nameA // collide with the live nameA row
+			m.UpdatedAt = time.Now()
+			<-start
+			err := repo.Update(ctx, &m)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				success++
+			case errors.Is(err, ErrNameTaken):
+				taken++
+			default:
+				others = append(others, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(others) > 0 {
+		t.Fatalf("unexpected errors from concurrent Update: %v", others)
+	}
+	if success != 0 {
+		t.Fatalf("rename success=%d want=0 (target name is live)", success)
+	}
+	if taken != attempts {
+		t.Fatalf("name_taken=%d want=%d", taken, attempts)
+	}
+	if live := countLive(t, database, owner, space, nameA); live != 1 {
+		t.Fatalf("live rows for nameA=%d want=1", live)
+	}
+}
+
+// TestConcurrentCreateSameSlug fires N Create calls that DIFFER by name+id
+// but share the same (space_id, slug) tuple, and asserts the DB UNIQUE
+// index (migration 03) admits exactly one winner. The rest must fail with
+// ErrSlugTaken — proof that the constraint fires and mapDupKey routes the
+// error to the slug family (not the older name family). Same recipe as
+// TestConcurrentCreateSameName, but the collision axis is slug not name.
+func TestConcurrentCreateSameSlug(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDB(t)
+	defer database.Close()
+
+	repo := New(database)
+	space := "space-slug-race"
+	slug := "shared-slug"
+
+	const attempts = 12
+	var (
+		mu      sync.Mutex
+		wg      sync.WaitGroup
+		start   = make(chan struct{})
+		success int
+		taken   int
+		others  []error
+	)
+	for i := 0; i < attempts; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m := newTestMCP(fmt.Sprintf("name-%d", i), fmt.Sprintf("owner-%d", i), space)
+			m.Slug = slug
+			<-start
+			err := repo.Create(ctx, m)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				success++
+			case errors.Is(err, ErrSlugTaken):
+				taken++
+			default:
+				others = append(others, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(others) > 0 {
+		t.Fatalf("unexpected errors: %v", others)
+	}
+	if success != 1 {
+		t.Fatalf("wanted exactly one winner, got success=%d", success)
+	}
+	if taken != attempts-1 {
+		t.Fatalf("slug_taken=%d want=%d", taken, attempts-1)
+	}
+	// One live row with this slug in this Space.
+	var n int
+	if err := database.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM mcp_servers WHERE space_id = ? AND slug = ? AND deleted_at IS NULL`,
+		space, slug,
+	).Scan(&n); err != nil {
+		t.Fatalf("count live: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("live rows with slug=%d want=1", n)
+	}
+}
+
+// TestKeywordSearchCaseInsensitive is the DB-backed regression for the JSON
+// case-sensitivity fix (PR #9 yujiawei P1) — the SQL side must lowercase both
+// operands so mixed-case rows aren't silently dropped. Since tags left the
+// keyword field set (owned by the dedicated tag chip filter), this test now
+// seeds a mixed-case `name` row as the positive case and asserts the previous
+// tag / tools / usage-example rows are NOT returned — search should only
+// match card-visible free-text fields (name / slogan / category / creator).
+func TestKeywordSearchCaseInsensitive(t *testing.T) {
+	database := openTestDB(t)
+	ctx := context.Background()
+	repo := New(database)
+
+	const (
+		owner = "owner-kw-case"
+		space = "space-kw-case"
+	)
+	seed := func(name string, tags []string, tools []model.Tool, examples []string) string {
+		cleanTuple(t, database, owner, space, name)
+		t.Cleanup(func() { cleanTuple(t, database, owner, space, name) })
+		m := newTestMCP(name, owner, space)
+		m.Tags = tags
+		m.Tools = tools
+		m.UsageExamples = examples
+		if err := repo.Create(ctx, m); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+		return m.ID
+	}
+	nameRow := seed("KW Case GitHub Client", nil, nil, nil)
+	tagsRow := seed("KW Case Tag", []string{"GitHub"}, nil, nil)
+	toolNameRow := seed("KW Case ToolName", nil, []model.Tool{{Name: "GitHubSearch", Description: "search"}}, nil)
+	toolDescRow := seed("KW Case ToolDesc", nil, []model.Tool{{Name: "search", Description: "Uses the GitHub API"}}, nil)
+	usageRow := seed("KW Case Usage", nil, nil, []string{"use GitHub CLI"})
+
+	list, _, _, err := repo.List(ctx, ListFilter{
+		CallerUID: owner,
+		SpaceID:   space,
+		Keyword:   "github", // lowercase — every seeded row is mixed case
+		MineOnly:  true,
+		Limit:     50,
+	})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	got := map[string]bool{}
+	for _, m := range list {
+		got[m.ID] = true
+	}
+	if !got[nameRow] {
+		t.Fatalf("case-insensitive keyword search missed name row (id=%s); got=%v", nameRow, got)
+	}
+	for label, id := range map[string]string{
+		"tags_json":           tagsRow,
+		"tools_json.name":     toolNameRow,
+		"tools_json.desc":     toolDescRow,
+		"usage_examples_json": usageRow,
+	} {
+		if got[id] {
+			t.Fatalf("keyword search must not match %s row (id=%s) — search should exclude non-card-visible fields; got=%v", label, id, got)
+		}
+	}
+}
+
+// TestRelevanceSortDoesNotBuryEmptyToolsRows is the DB-backed regression for
+// the JSON_EXTRACT NULL-propagation bug (PR #9 yujiawei P1). Before the fix,
+// an exact name match with an empty tools_json produced a NULL relevance score
+// because JSON_EXTRACT(tools_json, '$[*].name') on '[]' returns SQL NULL,
+// NULL LIKE ? = NULL, and NULL + anything = NULL — collapsing the additive
+// score and sending the row to the bottom of ORDER BY score DESC. Seed one
+// exact-name row without tools and one weaker (slogan-only) match with tools,
+// then assert the exact match sorts above the weaker one under sort=relevance.
+func TestRelevanceSortDoesNotBuryEmptyToolsRows(t *testing.T) {
+	database := openTestDB(t)
+	ctx := context.Background()
+	repo := New(database)
+
+	const (
+		owner = "owner-relevance-empty-tools"
+		space = "space-relevance-empty-tools"
+	)
+
+	exactNoTools := "github kw exact no tools"
+	weakWithTools := "unrelated title"
+	cleanTuple(t, database, owner, space, exactNoTools)
+	cleanTuple(t, database, owner, space, weakWithTools)
+	t.Cleanup(func() {
+		cleanTuple(t, database, owner, space, exactNoTools)
+		cleanTuple(t, database, owner, space, weakWithTools)
+	})
+
+	// Exact name match, no tools → pre-fix this row's relevance score was NULL.
+	strong := newTestMCP(exactNoTools, owner, space)
+	strong.Tools = nil
+	if err := repo.Create(ctx, strong); err != nil {
+		t.Fatalf("seed strong row: %v", err)
+	}
+
+	// Weak (slogan-only) match but with a non-empty tools_json → score stays numeric.
+	weak := newTestMCP(weakWithTools, owner, space)
+	weak.Slogan = "mentions github somewhere"
+	weak.Tools = []model.Tool{{Name: "unrelated", Description: "unrelated"}}
+	if err := repo.Create(ctx, weak); err != nil {
+		t.Fatalf("seed weak row: %v", err)
+	}
+
+	list, _, _, err := repo.List(ctx, ListFilter{
+		CallerUID: owner,
+		SpaceID:   space,
+		Keyword:   "github",
+		Sort:      "relevance",
+		MineOnly:  true,
+		Limit:     50,
+	})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	var strongIdx, weakIdx = -1, -1
+	for i, m := range list {
+		switch m.ID {
+		case strong.ID:
+			strongIdx = i
+		case weak.ID:
+			weakIdx = i
+		}
+	}
+	if strongIdx == -1 || weakIdx == -1 {
+		t.Fatalf("both seeded rows must be in the result: strongIdx=%d weakIdx=%d list=%v", strongIdx, weakIdx, list)
+	}
+	if strongIdx >= weakIdx {
+		t.Fatalf("exact-name-no-tools row (idx=%d) must sort ABOVE the weaker slogan-only-with-tools row (idx=%d) — NULL propagation regression",
+			strongIdx, weakIdx)
+	}
+}
+
+// TestSortUpdatedOrdersByUpdatedAtDesc guards the sort=updated branch (the
+// browse-without-keyword default the marketplace frontend requests). Seed
+// two rows created in the same tick, then bump the second via Update. The
+// second must sort first under sort=updated even though it was created
+// second, because created_at ties on the seed and updated_at is the
+// tie-breaker key.
+func TestSortUpdatedOrdersByUpdatedAtDesc(t *testing.T) {
+	database := openTestDB(t)
+	ctx := context.Background()
+	repo := New(database)
+
+	const (
+		owner = "owner-sort-updated"
+		space = "space-sort-updated"
+	)
+	nameOlder := "older sort-updated row"
+	nameNewer := "newer sort-updated row"
+	cleanTuple(t, database, owner, space, nameOlder)
+	cleanTuple(t, database, owner, space, nameNewer)
+	t.Cleanup(func() {
+		cleanTuple(t, database, owner, space, nameOlder)
+		cleanTuple(t, database, owner, space, nameNewer)
+	})
+
+	older := newTestMCP(nameOlder, owner, space)
+	if err := repo.Create(ctx, older); err != nil {
+		t.Fatalf("seed older: %v", err)
+	}
+	newer := newTestMCP(nameNewer, owner, space)
+	if err := repo.Create(ctx, newer); err != nil {
+		t.Fatalf("seed newer: %v", err)
+	}
+	// Bump the older row's updated_at so it should surface first under
+	// sort=updated. Slogan change is enough to trigger an UPDATE.
+	older.Slogan = "bumped for sort test"
+	older.UpdatedAt = time.Now().Add(time.Second)
+	if err := repo.Update(ctx, older); err != nil {
+		t.Fatalf("bump older: %v", err)
+	}
+
+	list, _, _, err := repo.List(ctx, ListFilter{
+		CallerUID: owner,
+		SpaceID:   space,
+		Sort:      "updated",
+		MineOnly:  true,
+		Limit:     50,
+	})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	var olderIdx, newerIdx = -1, -1
+	for i, m := range list {
+		switch m.ID {
+		case older.ID:
+			olderIdx = i
+		case newer.ID:
+			newerIdx = i
+		}
+	}
+	if olderIdx == -1 || newerIdx == -1 {
+		t.Fatalf("both rows must appear: olderIdx=%d newerIdx=%d", olderIdx, newerIdx)
+	}
+	if olderIdx >= newerIdx {
+		t.Fatalf("bumped older row (idx=%d) must sort ABOVE the newer row (idx=%d) under sort=updated",
+			olderIdx, newerIdx)
+	}
+}

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="line_view_bg">#B0B0B0</color>
+    <color name="chat_face_tab_bg">#ffffff</color>
+    <color name="chat_function_text">#585858</color>
+    <color name="pc_login_bg">#FAFAFA</color>
+    <color name="chat_more_bg">#f6f6f6</color>
+    <color name="category_org_bg">#d0ddfd</color>
+    <color name="category_org_text">#1856e7</color>
+    <color name="category_community_bg">#D0BCF3</color>
+    <color name="category_community_text">#7E51CC</color>
+    <!-- 外部群标识：紫色背景 + 白色文字（对齐  #980 Semi purple） -->
+    <color name="external_group_tag_bg">#722ED1</color>
+    <color name="external_group_tag_text">#FFFFFF</color>
+    <!-- 外部成员标识：紫色背景 + 白色文字（与 AI 紫色 #7761F4 区分） -->
+    <color name="external_member_badge_bg">#9C27B0</color>
+    <color name="external_member_badge_text">#FFFFFF</color>
+    <!-- 「来自 XX」副标题颜色 -->
+    <color name="external_member_source_text">#9C27B0</color>
+    <color name="tab_text_normal">#BBBBBD</color>
+    <color name="tab_text_selected">#1C1C23</color>
+    <color name="tab_bg">#f6f6f6</color>
+
+    <!-- ── Interactive Card (ContentType 17) 语义色 ────────────────────────────
+         AC HostConfig 的 containerStyles 六种风格独立底色 + subtle 文字（全局 color999
+         无夜间值，这里独立）。主文本 / stroke 复用 @color/colorDark / @color/dividerColor，
+         它们已有夜间覆盖。深色值见 values-night/color.xml。 -->
+    <color name="interactive_card_bg">#FFFFFF</color>
+    <color name="interactive_card_bg_emphasis">#EEEEF2</color>
+    <!-- accent 曾用淡紫色 #EBE8FE 强调主区，跟 web 效果图比对后决定回归白底 —— web 视觉是
+         「白底 + 分隔线区隔」而不是「主区色块」，Android 侧对齐后头部 / 主区 / 表单三段在
+         视觉上通过 spacing + hairline 分层，不靠背景色。深色模式同理跟 default 一致。 -->
+    <color name="interactive_card_bg_accent">#FFFFFF</color>
+    <color name="interactive_card_bg_good">#E7FBE9</color>
+    <color name="interactive_card_bg_warning">#FFF8E5</color>
+    <color name="interactive_card_bg_attention">#FFEBEB</color>
+    <color name="interactive_card_text_subtle">#999999</color>
+</resources>

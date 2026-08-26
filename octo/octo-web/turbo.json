@@ -1,0 +1,110 @@
+{
+  "$schema": "https://turborepo.org/schema.json",
+  "tasks": {
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "dev-ele": {
+      "dependsOn": [
+        "^dev"
+      ],
+      "cache": false
+    },
+    "build": {
+      "outputs": [
+        "build/**"
+      ]
+    },
+    "@octo/web#build": {
+      "outputs": [
+        "build/**"
+      ],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "../../pnpm-lock.yaml",
+        "../../packages/dmworkappbot/**",
+        "../../packages/dmworkbase/**",
+        "../../packages/dmworkcontacts/**",
+        "../../packages/dmworkdatasource/**",
+        "../../packages/dmworklogin/**",
+        "../../packages/mail/**",
+        "../../packages/dmworkmcp/**",
+        "../../packages/dmworkskillmarket/**",
+        "../../packages/dmworksummary/**",
+        "!../../packages/**/node_modules/**",
+        "!../../packages/**/build/**",
+        "!../../packages/**/dist/**",
+        "!../../packages/**/coverage/**",
+        "!../../packages/**/.turbo/**"
+      ]
+    },
+    "build-ele": {
+      "outputs": [
+        "dist-ele/**"
+      ],
+      "dependsOn": [
+        "^build"
+      ]
+    },
+    "build-ele:mac": {
+      "outputs": [
+        "dist-ele/**"
+      ],
+      "dependsOn": [
+        "^build"
+      ]
+    },
+    "build-ele:win": {
+      "outputs": [
+        "dist-ele/**"
+      ],
+      "dependsOn": [
+        "^build"
+      ]
+    },
+    "build-ele:linux": {
+      "outputs": [
+        "dist-ele/**"
+      ],
+      "dependsOn": [
+        "^build"
+      ]
+    },
+    "build-ele:linux-arm64": {
+      "outputs": [
+        "dist-ele/**"
+      ],
+      "dependsOn": [
+        "^build"
+      ]
+    },
+    "lint": {
+      "outputs": []
+    },
+    "test": {
+      "outputs": []
+    },
+    "clean": {
+      "dependsOn": [
+        "^clean"
+      ]
+    },
+    "storybook": {
+      "dependsOn": [
+        "^build"
+      ],
+      "cache": false,
+      "persistent": true
+    },
+    "build-storybook": {
+      "dependsOn": [
+        "^build"
+      ],
+      "outputs": [
+        "storybook-static/**"
+      ]
+    }
+  },
+  "ui": "stream"
+}

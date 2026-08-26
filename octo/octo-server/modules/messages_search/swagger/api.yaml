@@ -1,0 +1,850 @@
+swagger: "2.0"
+info:
+  description: |
+    Octo Messages Search API — direct OpenSearch-backed full-text search over
+    historical IM messages, scoped to a single channel. Four endpoints share
+    the request envelope (channel_type / channel_id / filters / sort / cursor)
+    and the cursor-paginated response envelope (data + pagination).
+  version: "1.0.0"
+  title: "Octo Messages Search API"
+host: "api.botgate.cn"
+tags:
+  - name: "messages_search"
+    description: "Messages search (OpenSearch direct)"
+schemes:
+  - "https"
+basePath: "/v1"
+
+securityDefinitions:
+  BearerAuth:
+    type: apiKey
+    name: Authorization
+    in: header
+    description: "Octo session token (`Bearer <token>`)."
+
+paths:
+  /messages/_search:
+    post:
+      tags:
+        - "messages_search"
+      operationId: "message.search"
+      summary: "Search text + mergeForward + rich-text messages (payload.type ∈ [1,11,14])"
+      description: "Full-text search across payload.text.content, payload.richText.searchText, and payload.mergeForward.msgs[].searchText scoped to a single channel; messages of other types (image/voice/video → /_search_media, file → /_search_files) are excluded by a payload.type IN [1, 11, 14] filter. Keyword is optional — when empty the endpoint returns the channel's messages in time order (relevance sort then requires a non-empty keyword). An empty keyword requires at least one filter (sender_ids/sent_at_*); keyword + filter both empty is rejected with 400."
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/SearchMessagesReq"
+      responses:
+        "200":
+          description: "OK"
+          schema:
+            $ref: "#/definitions/CursorList_MessageHit"
+        "400":
+          description: "Validation error"
+          schema:
+            $ref: "#/definitions/Error"
+        "401":
+          description: "Unauthenticated"
+          schema:
+            $ref: "#/definitions/Error"
+        "403":
+          description: "Forbidden"
+          schema:
+            $ref: "#/definitions/Error"
+        "404":
+          description: "Channel not visible / Space rejection"
+          schema:
+            $ref: "#/definitions/Error"
+        "429":
+          description: "Rate limited"
+          schema:
+            $ref: "#/definitions/Error"
+        "500":
+          description: "Internal error"
+          schema:
+            $ref: "#/definitions/Error"
+        "503":
+          description: "Search backend unavailable"
+          schema:
+            $ref: "#/definitions/Error"
+
+  /messages/_search_media:
+    post:
+      tags:
+        - "messages_search"
+      operationId: "message.search_media"
+      summary: "Search media (image + video)"
+      description: "Filter image and video messages in a channel; keyword must be empty."
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/SearchMediaReq"
+      responses:
+        "200":
+          description: "OK"
+          schema:
+            $ref: "#/definitions/CursorList_MediaHit"
+        "400":
+          description: "Validation error"
+          schema:
+            $ref: "#/definitions/Error"
+        "401":
+          description: "Unauthenticated"
+          schema:
+            $ref: "#/definitions/Error"
+        "403":
+          description: "Forbidden"
+          schema:
+            $ref: "#/definitions/Error"
+        "404":
+          description: "Channel not visible / Space rejection"
+          schema:
+            $ref: "#/definitions/Error"
+        "429":
+          description: "Rate limited"
+          schema:
+            $ref: "#/definitions/Error"
+        "500":
+          description: "Internal error"
+          schema:
+            $ref: "#/definitions/Error"
+        "503":
+          description: "Search backend unavailable"
+          schema:
+            $ref: "#/definitions/Error"
+
+  /messages/_search_files:
+    post:
+      tags:
+        - "messages_search"
+      operationId: "message.search_files"
+      summary: "Search files"
+      description: "Filter file messages by optional keyword on file name / caption."
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/SearchFilesReq"
+      responses:
+        "200":
+          description: "OK"
+          schema:
+            $ref: "#/definitions/CursorList_FileHit"
+        "400":
+          description: "Validation error"
+          schema:
+            $ref: "#/definitions/Error"
+        "401":
+          description: "Unauthenticated"
+          schema:
+            $ref: "#/definitions/Error"
+        "403":
+          description: "Forbidden"
+          schema:
+            $ref: "#/definitions/Error"
+        "404":
+          description: "Channel not visible / Space rejection"
+          schema:
+            $ref: "#/definitions/Error"
+        "429":
+          description: "Rate limited"
+          schema:
+            $ref: "#/definitions/Error"
+        "500":
+          description: "Internal error"
+          schema:
+            $ref: "#/definitions/Error"
+        "503":
+          description: "Search backend unavailable"
+          schema:
+            $ref: "#/definitions/Error"
+
+  /messages/_search_all:
+    post:
+      tags:
+        - "messages_search"
+      operationId: "message.search_all"
+      summary: "Search across messages and files"
+      description: "Combined search across text/forward and files in a single channel. Keyword is optional — when empty the endpoint mixes messages and files in time order (relevance sort then requires a non-empty keyword). An empty keyword requires at least one filter (sender_ids/sent_at_*); keyword + filter both empty is rejected with 400."
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/SearchMessagesReq"
+      responses:
+        "200":
+          description: "OK"
+          schema:
+            $ref: "#/definitions/CursorList_SearchAllHit"
+        "400":
+          description: "Validation error"
+          schema:
+            $ref: "#/definitions/Error"
+        "401":
+          description: "Unauthenticated"
+          schema:
+            $ref: "#/definitions/Error"
+        "403":
+          description: "Forbidden"
+          schema:
+            $ref: "#/definitions/Error"
+        "404":
+          description: "Channel not visible / Space rejection"
+          schema:
+            $ref: "#/definitions/Error"
+        "429":
+          description: "Rate limited"
+          schema:
+            $ref: "#/definitions/Error"
+        "500":
+          description: "Internal error"
+          schema:
+            $ref: "#/definitions/Error"
+        "503":
+          description: "Search backend unavailable"
+          schema:
+            $ref: "#/definitions/Error"
+
+  /messages/_search_around:
+    post:
+      tags:
+        - "messages_search"
+      operationId: "message.search_around"
+      summary: "Locate the context window around an anchor message"
+      description: "Returns the chronological window (older + anchor + newer) around a known anchor message in a single channel. The anchor is pre-validated through the same channel-access, Space-scope, and visibility gates as a normal read: a revoked / deleted / cross-Space / not-found anchor returns 404 and no context is fetched."
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/SearchAroundReq"
+      responses:
+        "200":
+          description: "OK"
+          schema:
+            $ref: "#/definitions/AroundResult"
+        "400":
+          description: "Validation error"
+          schema:
+            $ref: "#/definitions/Error"
+        "401":
+          description: "Unauthenticated"
+          schema:
+            $ref: "#/definitions/Error"
+        "403":
+          description: "Forbidden"
+          schema:
+            $ref: "#/definitions/Error"
+        "404":
+          description: "Anchor / channel not visible (also covers cross-Space and revoked anchor)"
+          schema:
+            $ref: "#/definitions/Error"
+        "429":
+          description: "Rate limited"
+          schema:
+            $ref: "#/definitions/Error"
+        "500":
+          description: "Internal error"
+          schema:
+            $ref: "#/definitions/Error"
+        "503":
+          description: "Search backend unavailable / disabled"
+          schema:
+            $ref: "#/definitions/Error"
+
+definitions:
+  SearchAroundReq:
+    type: object
+    required:
+      - channel_type
+      - channel_id
+      - anchor_message_id
+    properties:
+      channel_type:
+        type: integer
+        description: "1=p2p, 2=group, 5=thread."
+      channel_id:
+        type: string
+      anchor_message_id:
+        type: string
+        description: "Decimal-string snowflake id of the anchor message."
+      filters:
+        $ref: "#/definitions/SearchFilters"
+      page_size:
+        type: integer
+        description: "Max hits per wing (before / after), 1-100, default 20."
+  AroundResult:
+    type: object
+    properties:
+      before:
+        type: array
+        description: "Messages older than the anchor, oldest-first."
+        items:
+          $ref: "#/definitions/MessageHit"
+      anchor:
+        $ref: "#/definitions/MessageHit"
+      after:
+        type: array
+        description: "Messages newer than the anchor, oldest-first."
+        items:
+          $ref: "#/definitions/MessageHit"
+      has_more_before:
+        type: boolean
+      has_more_after:
+        type: boolean
+  SearchFilters:
+    type: object
+    properties:
+      sender_ids:
+        type: array
+        items:
+          type: string
+        maxItems: 50
+      sent_at_from:
+        type: string
+        description: "RFC3339 or YYYY-MM-DD; lower bound (inclusive)."
+      sent_at_to:
+        type: string
+        description: "RFC3339 or YYYY-MM-DD; upper bound (inclusive)."
+
+  SearchMessagesReq:
+    type: object
+    required:
+      - channel_type
+      - channel_id
+    properties:
+      channel_type:
+        type: integer
+        enum: [1, 2, 5]
+        description: "1 = DM, 2 = group, 5 = thread."
+      channel_id:
+        type: string
+      keyword:
+        type: string
+        maxLength: 64
+      filters:
+        $ref: "#/definitions/SearchFilters"
+      sort:
+        type: string
+        enum: ["time_desc", "time_asc", "relevance"]
+      page_size:
+        type: integer
+        minimum: 1
+        maximum: 100
+      cursor:
+        type: string
+
+  SearchMediaReq:
+    type: object
+    required:
+      - channel_type
+      - channel_id
+    properties:
+      channel_type:
+        type: integer
+        enum: [1, 2, 5]
+      channel_id:
+        type: string
+      filters:
+        $ref: "#/definitions/SearchFilters"
+      sort:
+        type: string
+        enum: ["time_desc", "time_asc"]
+      page_size:
+        type: integer
+        minimum: 1
+        maximum: 100
+      cursor:
+        type: string
+
+  SearchFilesReq:
+    type: object
+    required:
+      - channel_type
+      - channel_id
+    properties:
+      channel_type:
+        type: integer
+        enum: [1, 2, 5]
+      channel_id:
+        type: string
+      keyword:
+        type: string
+        maxLength: 64
+      filters:
+        $ref: "#/definitions/SearchFilters"
+      sort:
+        type: string
+        enum: ["time_desc", "time_asc", "relevance"]
+      page_size:
+        type: integer
+        minimum: 1
+        maximum: 100
+      cursor:
+        type: string
+
+  Pagination:
+    type: object
+    required:
+      - has_more
+      - next_cursor
+    properties:
+      has_more:
+        type: boolean
+      next_cursor:
+        type: string
+
+  OuterPreview:
+    type: object
+    properties:
+      child_count:
+        type: integer
+
+  InnerMessage:
+    type: object
+    description: |
+      Per-child projection of a forward (type=11) message's inner msgs[].
+      `sender_id` and `sent_at` are omitted while the indexer is still
+      writing the contract-v0 shape (only message_id / type / search_text).
+      Once the indexer fills msgs[].from / msgs[].timestamp, both fields
+      surface automatically — clients must tolerate either shape.
+    required:
+      - message_id
+      - type
+    properties:
+      message_id:
+        type: string
+      type:
+        type: integer
+        description: "Inner payload content type (1=text, 8=file, ...)."
+      search_text:
+        type: string
+      sender_id:
+        type: string
+      sender_name:
+        type: string
+      sent_at:
+        type: string
+        format: date-time
+
+  MessageHit:
+    type: object
+    required:
+      - message_id
+      - message_seq
+      - message_kind
+      - sender_id
+      - sent_at
+      - channel_id
+    properties:
+      message_id:
+        type: string
+      message_seq:
+        type: integer
+        format: int64
+      message_kind:
+        type: string
+        enum: ["text", "forward", "image", "video"]
+        description: |
+          Classification of the hit's renderable kind. "image" / "video" only
+          appear on /_search_all browse mode (empty keyword) and on
+          /_search_around, where the response includes media docs alongside
+          text/forward. The keyword-bearing /_search and /_search_all paths
+          stay limited to "text" / "forward".
+      snippet:
+        type: string
+      sender_id:
+        type: string
+      sender_name:
+        type: string
+      sender_avatar_url:
+        type: string
+        format: uri
+      sent_at:
+        type: string
+        format: date-time
+      outer_preview:
+        $ref: "#/definitions/OuterPreview"
+      inner_messages:
+        type: array
+        description: |
+          Forward-card child messages, only emitted when message_kind=forward
+          and the OS doc carries a non-empty payload.mergeForward.msgs[].
+          Omitted entirely (not "[]") on text hits or when msgs[] is missing.
+        items:
+          $ref: "#/definitions/InnerMessage"
+      channel_id:
+        type: string
+      thumb_url:
+        type: string
+        format: uri
+        description: |
+          Image/video thumbnail (mirrors MediaHit.thumb_url). Only present
+          when message_kind ∈ ["image", "video"] — i.e. on /_search_all
+          browse mode (no keyword) and /_search_around media hits. Omitted
+          on text / forward hits.
+      video_url:
+        type: string
+        format: uri
+        description: |
+          Video playback URL (mirrors MediaHit.video_url; distinct from the
+          poster/cover surfaced via thumb_url). Only present when
+          message_kind="video" — i.e. on /_search_all browse mode (no
+          keyword) and /_search_around video hits. Omitted on image / text /
+          forward hits.
+      width:
+        type: integer
+        description: |
+          Image/video pixel width (mirrors MediaHit.width). Only present
+          when message_kind ∈ ["image", "video"] — i.e. on /_search_all
+          browse mode (no keyword) and /_search_around media hits. Omitted
+          on text / forward hits.
+      height:
+        type: integer
+        description: |
+          Image/video pixel height (mirrors MediaHit.height). Only present
+          when message_kind ∈ ["image", "video"] — i.e. on /_search_all
+          browse mode (no keyword) and /_search_around media hits. Omitted
+          on text / forward hits.
+      duration_ms:
+        type: integer
+        format: int64
+        description: |
+          Video duration in milliseconds (mirrors MediaHit.duration_ms).
+          Only present when message_kind="video" — i.e. on /_search_all
+          browse mode (no keyword) and /_search_around video hits. Omitted
+          on image / text / forward hits.
+      rich_text:
+        $ref: "#/definitions/RichTextDetail"
+        description: |
+          Typed projection of a payload.type=14 rich-text message, extracted
+          from the indexer-preserved `_source.payloadRaw` blob. Emitted ONLY
+          when the hit is rich-text AND payloadRaw is present; older docs
+          (indexed before the field existed) leave it absent and the client
+          falls back to `snippet`. message_kind stays "text" on rich-text
+          hits so the swagger enum is unchanged.
+
+  MediaHit:
+    type: object
+    required:
+      - message_id
+      - message_seq
+      - media_kind
+      - sender_id
+      - sent_at
+      - month_bucket
+    properties:
+      message_id:
+        type: string
+      message_seq:
+        type: integer
+        format: int64
+      media_kind:
+        type: string
+        enum: ["image", "video"]
+      thumb_url:
+        type: string
+        format: uri
+      video_url:
+        type: string
+        format: uri
+        description: |
+          Video playback URL, distinct from the poster/cover surfaced via
+          thumb_url. Only present when media_kind="video". Omitted on image
+          hits.
+      width:
+        type: integer
+      height:
+        type: integer
+      duration_ms:
+        type: integer
+        format: int64
+      sender_id:
+        type: string
+      sender_name:
+        type: string
+      sent_at:
+        type: string
+        format: date-time
+      month_bucket:
+        type: string
+
+  FileHit:
+    type: object
+    required:
+      - message_id
+      - message_seq
+      - file_name
+      - preview_url
+      - sender_id
+      - sent_at
+    properties:
+      message_id:
+        type: string
+      message_seq:
+        type: integer
+        format: int64
+      file_name:
+        type: string
+      file_size_bytes:
+        type: integer
+        format: int64
+      file_ext:
+        type: string
+      download_url:
+        type: string
+        format: uri
+      preview_url:
+        type: string
+        format: uri
+        x-nullable: true
+      sender_id:
+        type: string
+      sender_name:
+        type: string
+      sender_avatar_url:
+        type: string
+        format: uri
+      sent_at:
+        type: string
+        format: date-time
+
+  SearchAllHit:
+    type: object
+    required:
+      - result_type
+      - sorted_at
+    properties:
+      result_type:
+        type: string
+        enum: ["message", "file"]
+      sorted_at:
+        type: string
+        format: date-time
+      message:
+        $ref: "#/definitions/MessageHit"
+      file:
+        $ref: "#/definitions/FileHit"
+
+  RichTextDetail:
+    type: object
+    description: |
+      Typed projection of a payload.type=14 rich-text message payload,
+      mirroring the channel/sync rendering contract. Returned under
+      MessageHit.rich_text on rich-text hits whose OS source preserved the
+      original `payloadRaw` blob.
+    required:
+      - content
+    properties:
+      content:
+        type: array
+        description: |
+          Ordered blocks (text / image / file). Block order is the rendered
+          interleave order. Legacy docs with a string `content` are normalised
+          into a single `{type:"text", text:<s>}` block server-side.
+        items:
+          $ref: "#/definitions/RichTextBlock"
+      plain:
+        type: string
+        description: |
+          Server-authoritative plain-text projection of the blocks (with
+          `[图片]` / `[文件]` placeholders), used for quote previews, copy
+          fallback, summarisation, etc. Distinct from the search-side
+          `snippet` — `snippet` is the highlight fragment, `plain` is the
+          payload's own plain string.
+      mention:
+        $ref: "#/definitions/RichTextMention"
+
+  RichTextBlock:
+    type: object
+    required:
+      - type
+    properties:
+      type:
+        type: string
+        description: |
+          Block kind. "text" / "image" / "file" today; renderers must tolerate
+          unknown values (forward-compatible — future block kinds may appear
+          without an API bump).
+      text:
+        type: string
+        description: "Text content (text block)."
+      url:
+        type: string
+        description: |
+          Resource reference (image src / file download). Passed through
+          verbatim from the payload — clients are responsible for resolving it
+          via the auth-aware file URL pipeline.
+      width:
+        type: integer
+        description: "Image width in pixels (image block)."
+      height:
+        type: integer
+        description: "Image height in pixels (image block)."
+      size:
+        type: integer
+        format: int64
+        description: "File size in bytes (file block; optional on image)."
+      name:
+        type: string
+        description: "Original filename / image alt text."
+      extension:
+        type: string
+        description: "File extension (file block) for icon / badge rendering."
+      mime:
+        type: string
+        description: "MIME type (file block, forward-compat)."
+      caption:
+        type: string
+        description: "Inline caption for image / file blocks."
+
+  RichTextMention:
+    type: object
+    description: |
+      @-mention metadata for a rich-text message. Absent when the payload
+      carries no mentions.
+    properties:
+      entities:
+        type: array
+        items:
+          $ref: "#/definitions/RichTextMentionEntity"
+      all:
+        type: integer
+        description: "Legacy @-all flag (compat with the per-channel @all)."
+      humans:
+        type: integer
+        description: "@all-humans tri-state flag."
+      ais:
+        type: integer
+        description: "@all-AIs tri-state flag."
+
+  RichTextMentionEntity:
+    type: object
+    required:
+      - uid
+      - offset
+      - length
+    properties:
+      uid:
+        type: string
+      offset:
+        type: integer
+        description: "Rune offset into the surrounding text block."
+      length:
+        type: integer
+        description: "Rune length of the @-anchor in the surrounding text."
+
+  CursorList_MessageHit:
+    type: object
+    required:
+      - data
+      - pagination
+    properties:
+      data:
+        type: array
+        items:
+          $ref: "#/definitions/MessageHit"
+      pagination:
+        $ref: "#/definitions/Pagination"
+
+  CursorList_MediaHit:
+    type: object
+    required:
+      - data
+      - pagination
+    properties:
+      data:
+        type: array
+        items:
+          $ref: "#/definitions/MediaHit"
+      pagination:
+        $ref: "#/definitions/Pagination"
+
+  CursorList_FileHit:
+    type: object
+    required:
+      - data
+      - pagination
+    properties:
+      data:
+        type: array
+        items:
+          $ref: "#/definitions/FileHit"
+      pagination:
+        $ref: "#/definitions/Pagination"
+
+  CursorList_SearchAllHit:
+    type: object
+    required:
+      - data
+      - pagination
+    properties:
+      data:
+        type: array
+        items:
+          $ref: "#/definitions/SearchAllHit"
+      pagination:
+        $ref: "#/definitions/Pagination"
+
+  ErrorBody:
+    type: object
+    required:
+      - code
+      - message
+    properties:
+      code:
+        type: string
+        description: "i18n code id (e.g. err.server.messages_search.validation_failed)."
+      message:
+        type: string
+      details:
+        type: object
+        additionalProperties: true
+      hint:
+        type: string
+      http_status:
+        type: integer
+
+  Error:
+    type: object
+    required:
+      - error
+    properties:
+      error:
+        $ref: "#/definitions/ErrorBody"

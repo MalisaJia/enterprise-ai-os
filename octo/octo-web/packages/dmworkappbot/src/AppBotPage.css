@@ -1,0 +1,35 @@
+.appbot-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: var(--wk-bg-surface);
+}
+
+.appbot-chat-wrap {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.appbot-toast {
+  position: fixed;
+  top: var(--wk-sp-4);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: var(--wk-z-toast);
+  padding: var(--wk-sp-2) var(--wk-sp-4);
+  border-radius: var(--wk-r-sm);
+  font-size: var(--wk-text-size-base);
+  font-weight: var(--wk-font-medium);
+  color: var(--wk-color-error);
+  background: var(--wk-color-error-bg);
+  border: 1px solid var(--wk-color-danger-border);
+  box-shadow: var(--wk-shadow-md);
+  opacity: 0;
+  transition: opacity var(--wk-dur) var(--wk-ease);
+}
+
+.appbot-toast-visible {
+  opacity: 1;
+}

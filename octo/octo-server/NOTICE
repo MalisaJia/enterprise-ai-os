@@ -1,0 +1,108 @@
+OCTO Server
+Copyright 2026 MININGLAMP Technology and the OCTO contributors
+
+This product includes software developed by the following projects:
+
+* TangSengDaoDaoServer
+  https://github.com/TangSengDaoDao/TangSengDaoDaoServer
+  Copyright TangSengDaoDao contributors
+  Licensed under the Apache License, Version 2.0
+  OCTO Server is a derivative work with significant modifications.
+
+* WuKongIM
+  https://github.com/WuKongIM/WuKongIM
+  Copyright WuKongIM contributors
+  Licensed under the Apache License, Version 2.0
+  Used as the underlying real-time messaging core.
+
+See LICENSE for full license text.
+
+--------------------------------------------------------------------
+Third-party Go module dependencies requiring attribution
+--------------------------------------------------------------------
+
+The following direct dependencies are licensed under Apache 2.0:
+  - firebase.google.com/go (Google)
+  - github.com/prometheus/client_golang
+  - github.com/coreos/go-oidc
+  - github.com/minio/minio-go
+  - google.golang.org/grpc, protobuf, api
+  - go.opencensus.io
+
+The following direct dependencies are licensed under MPL-2.0:
+  - github.com/hashicorp/errwrap
+  - github.com/hashicorp/go-multierror
+  - github.com/hashicorp/hcl
+
+Other direct dependencies use permissive licenses (MIT / BSD-2 / BSD-3 / ISC):
+  - github.com/gin-gonic/gin, spf13/viper, spf13/cast
+  - github.com/go-redis/redis, go-sql-driver/mysql, gocraft/dbr
+  - github.com/rubenv/sql-migrate, mattn/go-sqlite3
+  - github.com/sideshow/apns2, sendgrid/rest
+  - github.com/tencentyun/qcloud-cos-sts-sdk, aliyun/aliyun-oss-go-sdk
+  - github.com/qiniu/go-sdk, alibabacloud-go/*
+  - github.com/olivere/elastic, disintegration/imaging
+  - github.com/sourcegraph/syntaxhighlight, gomarkdown/markdown
+  - github.com/btcsuite/btcd/btcec (ISC) — secp256k1 signature verification
+  - github.com/ethereum/go-ethereum was previously used but has been
+    removed (originally LGPL-3.0) in favor of btcec/v2.
+  - go.uber.org/zap, opentracing-go
+  - golang.org/x/crypto, golang.org/x/oauth2, golang.org/x/sync, etc.
+
+For the exhaustive module-by-module license inventory, run
+`go-licenses csv ./...` or inspect each upstream's LICENSE file
+via `go.sum`.
+
+--------------------------------------------------------------------
+Lucide git-branch icon
+--------------------------------------------------------------------
+
+OCTO Server includes a modified copy of the git-branch SVG from Lucide
+0.577.0:
+  https://github.com/lucide-icons/lucide/blob/0.577.0/icons/git-branch.svg
+
+The copy is minified and URL-encoded, changes width and height from 24px to
+16px, and replaces currentColor with the fixed neutral stroke #6b7075.
+
+ISC License
+
+Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2026 as part of Feather (MIT). All other copyright (c) for Lucide are held by Lucide Contributors 2026.
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+---
+
+The MIT License (MIT) (for portions derived from Feather)
+
+Copyright (c) 2013-2026 Cole Bemis
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Frontend clients (octo-web) bundle
+additional UI and platform SDKs; see each client repository's NOTICE.

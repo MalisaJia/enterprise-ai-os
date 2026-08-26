@@ -1,0 +1,195 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "octo.fullname" . }}-misc
+  labels:
+    {{- include "octo.labels" . | nindent 4 }}
+data:
+  minio-octo-app-policy.json: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "OctoAppBucketReadWrite",
+          "Effect": "Allow",
+          "Action": [
+            "s3:GetBucketLocation",
+            "s3:ListBucket",
+            "s3:ListBucketMultipartUploads"
+          ],
+          "Resource": [
+            "arn:aws:s3:::file",
+            "arn:aws:s3:::chat",
+            "arn:aws:s3:::moment",
+            "arn:aws:s3:::sticker",
+            "arn:aws:s3:::report",
+            "arn:aws:s3:::chatbg",
+            "arn:aws:s3:::common",
+            "arn:aws:s3:::download",
+            "arn:aws:s3:::group",
+            "arn:aws:s3:::avatar"{{- if .Values.docs.enabled }},
+            "arn:aws:s3:::octo-docs-attachments"{{- end }}{{- if .Values.marketplace.enabled }},
+            "arn:aws:s3:::marketplace"{{- end }}
+          ]
+        },
+        {
+          "Sid": "OctoAppObjectReadWrite",
+          "Effect": "Allow",
+          "Action": [
+            "s3:GetObject",
+            "s3:PutObject",
+            "s3:DeleteObject",
+            "s3:AbortMultipartUpload",
+            "s3:ListMultipartUploadParts"
+          ],
+          "Resource": [
+            "arn:aws:s3:::file/*",
+            "arn:aws:s3:::chat/*",
+            "arn:aws:s3:::moment/*",
+            "arn:aws:s3:::sticker/*",
+            "arn:aws:s3:::report/*",
+            "arn:aws:s3:::chatbg/*",
+            "arn:aws:s3:::common/*",
+            "arn:aws:s3:::download/*",
+            "arn:aws:s3:::group/*",
+            "arn:aws:s3:::avatar/*"{{- if .Values.docs.enabled }},
+            "arn:aws:s3:::octo-docs-attachments/*"{{- end }}{{- if .Values.marketplace.enabled }},
+            "arn:aws:s3:::marketplace/*"{{- end }}
+          ]
+        }
+      ]
+    }
+
+  init-extra-dbs.sh: |
+    #!/bin/bash
+    # Runs inside MySQL's docker-entrypoint-initdb.d on first volume init.
+    # Creates extra schemas and service-account users for octo-matter + smart-summary.
+    set -euo pipefail
+
+    : "${OCTO_MATTER_DB_PASSWORD:=matter}"
+    : "${OCTO_SUMMARY_DB_PASSWORD:=summary}"
+    : "${OCTO_SUMMARY_READER_PASSWORD:=summary_reader}"
+    {{- if .Values.speech.enabled }}
+    : "${OCTO_SPEECH_DB_PASSWORD:=speech}"
+    {{- end }}
+    {{- if .Values.docs.enabled }}
+    : "${OCTO_DOCS_DB_PASSWORD:=docs}"
+    {{- end }}
+    {{- if .Values.marketplace.enabled }}
+    : "${OCTO_MARKETPLACE_DB_PASSWORD:=marketplace}"
+    {{- end }}
+    : "${MYSQL_DATABASE:=octo}"
+
+    validate_password() {
+      local name="$1" value="$2"
+      if [ -z "$value" ]; then
+        echo "[init-extra-dbs] FATAL: $name is empty" >&2; exit 1
+      fi
+      case "$value" in
+        *[!A-Za-z0-9._-]*)
+          echo "[init-extra-dbs] FATAL: $name contains characters outside [A-Za-z0-9._-]" >&2; exit 1 ;;
+      esac
+      local lc; lc=$(printf %s "$value" | tr 'A-Z' 'a-z')
+      case "$lc" in
+        change_me_*|chg_me*)
+          echo "[init-extra-dbs] FATAL: $name is still a CHANGE_ME placeholder." >&2; exit 1 ;;
+      esac
+    }
+
+    reject_literal_default() {
+      local name="$1" value="$2" default="$3"
+      if [ "$value" = "$default" ]; then
+        echo "[init-extra-dbs] FATAL: $name is still the literal default ('$default')." >&2; exit 1
+      fi
+    }
+
+    validate_identifier() {
+      local name="$1" value="$2"
+      if [ -z "$value" ]; then
+        echo "[init-extra-dbs] FATAL: $name is empty" >&2; exit 1
+      fi
+      case "$value" in
+        *[!A-Za-z0-9_]*)
+          echo "[init-extra-dbs] FATAL: $name contains characters outside [A-Za-z0-9_]" >&2; exit 1 ;;
+      esac
+    }
+
+    validate_password  OCTO_MATTER_DB_PASSWORD       "$OCTO_MATTER_DB_PASSWORD"
+    validate_password  OCTO_SUMMARY_DB_PASSWORD      "$OCTO_SUMMARY_DB_PASSWORD"
+    validate_password  OCTO_SUMMARY_READER_PASSWORD  "$OCTO_SUMMARY_READER_PASSWORD"
+    {{- if .Values.speech.enabled }}
+    validate_password  OCTO_SPEECH_DB_PASSWORD       "$OCTO_SPEECH_DB_PASSWORD"
+    {{- end }}
+    {{- if .Values.docs.enabled }}
+    validate_password  OCTO_DOCS_DB_PASSWORD         "$OCTO_DOCS_DB_PASSWORD"
+    {{- end }}
+    {{- if .Values.marketplace.enabled }}
+    validate_password  OCTO_MARKETPLACE_DB_PASSWORD  "$OCTO_MARKETPLACE_DB_PASSWORD"
+    {{- end }}
+    reject_literal_default OCTO_MATTER_DB_PASSWORD       "$OCTO_MATTER_DB_PASSWORD"      "matter"
+    reject_literal_default OCTO_SUMMARY_DB_PASSWORD      "$OCTO_SUMMARY_DB_PASSWORD"     "summary"
+    reject_literal_default OCTO_SUMMARY_READER_PASSWORD  "$OCTO_SUMMARY_READER_PASSWORD" "summary_reader"
+    {{- if .Values.speech.enabled }}
+    reject_literal_default OCTO_SPEECH_DB_PASSWORD       "$OCTO_SPEECH_DB_PASSWORD"      "speech"
+    {{- end }}
+    {{- if .Values.docs.enabled }}
+    reject_literal_default OCTO_DOCS_DB_PASSWORD         "$OCTO_DOCS_DB_PASSWORD"        "docs"
+    {{- end }}
+    {{- if .Values.marketplace.enabled }}
+    reject_literal_default OCTO_MARKETPLACE_DB_PASSWORD  "$OCTO_MARKETPLACE_DB_PASSWORD" "marketplace"
+    {{- end }}
+    validate_password  MYSQL_ROOT_PASSWORD            "$MYSQL_ROOT_PASSWORD"
+    validate_identifier MYSQL_DATABASE               "$MYSQL_DATABASE"
+
+    MYSQL_PWD="${MYSQL_ROOT_PASSWORD}" mysql -u root <<SQL
+    CREATE DATABASE IF NOT EXISTS octo_matter  CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+    CREATE DATABASE IF NOT EXISTS octo_summary CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+    {{- if .Values.speech.enabled }}
+    CREATE DATABASE IF NOT EXISTS octo_speech  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    {{- end }}
+    {{- if .Values.docs.enabled }}
+    CREATE DATABASE IF NOT EXISTS octo_docs    CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+    {{- end }}
+    {{- if .Values.marketplace.enabled }}
+    CREATE DATABASE IF NOT EXISTS octo_marketplace CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+    {{- end }}
+
+    CREATE USER IF NOT EXISTS 'matter'@'%'  IDENTIFIED BY '${OCTO_MATTER_DB_PASSWORD}';
+    ALTER USER IF EXISTS      'matter'@'%'  IDENTIFIED BY '${OCTO_MATTER_DB_PASSWORD}';
+    CREATE USER IF NOT EXISTS 'summary'@'%' IDENTIFIED BY '${OCTO_SUMMARY_DB_PASSWORD}';
+    ALTER USER IF EXISTS      'summary'@'%' IDENTIFIED BY '${OCTO_SUMMARY_DB_PASSWORD}';
+
+    CREATE USER IF NOT EXISTS 'summary_reader'@'%' IDENTIFIED BY '${OCTO_SUMMARY_READER_PASSWORD}';
+    ALTER USER IF EXISTS      'summary_reader'@'%' IDENTIFIED BY '${OCTO_SUMMARY_READER_PASSWORD}';
+    {{- if .Values.speech.enabled }}
+
+    CREATE USER IF NOT EXISTS 'speech'@'%' IDENTIFIED BY '${OCTO_SPEECH_DB_PASSWORD}';
+    ALTER USER IF EXISTS      'speech'@'%' IDENTIFIED BY '${OCTO_SPEECH_DB_PASSWORD}';
+    {{- end }}
+    {{- if .Values.docs.enabled }}
+
+    CREATE USER IF NOT EXISTS 'docs'@'%' IDENTIFIED BY '${OCTO_DOCS_DB_PASSWORD}';
+    ALTER USER IF EXISTS      'docs'@'%' IDENTIFIED BY '${OCTO_DOCS_DB_PASSWORD}';
+    {{- end }}
+    {{- if .Values.marketplace.enabled }}
+
+    CREATE USER IF NOT EXISTS 'marketplace'@'%' IDENTIFIED BY '${OCTO_MARKETPLACE_DB_PASSWORD}';
+    ALTER USER IF EXISTS      'marketplace'@'%' IDENTIFIED BY '${OCTO_MARKETPLACE_DB_PASSWORD}';
+    {{- end }}
+
+    GRANT ALL PRIVILEGES ON octo_matter.*       TO 'matter'@'%';
+    GRANT ALL PRIVILEGES ON octo_summary.*      TO 'summary'@'%';
+    GRANT SELECT         ON \`${MYSQL_DATABASE}\`.* TO 'summary_reader'@'%';
+    {{- if .Values.speech.enabled }}
+    GRANT ALL PRIVILEGES ON octo_speech.*       TO 'speech'@'%';
+    {{- end }}
+    {{- if .Values.docs.enabled }}
+    GRANT ALL PRIVILEGES ON octo_docs.*         TO 'docs'@'%';
+    {{- end }}
+    {{- if .Values.marketplace.enabled }}
+    GRANT ALL PRIVILEGES ON octo_marketplace.*  TO 'marketplace'@'%';
+    {{- end }}
+    FLUSH PRIVILEGES;
+    SQL
+
+    echo "[init-extra-dbs] created octo_matter + octo_summary{{- if .Values.speech.enabled }} + octo_speech{{- end }}{{- if .Values.docs.enabled }} + octo_docs{{- end }}{{- if .Values.marketplace.enabled }} + octo_marketplace{{- end }} + service users"

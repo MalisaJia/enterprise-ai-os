@@ -1,0 +1,32 @@
+# Build artifacts
+bin/
+*.exe
+*.log
+
+# IDE / tool workspace (not tracked)
+.idea/
+.vscode/
+*.swp
+*~
+
+# Deployment config
+docker-compose.yml
+# Root-level binaries
+summary-api
+summary-worker
+
+# Review output files (generated, not tracked)
+/cc-*.json
+/codex-*.txt
+/codex-*.log
+/review-*.json
+/review-*.txt
+/*-dev.log
+!docs/**
+
+# Stray local build binaries (dot-prefixed)
+.bin_*
+
+# Tokenizer model files (download at runtime or build time)
+internal/tokenizer/models/
+*.model

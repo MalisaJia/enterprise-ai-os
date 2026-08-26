@@ -1,0 +1,162 @@
+package main
+
+import (
+	"log"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/router"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/db"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmobs"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/notify"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/worker"
+)
+
+func main() {
+	cfg := config.Load()
+
+	// Instrument every llmfallback.Run in this process (agent chat, agent
+	// tools, worker Map/Reduce, API refine). Must run before any LLM client
+	// is constructed so no call path starts unmonitored.
+	llmobs.Install(slog.Default().With(slog.String("component", "worker")))
+
+	// Apply config to pipeline package-level variables
+	if cfg.MaxSafetyLimit > 0 {
+		pipeline.MaxSafetyLimit = cfg.MaxSafetyLimit
+	}
+	if cfg.DefaultTimeRangeDays > 0 {
+		pipeline.DefaultTimeRangeDays = cfg.DefaultTimeRangeDays
+	}
+	// EnableIntentShortcut defaults to true, so we always apply it
+	pipeline.EnableIntentShortcut = cfg.EnableIntentShortcut
+
+	// Optional override of the per-stage timing log path; defaults to
+	// timing.DefaultLogPath (/var/log/smart-summary/timing.log).
+	if p := os.Getenv("TIMING_LOG_PATH"); p != "" {
+		timing.SetLogPath(p)
+	}
+	// Optional override of the per-run LLM summary report path; defaults to
+	// timing.DefaultReportPath (/var/log/smart-summary/summary-report.log).
+	if p := os.Getenv("SUMMARY_REPORT_PATH"); p != "" {
+		timing.SetReportPath(p)
+	}
+	config.ValidateRequired(map[string]string{
+		"MYSQL_DSN":               cfg.MySQLDSN,
+		"IM_MYSQL_DSN":            cfg.IMMySQLDSN,
+		"LLM_API_URL":             cfg.LLMApiURL,
+		"LLM_API_KEY":             cfg.LLMApiKey,
+		"LLM_MODEL":               cfg.LLMModel,
+		"WORKER_API_CALLBACK_URL": cfg.WorkerCallbackURL,
+	})
+
+	// Init summary DB
+	summaryDB, err := db.New(cfg.MySQLDSN)
+	if err != nil {
+		log.Fatalf("[worker] connect summary DB: %v", err)
+	}
+
+	// Run database migrations
+	sqlDB, err := summaryDB.DB()
+	if err != nil {
+		log.Fatalf("[worker] get raw db: %v", err)
+	}
+	n, err := db.RunMigrations(sqlDB)
+	if err != nil {
+		log.Fatalf("[worker] migration failed: %v", err)
+	}
+	if n > 0 {
+		log.Printf("[worker] applied %d migration(s)", n)
+	}
+
+	// Init IM DB (read-only, for message fetching)
+	imDB, err := db.New(cfg.IMMySQLDSN)
+	if err != nil {
+		log.Fatalf("[worker] connect IM DB: %v", err)
+	}
+
+	// Init LLM client
+	llm := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, cfg.ToolCallTimeout, cfg.LLMFallbackModels)
+
+	// Set up user/source name resolvers (same as API process)
+	service.SetUserNameResolver(func(uid string) string {
+		var name string
+		imDB.Raw("SELECT name FROM `user` WHERE uid = ? LIMIT 1", uid).Scan(&name)
+		if name != "" {
+			return name
+		}
+		return uid
+	})
+
+	// Start worker pool
+	pool := worker.NewWorkerPool(cfg.WorkerMaxConcurrent)
+
+	// Build the terminal-state notifier (方向 B: reliable delivery + full fan-out).
+	// Disabled unless SUMMARY_NOTIFY_ENABLED=true; a nil deliverer / disabled
+	// config makes OnTaskTerminal a no-op, so it is always safe to wire.
+	var notifier *notify.Notifier
+	if cfg.NotifyEnabled {
+		if cfg.OctoAPIURL == "" {
+			log.Printf("[worker] SUMMARY_NOTIFY_ENABLED=true but OCTO_API_URL missing; notifications disabled")
+		} else {
+			// SUMMARY_NOTIFY_TOKEN authenticates /v1/internal/notify. Prod misconfig
+			// must fail fast; dev only warns.
+			if cfg.NotifyInternalToken == "" {
+				if cfg.AppEnv == "prod" {
+					log.Fatalf("[worker] SUMMARY_NOTIFY_ENABLED=true but SUMMARY_NOTIFY_TOKEN missing (APP_ENV=prod)")
+				}
+				log.Printf("[worker] WARNING: SUMMARY_NOTIFY_ENABLED=true but SUMMARY_NOTIFY_TOKEN missing (APP_ENV=%s); /v1/internal/notify will 401", cfg.AppEnv)
+			}
+			deliverer := notify.NewInternalNotifyDeliverer(cfg.OctoAPIURL, cfg.NotifyInternalToken, cfg.SummaryWebBaseURL)
+			// imDB (shared IM DB, read-only) resolves space names in the text and the
+			// active-membership pre-check; nil-safe degradation inside notify.
+			notifier = notify.New(summaryDB, imDB, deliverer, notify.Config{
+				Enabled:     true,
+				MaxAttempts: cfg.MaxNotifyAttempts,
+			}).WithErrorSanitizer(worker.SanitizeErrorForUser)
+			log.Printf("[worker] terminal-state notifications ENABLED (internal-notify transport)")
+		}
+	}
+
+	// Start processor (polling loop)
+	proc := worker.NewProcessor(summaryDB, imDB, pool, llm, cfg)
+	proc.SetNotifier(notifier)
+	go proc.Run()
+
+	// Start scheduler (cron jobs)
+	cronSched := worker.StartScheduler(summaryDB, imDB, cfg.WorkerMaxRetry, cfg.WorkerTriggerURL, cfg.ScheduleMaxWindowDays, cfg.FeatureTeamSchedule, notifier)
+
+	// Start internal HTTP server for worker-trigger
+	hub := ws.NewHub(summaryDB)
+	internalRouter, intH := router.SetupInternal(hub)
+	intH.SetTriggerCh(proc.TriggerCh())
+	internalSrv := &http.Server{
+		Addr:    cfg.WorkerListenAllInterfaces + ":" + cfg.WorkerInternalPort,
+		Handler: internalRouter,
+	}
+	go func() {
+		log.Printf("[worker] internal server listening on %s:%s", cfg.WorkerListenAllInterfaces, cfg.WorkerInternalPort)
+		if err := internalSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[worker] internal server error: %v", err)
+		}
+	}()
+
+	// Graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	<-quit
+	log.Println("[worker] shutting down...")
+
+	proc.Stop()
+	pool.Drain()
+	cronSched.Stop()
+
+	log.Println("[worker] exited")
+}

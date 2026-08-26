@@ -1,0 +1,2562 @@
+//
+//  WKConversationListVM.m
+//  WuKongBase
+//
+//  Created by tt on 2019/12/22.
+//
+
+#import "WKConversationListVM.h"
+#import "WuKongBase.h"
+#import "WKProhibitwordsService.h"
+#import "WKThreadService.h"
+#import "WKThreadModel.h"
+#import "WKThreadCreatedContent.h"
+#import "WKCategoryEntity.h"
+#import "WKCategoryService.h"
+#import "WKFollowedKeysStore.h"
+#import "WKSidebarItemEntity.h"
+#import <WuKongIMSDK/WKReminderDB.h>
+#import <WuKongIMSDK/WKUnreadStore.h>
+#import <WuKongIMSDK/WKUnreadStateDB.h>
+#import "WKSpaceFilter.h"
+#import "WKSpaceBotRegistry.h"
+#import "WKConvListCache.h"
+#import "WKApp.h"
+#import "WKTimeTool.h"
+
+// [ThreadBadgeDbg] / [ThreadSync] 子区 unread / 关注 badge 链路调试日志
+// （PR #137 review 反馈）：仅 DEBUG 构建打印，Release 编译为空 ——
+// 防止 channelId / groupNo / unread 数字这类 metadata 进入生产日志。
+#if DEBUG
+#define WK_THREAD_BADGE_DBG(...) NSLog(__VA_ARGS__)
+#else
+#define WK_THREAD_BADGE_DBG(...) do {} while(0)
+#endif
+
+@interface WKConversationListVM ()
+@property(nonatomic,strong) NSMutableArray<WKConversationWrapModel*> *conversationWrapModels;
+@property(nonatomic,copy,readwrite,nullable) NSArray<WKConversationWrapModel*> *threadWrapModels; // 子区独立 wrap，最近 tab 用
+@property(nonatomic,strong) NSMutableDictionary<NSString*, WKConversationWrapModel*> *channelIndex; // channel key → model, O(1) lookup
+@property(nonatomic,strong) NSArray<WKConversationWrapModel*> *filteredConversations; // 过滤后的列表
+@property(nonatomic,strong) NSRecursiveLock *conversationsLock;
+@property(nonatomic,strong) NSSet<NSString*> *syncedGroupChannelIds; // 当前空间的合法群聊白名单
+/// conversationWrapModels 当前这一份是"为哪个空间"装载的。
+/// 快照（persistRenderedMembershipSnapshot）必须用它和 currentSpaceId 比对：
+/// 只有两者一致时，内存里的列表才真的代表当前空间 —— 否则就有可能把上一个空间的
+/// 会话写进新空间的归属（例如切换过程中 App 被切到后台触发快照）。
+/// reset 时清空，loadConversationList 落数据时盖章。
+@property(nonatomic,copy,nullable) NSString *loadedForSpaceId;
+@property(nonatomic,strong) NSMutableSet<NSString*> *expandedThreadGroups; // 子区预览展开的群 channelId
+@property(nonatomic,copy) NSArray<WKConversation*> *cachedAllConversations; // loadConversationList 缓存，供 buildGroupDisplayList 复用
+@property(nonatomic,strong) NSDictionary<NSString*, NSArray<WKConversation*>*> *cachedTopicsByGroup; // groupId → 子区会话列表
+@property(nonatomic,strong) NSDictionary<NSString*, NSArray<WKReminder*>*> *cachedRemindersByChannelId; // 子区 channelId → reminder 列表
+/// 冷启动两阶段子区分页标记（PR review #7 warning）：
+///   - YES：曾在 store.loaded 状态下跑过 fetchThreadCountsForGroupsWithCompletion,
+///     有已关注子区的群已经拿到 maxPages=10 全分页结果
+///   - NO：冷启全用 maxPages=1，等 store 加载好后由 coldStartCatchupIfNeeded
+///     对有已关注子区的群补一次完整分页
+/// 仅在 fetchThreadCountsForGroupsWithCompletion 走 storeLoaded 分支时翻 YES;
+/// reset 时清零，保证切账号 / 切 Space 后冷启逻辑重新生效。
+@property(nonatomic,assign) BOOL didColdStartFullPaging;
+/// 与 WKFollowedKeysStore.generation 同款拦截 (PR review #13 critical)：reset 时 +1,
+/// 任何在飞的 fetchThreadCountsForGroupsWithCompletion / refreshThreadCountForGroups
+/// 在发起时捕获 myGen，回包时校验 myGen == self.vmGeneration，mismatch 就丢弃
+/// per-callback 累积 + 最终 mergeThreadConvs / 通知，避免旧 Space 的 thread 数据
+/// 在切到新 Space 后回到 cachedTopicsByGroup 污染 badge / Recent tab。
+@property(nonatomic,assign) NSInteger vmGeneration;
+/// fetchThreadCountsForGroupsWithCompletion 防并发. 用户在 Follow ↔ Recent 之间
+/// 频繁切换时, onTabChanged 每次切 Recent 都会触发一波对 N 个群并发 listThreads,
+/// 多波在飞时各自 callback 写 model.threadPreviews, 第一波部分回包后
+/// dispatch_group_notify 已触发 syncThreadWrapModelsFromCachedTopics → reload,
+/// Follow tab 看到的是只算了部分群的中间态 (子区先少); 第二波又写一遍 → 再 reload
+/// → 子区回来. 这是用户感知的"页面疯狂变化". 加 in-flight guard 让重叠调用直接
+/// 短路, 同时段内只有最早一次真跑, 消除中间态抖动. 不影响冷启动单次 fetch.
+@property(nonatomic,assign) BOOL threadCountsFetchInFlight;
+@property(nonatomic,strong) NSDictionary *cachedThreadData; // channelId → {previews, count}，跨 reset 保留
+@property(nonatomic,assign,readwrite) BOOL lastBuildFollowHasMention;
+@property(nonatomic,assign,readwrite) BOOL lastBuildRecentHasMention;
+
+@end
+
+@implementation WKConversationListVM
+
+
+static WKConversationListVM *_instance;
++ (id)allocWithZone:(NSZone *)zone
+{
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        _instance = [super allocWithZone:zone];
+    });
+    return _instance;
+}
++ (WKConversationListVM *)shared
+{
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        _instance = [[self alloc] init];
+        
+    });
+    return _instance;
+}
+
+-(instancetype) init {
+    self = [super init];
+    if(self) {
+        self.conversationsLock = [[NSRecursiveLock alloc] init];
+        self.channelIndex = [NSMutableDictionary dictionary];
+        self.collapsedSections = [NSMutableSet set];
+        self.expandedThreadGroups = [NSMutableSet set];
+        self.categoryList = @[];
+    }
+    return self;
+}
+
+- (NSString *)channelKey:(WKChannel *)channel {
+    return [NSString stringWithFormat:@"%@_%d", channel.channelId, (int)channel.channelType];
+}
+
+- (void)rebuildChannelIndex {
+    [self.channelIndex removeAllObjects];
+    for (WKConversationWrapModel *model in self.conversationWrapModels) {
+        self.channelIndex[[self channelKey:model.channel]] = model;
+    }
+}
+
+- (void)reset {
+    NSLog(@"[ConvDebug] VM reset called! clearing %lu models, callStack=%@", (unsigned long)self.conversationWrapModels.count, [[NSThread callStackSymbols] subarrayWithRange:NSMakeRange(1, MIN(5, [NSThread callStackSymbols].count - 1))]);
+    // 先 +1 vmGeneration：所有在飞的 thread count 请求（属于上一个 Space）
+    // 回包时 myGen 已 mismatch，按 generation 闸门丢弃，不会再 merge 进 cache
+    self.vmGeneration = self.vmGeneration + 1;
+    [self.conversationWrapModels removeAllObjects];
+    [self.channelIndex removeAllObjects];
+    self.filteredConversations = @[];
+    self.threadWrapModels = @[]; // 之前漏清 → space 切换 / 启动清理后旧子区行残留在 recent tab,
+                                  // badge 也算它们；rebuildFilteredList 会把它们 append 进 filteredConversations。
+                                  // 必须和 conversationWrapModels 一起清，等下次 loadConversationList 重建。
+    self.syncedGroupChannelIds = nil;
+    self.loadedForSpaceId = nil; // 内存列表已清空，不再代表任何空间
+    self.categoryList = @[];
+    self.cachedAllConversations = nil;
+    self.cachedTopicsByGroup = nil;
+    self.cachedRemindersByChannelId = nil;
+    self.didColdStartFullPaging = NO; // 切账号 / 切 Space 后冷启两阶段分页要重新生效
+    self.threadCountsFetchInFlight = NO; // reset 后允许新 fetch 启动 (旧在飞那次会被 vmGeneration 拦下)
+}
+
+-(void) snapshotSyncedGroupIds {
+    NSMutableSet *groupIds = [NSMutableSet set];
+    for (WKConversationWrapModel *model in self.conversationWrapModels) {
+        if (model.channel.channelType == WK_GROUP) {
+            [groupIds addObject:model.channel.channelId];
+        }
+    }
+    self.syncedGroupChannelIds = [groupIds copy];
+    // DM 不维护内存白名单：DM 的空间隔离由 SQL 作用域负责，多一份内存集合只会和 DB
+    // 漂移（曾导致"进聊天详情返回后所有私聊消失"）。见 shouldShowConversation: 的注释。
+    NSLog(@"📋 已记录当前空间合法群聊白名单: %lu 个群", (unsigned long)groupIds.count);
+}
+
+/// 实时会话更新被判定为"属于当前空间"后，把结论同步进内存群白名单。
+///
+/// 归属落库（WKConvListCache.recordMembershipBatch）是异步的，而
+/// shouldShowConversation: 的群分支读的是这个内存集合 —— 不同步更新的话，刚进来的新群
+/// 会在下一次 loadConversationList 时被自己的白名单挡掉（DB 里有、列表里没有）。
+/// DM 不参与：它没有内存白名单，隔离完全交给 SQL 作用域。
+-(void) noteSpaceMembershipChannels:(NSArray<WKChannel*>*)channels {
+    if(channels.count == 0) return;
+    NSMutableSet *groups = self.syncedGroupChannelIds ? [self.syncedGroupChannelIds mutableCopy] : nil;
+    if(!groups) return; // 白名单未初始化时保持 nil 的 fail-open 语义，不要凭这一批把它变成窄集合
+    BOOL groupChanged = NO;
+    for (WKChannel *ch in channels) {
+        if(ch.channelId.length == 0) continue;
+        if(ch.channelType == WK_GROUP && ![groups containsObject:ch.channelId]) {
+            [groups addObject:ch.channelId];
+            groupChanged = YES;
+        }
+    }
+    if(groupChanged) self.syncedGroupChannelIds = [groups copy];
+}
+
+-(void) persistRenderedMembershipSnapshot {
+    [self persistRenderedMembershipSnapshotSynchronous:NO];
+}
+
+-(void) persistRenderedMembershipSnapshotSynchronous:(BOOL)synchronous {
+    if(![WKConvListCache enabled]) return;
+    NSString *spaceId = [WKConvListCache currentSpaceId];
+    if(spaceId.length == 0) return;
+    // 内存列表必须确实是为这个空间装的。不一致说明正处在切换的中间态（例如切换过程中
+    // App 被切到后台触发了快照）—— 这时候写快照会把上一个空间的会话记进新空间的归属，
+    // 正是跨空间污染的经典成因，直接跳过。
+    if(![self.loadedForSpaceId isEqualToString:spaceId]) {
+        NSLog(@"[SpaceIndex] 跳过快照：内存列表属于 %@，当前空间 %@",
+              self.loadedForSpaceId ?: @"<nil>", spaceId);
+        return;
+    }
+    if(self.conversationWrapModels.count == 0 && self.threadWrapModels.count == 0) {
+        return; // 没有渲染内容就不写（别把"空"记成这个空间的状态）
+    }
+    NSMutableArray<WKChannel*> *rendered = [NSMutableArray array];
+    for (WKConversationWrapModel *m in self.conversationWrapModels) {
+        if(m.channel.channelId.length > 0) [rendered addObject:m.channel];
+    }
+    // 子区也要记：最近 tab 里子区是独立行，不记的话下次冷启动子区行会消失。
+    for (WKConversationWrapModel *t in self.threadWrapModels) {
+        if(t.channel.channelId.length > 0) [rendered addObject:t.channel];
+    }
+    // recordMembershipBatch 内部按 (space, channel) 内存去重 + 批量事务，
+    // 所以这个方法可以被高频调用（每次 loadConversationList 完成都调）而几乎无成本。
+    [WKConvListCache recordMembershipBatch:rendered forSpace:spaceId synchronous:synchronous];
+    // 内存群白名单跟着放宽：快照会往归属表里加行，而群白名单是在 hydrate 时按归属表
+    // 建立的。不同步放宽的话，白名单会比 DB 作用域更严，下一次 loadConversationList
+    // 就会把这些群筛掉 —— 与 DM 那个"进详情返回后消失"的 bug 同一类漂移。
+    [self noteSpaceMembershipChannels:rendered];
+    NSLog(@"[SpaceIndex] 快照已渲染列表 space=%@ rows=%lu sync=%d",
+          spaceId, (unsigned long)rendered.count, synchronous);
+}
+
+-(void) addGroupToWhitelist:(NSString*)channelId {
+    if(!channelId || channelId.length == 0) return;
+    if(self.syncedGroupChannelIds) {
+        NSMutableSet *mutable = [self.syncedGroupChannelIds mutableCopy];
+        [mutable addObject:channelId];
+        self.syncedGroupChannelIds = [mutable copy];
+    } else {
+        self.syncedGroupChannelIds = [NSSet setWithObject:channelId];
+    }
+    // 归属同时落库：白名单是内存态（reset 就没了），归属表才是跨启动的空间闸门。
+    // 缺这一步，刚建/刚进的群下次冷启动会被作用域挡在列表外。
+    [WKConvListCache recordMembership:[WKChannel channelID:channelId channelType:WK_GROUP] forSpace:nil];
+    NSLog(@"📋 群聊 %@ 已添加到当前空间白名单", channelId);
+}
+
+/// 用持久化的归属表水化空间白名单 + 会话读路径作用域。
+///
+/// 为什么需要：`reset` 把 syncedGroupChannelIds 清成 nil，而
+/// `shouldShowConversation:` 对 nil 的语义是 "尚未 sync，暂不过滤"（fail-open）。
+/// 原先这个 fail-open 窗口是安全的 —— 因为 DB 刚被 deleteAllConversation 清过，
+/// 里面没有别的空间的会话。现在 DB 会长期保留多空间会话，这个窗口必须关掉：
+/// 从归属表里把白名单直接读出来，第一帧就是正确的过滤结果。
+///
+/// 调用时机：启动、切空间 —— 都在 `reset` 之后、任何 loadConversationList 之前。
+-(void) hydrateSpaceScope:(NSString*)spaceId {
+    // 归属索引的一次性准备/重建必须在任何读之前：它把"归属表整表为空"这个状态彻底
+    // 消掉，读路径从此可以一直按空间精确过滤（那个兼容态就是跨空间污染的来源之一）。
+    [WKConvListCache prepareMembershipIfNeeded];
+    [WKConvListCache applyScopeForSpace:spaceId];
+    if(![WKConvListCache enabled] || spaceId.length == 0) {
+        return;
+    }
+    if(![WKConvListCache hasMembershipForSpace:spaceId]) {
+        // 这个空间从没被完整同步过（全新安装 / 第一次进这个空间）：白名单保持 nil，
+        // 沿用"首次 sync 前不过滤"的既有语义 —— 实时消息路径靠
+        // isGroupWhitelistInitialized 判断，收紧成空集会让 sync 回来的会话全被挡住。
+        // DB 读路径不受影响：作用域仍生效，membership 为 0 行 → 返回空列表（正确，
+        // 本来就没有这个空间的缓存）。
+        self.syncedGroupChannelIds = nil;
+        NSLog(@"[SpaceIndex] hydrate space=%@ 该空间尚无归属数据，白名单保持未初始化", spaceId);
+        return;
+    }
+    self.syncedGroupChannelIds = [[WKConvListCache channelIdsForSpace:spaceId channelType:WK_GROUP] copy];
+    NSLog(@"[SpaceIndex] hydrate space=%@ groups=%lu", spaceId,
+          (unsigned long)self.syncedGroupChannelIds.count);
+}
+
+-(BOOL) isGroupInWhitelist:(NSString*)channelId {
+    if(!self.syncedGroupChannelIds) return YES; // 白名单未初始化（首次sync前），暂不过滤
+    return [self.syncedGroupChannelIds containsObject:channelId];
+}
+
+-(BOOL) isGroupWhitelistInitialized {
+    // : 在新消息路径 + Space 切换瞬态窗口中严格区分
+    // "白名单尚未 snapshot（nil）" vs "已 snapshot 但该 Space 无群（非 nil 空集）"。
+    // 前者 caller 应走 verifyAndAddGroupsToList 回兜，而不是裸放行。
+    return self.syncedGroupChannelIds != nil;
+}
+
+-(NSArray<NSString*>*) pruneNonCurrentSpaceGroups {
+    // : 清 VM 残留——对每个 WK_GROUP 查一次 SpaceFilter，
+    // 明确 Skip 的群从 conversationWrapModels 踢出。Keep / FailOpen 保持不变。
+    // 调用时机：Space 切换完成后 + 新消息 filter 批次结束前，确保单例内存不存"已归属
+    // 其它 Space 的群"，防止下次 sort/refresh 再把它浮到顶部（Round-1 只覆盖
+    // filter 入口一次，漏了残留清理）。
+    NSMutableArray<NSString*> *removed = [NSMutableArray array];
+    if(self.conversationWrapModels.count == 0) return removed;
+    // 先拷贝一份 snapshot，避免遍历中修改原数组
+    NSArray<WKConversationWrapModel*> *snapshot = [self.conversationWrapModels copy];
+    NSMutableArray<WKChannel*> *removedChannels = [NSMutableArray array];
+    for(WKConversationWrapModel *m in snapshot) {
+        WKChannel *ch = m.channel;
+        if(ch.channelType != WK_GROUP) continue;
+        WKSpaceFilterDecision d = [[WKSpaceFilter shared] decideChannel:ch.channelId
+                                                            channelType:ch.channelType];
+        if(d == WKSpaceFilterDecisionSkip) {
+            [self removeAtChannnel:ch];
+            [removed addObject:ch.channelId];
+            [removedChannels addObject:ch];
+        }
+    }
+    if(removed.count > 0) {
+        NSLog(@"🧹 [] 清理当前 Space 不应展示的残留群聊 %lu 个: %@",
+              (unsigned long)removed.count, removed);
+        // Skip 是 WKSpaceFilter 的**明确**判定（channelInfo.space_id 指向别的空间且我
+        // 也不是外部成员），所以同步把归属删掉 —— 否则此前误写的归属会一直挂着，
+        // 下次冷启动从缓存里又把它读回当前空间的列表（跨空间污染的自愈通道）。
+        [self dropSpaceMembershipForChannels:removedChannels forSpace:nil];
+    }
+    return removed;
+}
+
+/// 明确判定不属于某空间的 channel → 删归属 + 从内存白名单剔除。
+/// 只应由 prune / sweep 这类"有明确 Skip 证据"的路径调用；fail-open 判定绝不能进来
+/// （那会把用户正常的会话从缓存里删掉）。
+-(void) dropSpaceMembershipForChannels:(NSArray<WKChannel*>*)channels forSpace:(NSString*)spaceId {
+    if(channels.count == 0) return;
+    NSString *sid = spaceId.length > 0 ? spaceId : [WKConvListCache currentSpaceId];
+    if(sid.length == 0) return;
+    [WKConvListCache removeMembership:channels forSpace:sid];
+    // 只有在被删的就是"当前空间"时才动内存白名单 —— 白名单描述的是当前空间。
+    if(![sid isEqualToString:[WKConvListCache currentSpaceId]]) return;
+    NSMutableSet *groups = self.syncedGroupChannelIds ? [self.syncedGroupChannelIds mutableCopy] : nil;
+    for (WKChannel *ch in channels) {
+        if(ch.channelType == WK_GROUP) [groups removeObject:ch.channelId];
+    }
+    if(groups) self.syncedGroupChannelIds = [groups copy];
+}
+
+/// YUJ-bot-isolation: 清掉当前 Space 的 conversation list 里"不属于当前 Space 已添加 Bot"
+/// 的 Bot 行。对应 web 没有此问题（web 的服务端 Bot DM 走不同 channel_id 形态）。
+/// 调用时机：WKSpaceBotRegistry 加载完成后，由 VC 监听通知触发。
+/// 数据源：WKSpaceBotRegistry（my_bots ∪ space_bots[status=added]）。
+/// 三态语义：
+///   - Member：保留
+///   - NotMember：移除
+///   - Unknown：保留（理论上加载完成后不应再有 Unknown，安全降级）
+-(NSArray<NSString*>*) pruneNonCurrentSpaceBotsForSpace:(NSString*)spaceId {
+    NSMutableArray<NSString*> *removed = [NSMutableArray array];
+    if(spaceId.length == 0 || self.conversationWrapModels.count == 0) return removed;
+    NSArray<WKConversationWrapModel*> *snapshot = [self.conversationWrapModels copy];
+    NSArray<NSString*> *systemBotUIDs = [WKApp shared].config.systemBotUIDs;
+    NSMutableArray<WKChannel*> *removedChannels = [NSMutableArray array];
+    for(WKConversationWrapModel *m in snapshot) {
+        WKChannel *ch = m.channel;
+        if(ch.channelType != WK_PERSON) continue;
+        // System bot（botfather/u_10000/fileHelper）全局可见，跳过。
+        if(systemBotUIDs.count > 0 && [systemBotUIDs containsObject:ch.channelId]) continue;
+        WKChannelInfo *info = [[WKChannelInfoDB shared] queryChannelInfo:ch];
+        if(!info || !info.robot) continue; // 非 Bot 不参与本轮 prune
+        WKSpaceBotMembership mem = [[WKSpaceBotRegistry shared] membershipForBotUID:ch.channelId inSpace:spaceId];
+        if(mem == WKSpaceBotMembershipNotMember) {
+            [self removeAtChannnel:ch];
+            [removed addObject:ch.channelId];
+            [removedChannels addObject:ch];
+        }
+    }
+    if(removed.count > 0) {
+#if DEBUG
+        NSLog(@"🧹 [BotSpaceTrace] pruneNonCurrentSpaceBots removed %lu bot(s) for space=%@: %@",
+              (unsigned long)removed.count, spaceId, removed);
+#endif
+        // NotMember 是服务端权威名单的明确判定 → 同步删归属（自愈，见
+        // dropSpaceMembershipForChannels:forSpace: 注释）。Unknown 不走这里，不会误删。
+        [self dropSpaceMembershipForChannels:removedChannels forSpace:spaceId];
+    }
+    return removed;
+}
+
+/// Space 切换/sync 完成后的兜底总清扫 —— 把 conversationWrapModels + threadWrapModels
+/// 里凡是不属于当前 Space 的条目全部移除。和 pruneNonCurrentSpaceGroups /
+/// pruneNonCurrentSpaceBotsForSpace 互补：
+///   - 群聊：仍走 WKSpaceFilter（Skip 移除，Keep/FailOpen 保留）
+///   - Person Bot：仍走 WKSpaceBotRegistry（NotMember 移除，Member/Unknown 保留）
+///   - Person 非 Bot：lastMessage.space_id 明确不匹配 → 移除
+///   - 子区：parentGroupNo 不在 syncedGroupChannelIds → 从 threadWrapModels 移除
+/// 调用时机：Space 切换 sync 完成 callback 末尾（snapshot/prune 之后），
+/// 兜住"切换瞬间通过 fail-open 漏入的会话"。返回 (移除 WrapModel 数, 移除子区数)。
+-(void) sweepForeignToSpace:(NSString*)spaceId removedCount:(NSInteger*)outRemovedCount removedThreadCount:(NSInteger*)outRemovedThreadCount {
+    NSInteger removedConv = 0;
+    NSInteger removedThread = 0;
+    if(spaceId.length == 0) {
+        if(outRemovedCount) *outRemovedCount = 0;
+        if(outRemovedThreadCount) *outRemovedThreadCount = 0;
+        return;
+    }
+
+    // 1) conversationWrapModels 扫描
+    NSArray<WKConversationWrapModel*> *convSnapshot = [self.conversationWrapModels copy];
+    /// 被明确判定"不属于本空间"的 channel —— 方法末尾一并删归属（自愈）
+    NSMutableArray<WKChannel*> *sweptChannels = [NSMutableArray array];
+    NSArray<NSString*> *systemBotUIDs = [WKApp shared].config.systemBotUIDs;
+    NSString *botfatherUID = [WKApp shared].config.botfatherUID;
+    NSString *systemUID = [WKApp shared].config.systemUID;
+    NSString *fileHelperUID = [WKApp shared].config.fileHelperUID;
+
+    for(WKConversationWrapModel *m in convSnapshot) {
+        WKChannel *ch = m.channel;
+        NSString *cid = ch.channelId;
+        if(cid.length == 0) continue;
+        // 全局可见频道：系统通知 / 文件助手 / botfather —— 永不移除
+        if([cid isEqualToString:systemUID] || [cid isEqualToString:fileHelperUID]
+           || (botfatherUID.length > 0 && [cid isEqualToString:botfatherUID])
+           || (systemBotUIDs.count > 0 && [systemBotUIDs containsObject:cid])) {
+            continue;
+        }
+
+        if(ch.channelType == WK_GROUP) {
+            WKSpaceFilterDecision d = [[WKSpaceFilter shared] decideChannel:cid channelType:ch.channelType];
+            if(d == WKSpaceFilterDecisionSkip) {
+                [self removeAtChannnel:ch];
+                [sweptChannels addObject:ch];
+                removedConv++;
+            }
+            continue;
+        }
+
+        if(ch.channelType == WK_PERSON) {
+            // 优先 SpaceFilter（前缀 / channelInfo.space_id）
+            WKSpaceFilterDecision d = [[WKSpaceFilter shared] decideChannel:cid channelType:ch.channelType];
+            if(d == WKSpaceFilterDecisionSkip) {
+                [self removeAtChannnel:ch];
+                [sweptChannels addObject:ch];
+                removedConv++;
+                continue;
+            }
+            // Bot：用 WKSpaceBotRegistry NotMember 兜底
+            WKChannelInfo *info = [[WKChannelInfoDB shared] queryChannelInfo:ch];
+            if(info && info.robot) {
+                WKSpaceBotMembership mem = [[WKSpaceBotRegistry shared] membershipForBotUID:cid inSpace:spaceId];
+                if(mem == WKSpaceBotMembershipNotMember) {
+                    [self removeAtChannnel:ch];
+                    [sweptChannels addObject:ch];
+                    removedConv++;
+                    continue;
+                }
+            }
+            // 非 Bot 普通 DM：看 lastMessage.space_id —— 明确跨 Space 才移除（保守:
+            // 缺 space_id 的旧消息保留，避免误杀历史会话）
+            WKMessage *lastMsg = m.lastMessage;
+            if(lastMsg) {
+                id v = lastMsg.content.contentDict[@"space_id"];
+                if([v isKindOfClass:[NSString class]]) {
+                    NSString *msgSpace = (NSString *)v;
+                    if(msgSpace.length > 0 && ![msgSpace isEqualToString:spaceId]) {
+                        [self removeAtChannnel:ch];
+                        [sweptChannels addObject:ch];
+                        removedConv++;
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) threadWrapModels 扫描 —— 父群不在白名单 → 移除
+    NSSet<NSString*> *synced = self.syncedGroupChannelIds;
+    if(synced && self.threadWrapModels.count > 0) {
+        NSMutableArray<WKConversationWrapModel*> *kept = [NSMutableArray array];
+        for(WKConversationWrapModel *t in self.threadWrapModels) {
+            NSString *tcid = t.channel.channelId ?: @"";
+            NSRange sep = [tcid rangeOfString:@"____"];
+            if(sep.location == NSNotFound) {
+                [kept addObject:t];
+                continue;
+            }
+            NSString *parentGroupNo = [tcid substringToIndex:sep.location];
+            if([synced containsObject:parentGroupNo]) {
+                [kept addObject:t];
+            } else {
+                removedThread++;
+            }
+        }
+        if(removedThread > 0) {
+            self.threadWrapModels = [kept copy];
+        }
+    }
+
+    if(removedConv > 0 || removedThread > 0) {
+        NSLog(@"🧹 [SpaceSweep] sweepForeignToSpace=%@ removedConv=%ld removedThread=%ld",
+              spaceId, (long)removedConv, (long)removedThread);
+    }
+    if(sweptChannels.count > 0) {
+        // 本方法的三条移除判据（SpaceFilter Skip / Bot NotMember / lastMessage.space_id
+        // 明确不匹配）都是**明确**证据，不是 fail-open，所以可以安全地把归属一起删掉。
+        // 这是"归属曾被写错"的自愈通道：不删的话，下次冷启动会从缓存里把它读回来。
+        [self dropSpaceMembershipForChannels:sweptChannels forSpace:spaceId];
+    }
+    if(outRemovedCount) *outRemovedCount = removedConv;
+    if(outRemovedThreadCount) *outRemovedThreadCount = removedThread;
+}
+
+-(BOOL) ensureSystemBotsVisible {
+    // : 后端 sync 在当前 Space 不返回 botfather 时的本地兜底。
+    // 对齐 Android Round-3 Fix C：只合成 VM 层占位条目，绝不写入 WKSDK cache / DB,
+    // 以免与 的群聊 cache pollution 修复策略冲突（后者针对持久化层）。
+    NSString *botfatherUID = [WKApp shared].config.botfatherUID;
+    if(!botfatherUID || botfatherUID.length == 0) {
+        return NO;
+    }
+
+    // 尊重用户主动删除过 BotFather 的意图（hidden 标记与 shouldShowConversation 语义一致）。
+    NSString *currentSpaceId = [[NSUserDefaults standardUserDefaults] objectForKey:@"currentSpaceId"];
+    if(currentSpaceId.length > 0) {
+        NSString *hiddenKey = [NSString stringWithFormat:@"WKBotFatherHidden_%@", currentSpaceId];
+        if([[NSUserDefaults standardUserDefaults] boolForKey:hiddenKey]) {
+            return NO;
+        }
+    }
+
+    WKChannel *botfatherChannel = [WKChannel personWithChannelID:botfatherUID];
+    // 已存在（sync 正常返回 / 新消息路径已 upsert）直接放行
+    if([self modelAtChannel:botfatherChannel]) {
+        return NO;
+    }
+
+    // 合成占位 conversation — 仅放在 VM 层；不调 [[WKSDK shared] conversationManager] 写入。
+    // timestamp=0 会把它排到列表底部，与真实历史会话顺序不冲突。
+    WKConversation *placeholder = [[WKConversation alloc] init];
+    placeholder.channel = botfatherChannel;
+    placeholder.unreadCount = 0;
+    placeholder.lastMsgTimestamp = 0;
+    WKConversationWrapModel *wrap = [[WKConversationWrapModel alloc] initWithConversation:placeholder];
+
+    if(!self.conversationWrapModels) {
+        self.conversationWrapModels = [NSMutableArray array];
+    }
+    [self.conversationWrapModels addObject:wrap];
+    self.channelIndex[[self channelKey:botfatherChannel]] = wrap;
+    [self sortConversationList]; // 内部会 rebuildFilteredList
+    NSLog(@"🤖 [] 本地合成 BotFather 兜底 conversation（backend sync 未返回；spaceId=%@）",
+          currentSpaceId ?: @"<none>");
+    return YES;
+}
+
+-(void) loadConversationList:(void(^)(void)) finished {
+    CFAbsoluteTime _lcStart = CFAbsoluteTimeGetCurrent();
+
+    // 发起时就把"这次加载是为哪个空间、属于哪一代 VM"钉下来。回主线程时必须用这两个
+    // 捕获值校验，**不能读当时的 currentSpaceId 去盖章** ——
+    //   A 的 DB 查询在后台跑 → 用户切到 B（reset + hydrateSpaceScope(B) + 新 load）
+    //   → A 的回调后到，把 A 的会话写进 VM，又把 loadedForSpaceId 盖成 B。
+    // 这样 persistRenderedMembershipSnapshot 的 loadedForSpaceId == currentSpaceId
+    // 校验必然通过，A 的 channel 就被永久写进 B 的归属表（归属只增不删，重启也在），
+    // 之后每次冷启动都把 A 的会话种回 B 的列表 —— 正是本次缓存改造要消灭的污染。
+    // 丢弃是安全的：所有 reset 调用点后面都紧跟一次新的 loadConversationList
+    // （performSwitchToSpaceId / loadCurrentSpace 两条空间变化路径 + init），
+    // 不存在"丢了这次就没人再刷"的情况。
+    NSString *requestedSpaceId = [WKConvListCache currentSpaceId];
+    NSInteger requestedGen = self.vmGeneration;
+
+    // 在主线程快照旧 threadPreviews/threadCount（后台线程不能读 self.conversationWrapModels）
+    // reset 会清空 conversationWrapModels，所以同时用 cachedThreadData 兜底
+    NSMutableDictionary *oldThreadData = [NSMutableDictionary dictionary];
+    if (self.cachedThreadData) {
+        [oldThreadData addEntriesFromDictionary:self.cachedThreadData];
+    }
+    for (WKConversationWrapModel *old in self.conversationWrapModels) {
+        if (old.threadCount > 0) {
+            oldThreadData[old.channel.channelId] = @{
+                @"previews": old.threadPreviews ?: @[],
+                @"count": @(old.threadCount)
+            };
+        }
+    }
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        // ===== 后台线程：DB 查询 + 数据构建 =====
+        CFAbsoluteTime _dbStart = CFAbsoluteTimeGetCurrent();
+        NSArray<WKConversation*> *conversations = [[[WKSDK shared] conversationManager] getConversationList];
+        NSLog(@"[TabPerf] loadConversationList(bg): DB query=%.1fms count=%lu",
+              (CFAbsoluteTimeGetCurrent()-_dbStart)*1000, (unsigned long)conversations.count);
+        // 跨空间污染定位用：DB 读路径已经按 conversation_space 作用域过滤过，所以这里的
+        // count 就是"归属于当前空间的会话数"。若列表里出现别的空间的会话而这条日志的
+        // scope 是对的，说明污染来自实时路径（WKConversationListVC.filterConversationsBySpace）
+        // 而不是缓存；反之则是归属表被写脏了。
+        NSLog(@"[SpaceIndex] loadConversationList scope=%@ dbRows=%lu groupWhitelist=%@",
+              [[WKSDK shared].conversationManager spaceScope] ?: @"<off>",
+              (unsigned long)conversations.count,
+              strongSelf.syncedGroupChannelIds ? [@(strongSelf.syncedGroupChannelIds.count) stringValue] : @"<nil>");
+
+        // 已读水位夹取：用本地 last_read_seq 把"已经读过、但 DB 里 unread 还没归零"的
+        // 会话压成 0。
+        //
+        // 为什么在这里做：DB 不再被清空后，列表第一帧直接来自上次持久化的 unread。
+        // 正常路径上它已经是 mergeConversations → WKUnreadStore.reconcileServerSnapshot
+        // 的结果（本地优先），但边界情况仍会留下偏大的值 —— 例如"读完最后一条后
+        // 立刻被杀进程、ack 还没上报"，或 server 在下一次 sync 前回了个偏大的 unread。
+        // 用户对"已读又变未读"的容忍度是 0，所以在渲染前统一夹一次。
+        // prefetchReconcileContext 一次性预读整张 unread_state（本来就是给 250+ 行
+        // 批量 reconcile 设计的入口），避免每行一次 DB 查询。
+        WKUnreadReconcileContext *unreadCtx = [[WKUnreadStore shared] prefetchReconcileContext];
+        NSInteger clampedCount = 0;
+        for (WKConversation *conversation in conversations) {
+            if(conversation.unreadCount <= 0) continue;
+            WKUnreadStateRecord *rec = unreadCtx.unreadStateMap[[WKUnreadStore channelKeyFor:conversation.channel]];
+            if(!rec) continue;
+            // lastMessageSeq 为 0 表示这条会话没有可比对的 seq 锚点（占位 / 纯 cmd 会话），
+            // 不夹 —— 宁可多显示一个红点，也不要凭没有锚点的比较把真未读抹掉。
+            if(conversation.lastMessageSeq > 0 && rec.lastReadSeq >= conversation.lastMessageSeq) {
+                conversation.unreadCount = 0;
+                clampedCount++;
+            }
+        }
+        if(clampedCount > 0) {
+            NSLog(@"[UnreadTrace] loadConversationList 已读水位夹取 %ld 条", (long)clampedCount);
+        }
+
+        NSMutableArray<WKConversationWrapModel*> *conversationWrapModels = [[NSMutableArray alloc] init];
+        NSInteger filteredCount = 0;
+        if(conversations) {
+            for (WKConversation *conversation in conversations) {
+                if(![strongSelf shouldShowConversation:conversation]) {
+                    filteredCount++;
+                    continue;
+                }
+                if(conversation.channel.channelType == WK_COMMUNITY_TOPIC) {
+                    continue;
+                }
+                WKConversationWrapModel *wrapModel = [[WKConversationWrapModel alloc] initWithConversation:conversation];
+                if(conversation.parentChannel) {
+                    WKConversationWrapModel *parentConversationWrapModel = [strongSelf addOrCreateParentConversation:conversation.parentChannel newConversationWrapModel:wrapModel conversationWrapModels:conversationWrapModels];
+                    if(parentConversationWrapModel) {
+                        [strongSelf handleProhibitwords:parentConversationWrapModel];
+                        [conversationWrapModels addObject:parentConversationWrapModel];
+                    }
+                } else {
+                    [strongSelf handleProhibitwords:wrapModel];
+                    [conversationWrapModels addObject:wrapModel];
+                }
+            }
+        }
+
+        // 从旧 model 继承 threadPreviews/threadCount
+        for (WKConversationWrapModel *model in conversationWrapModels) {
+            NSDictionary *data = oldThreadData[model.channel.channelId];
+            if (data) {
+                model.threadPreviews = data[@"previews"];
+                model.threadCount = [data[@"count"] integerValue];
+            }
+        }
+
+        // 恢复 reminders（DB 查询）
+        for (WKConversationWrapModel *model in conversationWrapModels) {
+            WKConversation *conv = [model getConversation];
+            if (!conv.reminders || conv.reminders.count == 0) {
+                NSArray<WKReminder *> *reminders = [[WKReminderDB shared] getWaitDoneReminder:conv.channel];
+                if (reminders.count > 0) {
+                    conv.reminders = reminders;
+                }
+            }
+        }
+
+        // 构建子区索引缓存（DB 查询）。空间隔离：子区按"父群在不在当前 Space
+        // 白名单"过滤；缺这个 gate 会让另一个 Space 的子区会话漏到最近 tab 列表里。
+        NSSet<NSString *> *syncedGroupsSnapshot = strongSelf.syncedGroupChannelIds;
+        NSMutableDictionary<NSString*, NSMutableArray<WKConversation*>*> *topicsByGroup = [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSString*, NSArray<WKReminder*>*> *remindersByChannelId = [NSMutableDictionary dictionary];
+        for (WKConversation *conv in conversations) {
+            if (conv.channel.channelType != WK_COMMUNITY_TOPIC) continue;
+            NSString *channelId = conv.channel.channelId;
+            NSRange sep = [channelId rangeOfString:@"____"];
+            if (sep.location == NSNotFound) continue;
+            NSString *groupId = [channelId substringToIndex:sep.location];
+            // 父群不在当前 Space 白名单 → 子区不收（白名单为 nil 表示首次 sync 前
+            // 不过滤，与 shouldShowConversation: 同语义）
+            if (syncedGroupsSnapshot && ![syncedGroupsSnapshot containsObject:groupId]) continue;
+            NSMutableArray *topics = topicsByGroup[groupId];
+            if (!topics) { topics = [NSMutableArray array]; topicsByGroup[groupId] = topics; }
+            [topics addObject:conv];
+            NSArray<WKReminder*> *reminders = [[WKReminderDB shared] getWaitDoneReminder:conv.channel];
+            if (reminders.count > 0) remindersByChannelId[channelId] = reminders;
+        }
+        // 注：getConversationList 不返回 WK_COMMUNITY_TOPIC（SDK 设计如此），上面循环
+        // 在冷启动时一条子区也拿不到。改由主线程在 cache 写回后调
+        // seedFollowedThreadsIntoTopicsCache 按 followedKeys 显式 batch-fetch 一遍兜底，
+        // 避免"+N子区" cell badge unread 永远是 0 的偶发崩在冷启动场景。
+        // 最近 tab 子区独立行渲染源 threadWrapModels：严格按 parent.threadPreviews
+        // （listThreads 拉回的真实结果）收集，与 syncThreadWrapModelsFromCachedTopics
+        // 同款口径，确保 cell / badge 看到的子区集合一致。
+        //
+        // 之前是直接 wrap 所有 SDK cache 持有的 thread conversation（topicsByGroup 的副产品）,
+        // 把 SDK cache 里早不活跃 / 跨 group / 归档 / 用户没 join 的 thread 全部塞进 threadWrapModels,
+        // 实测 loadConversationList 把 threadWrapModels 从 20 涨到 185，后续
+        // syncThreadWrapModelsFromCachedTopics 又按 parent.threadPreviews prune 回 20,
+        // 中间这一波 badge 算上 165 个幽灵 thread 的 unread (94 条 = 866) → 闪到 872。
+        // 现在 loadConversationList 一开始就用同款口径，根除 spike 来源。
+        NSMutableArray<WKConversationWrapModel*> *threadWrapModels = [NSMutableArray array];
+        for (WKConversationWrapModel *parent in conversationWrapModels) {
+            if (parent.channel.channelType != WK_GROUP) continue;
+            if (syncedGroupsSnapshot && ![syncedGroupsSnapshot containsObject:parent.channel.channelId]) continue;
+            for (WKThreadModel *t in parent.threadPreviews) {
+                if (t.channelId.length == 0) continue;
+                WKChannel *threadChannel = [WKChannel channelID:t.channelId channelType:WK_COMMUNITY_TOPIC];
+                WKConversation *conv = [[WKSDK shared].conversationManager getConversation:threadChannel];
+                if (conv) {
+                    [threadWrapModels addObject:[[WKConversationWrapModel alloc] initWithConversation:conv]];
+                } else {
+                    // SDK 没有 → 合成占位（与 syncThreadWrapModelsFromCachedTopics 同款），
+                    // 等真实 conv 通过 onConversationUpdate 到达后 lastMessage 不再 nil,
+                    // getRecentUnreadCount 才会算入（placeholder 已经 skip）。
+                    WKConversation *placeholder = [[WKConversation alloc] init];
+                    placeholder.channel = threadChannel;
+                    placeholder.unreadCount = t.unreadCount;
+                    [threadWrapModels addObject:[[WKConversationWrapModel alloc] initWithConversation:placeholder]];
+                }
+            }
+        }
+
+        // 排序（纯内存）
+        [conversationWrapModels sortUsingComparator:^NSComparisonResult(WKConversationWrapModel *obj1, WKConversationWrapModel *obj2) {
+            if(obj1.stick && !obj2.stick) return NSOrderedAscending;
+            if(!obj1.stick && obj2.stick) return NSOrderedDescending;
+            if(obj1.lastMsgTimestamp > obj2.lastMsgTimestamp) return NSOrderedAscending;
+            if(obj1.lastMsgTimestamp < obj2.lastMsgTimestamp) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+
+        NSLog(@"[TabPerf] loadConversationList(bg): total=%.1fms models=%lu",
+              (CFAbsoluteTimeGetCurrent()-_lcStart)*1000, (unsigned long)conversationWrapModels.count);
+
+        // ===== 主线程：赋值 + UI 回调 =====
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) mainSelf = weakSelf;
+            if (!mainSelf) return;
+
+            // 过期结果闸门：期间发生过 reset（换代）或空间已经变了 → 这批数据属于上一个
+            // 空间，既不能写进 VM 也不能盖章。直接丢弃，不调 finished ——
+            // finished 里会 persistRenderedMembershipSnapshot，让它跑就等于把旧空间的
+            // 会话写进新空间的归属表。新空间自己那次 load 的 finished 会负责刷 UI。
+            NSString *nowSpaceId = [WKConvListCache currentSpaceId];
+            BOOL spaceChanged = (requestedSpaceId || nowSpaceId)
+                && !(requestedSpaceId == nowSpaceId || [requestedSpaceId isEqualToString:nowSpaceId]);
+            if (requestedGen != mainSelf.vmGeneration || spaceChanged) {
+                NSLog(@"[SpaceIndex] 丢弃过期 loadConversationList 结果: gen %ld→%ld space %@→%@ rows=%lu",
+                      (long)requestedGen, (long)mainSelf.vmGeneration,
+                      requestedSpaceId ?: @"<nil>", nowSpaceId ?: @"<nil>",
+                      (unsigned long)conversationWrapModels.count);
+                return;
+            }
+
+            mainSelf.cachedAllConversations = conversations;
+            mainSelf.conversationWrapModels = conversationWrapModels;
+            mainSelf.threadWrapModels = threadWrapModels;
+            // 盖章用**发起时**捕获的空间，不是回调时的 currentSpaceId。上面的闸门已经保证
+            // 两者相等，这里用捕获值是为了让"这批数据属于哪个空间"这件事只有一个来源。
+            mainSelf.loadedForSpaceId = requestedSpaceId;
+            [mainSelf rebuildChannelIndex];
+            mainSelf.cachedTopicsByGroup = topicsByGroup;
+            mainSelf.cachedRemindersByChannelId = remindersByChannelId;
+            WK_THREAD_BADGE_DBG(@"[ThreadBadgeDbg] loadConversationList snapshot: topicsByGroup=%lu (groups), reminders=%lu (channels)",
+                  (unsigned long)topicsByGroup.count, (unsigned long)remindersByChannelId.count);
+            // 兜底用 followedKeys 把已关注子区从 SDK DB 抓回来 — getConversationList 不返
+            // 回 WK_COMMUNITY_TOPIC，上面 bg 循环冷启动期一条都收不到。
+            [mainSelf seedFollowedThreadsIntoTopicsCache];
+            [mainSelf rebuildFilteredList];
+
+            // 更新 threadData 缓存（跨 reset 保留，防止切空间时 threadPreviews 丢失）
+            NSMutableDictionary *newThreadCache = [NSMutableDictionary dictionary];
+            for (WKConversationWrapModel *m in conversationWrapModels) {
+                if (m.threadCount > 0) {
+                    newThreadCache[m.channel.channelId] = @{
+                        @"previews": m.threadPreviews ?: @[],
+                        @"count": @(m.threadCount)
+                    };
+                }
+            }
+            mainSelf.cachedThreadData = newThreadCache;
+
+            NSLog(@"[TabPerf] loadConversationList: mainThread assign+callback, totalFromStart=%.1fms",
+                  (CFAbsoluteTimeGetCurrent()-_lcStart)*1000);
+            WK_THREAD_BADGE_DBG(@"[ThreadSync] loadConversationList done: groups+DMs=%ld threadWrapModels=%ld (来源 getConversationList)",
+                  (long)conversationWrapModels.count, (long)threadWrapModels.count);
+
+            if(finished) {
+                finished();
+            }
+            [mainSelf fetchThreadCountsForGroups];
+        });
+    });
+}
+
+/// 通过 API 获取每个群组的子区真实数量（带完成回调）
+-(void) fetchThreadCountsForGroupsWithCompletion:(void(^)(void))completion {
+    // 防并发: 见 self.threadCountsFetchInFlight 注释 (Follow ↔ Recent 频繁切换
+    // 时多波 fetch 在飞导致 sync 看到中间态, Follow tab 闪烁). 第二次进来直接
+    // 短路, 不调 completion (caller fetchThreadCountsForGroups 只 post 通知,
+    // 在飞那次完成时会 post, 不会丢事件).
+    if (self.threadCountsFetchInFlight) {
+        return;
+    }
+    NSMutableArray<WKConversationWrapModel *> *groupModels = [NSMutableArray array];
+    for (WKConversationWrapModel *model in self.conversationWrapModels) {
+        if (model.channel.channelType == WK_GROUP) {
+            [groupModels addObject:model];
+        }
+    }
+    if (groupModels.count == 0) {
+        if (completion) completion();
+        return;
+    }
+    self.threadCountsFetchInFlight = YES;
+
+    dispatch_group_t group = dispatch_group_create();
+    // 累积 listThreads 回的每个群下 thread → WKConversation 映射，统一在 notify
+    // 那一次主线程 merge 进 cachedTopicsByGroup（避免 N 个 .then 各自异步 merge 引入
+    // 写后写竞态）。SDK getConversationList 不返回 WK_COMMUNITY_TOPIC，
+    // getConversations: 在冷启 DB 也是空，唯一的子区 unread 真值就在 listThreads 回的
+    // WKThreadModel.unreadCount 里。
+    NSMutableDictionary<NSString*, NSArray<WKConversation*>*> *threadConvsAccum = [NSMutableDictionary dictionary];
+    // 与 threadConvsAccum 同步的"该群响应是否完整（未被 maxPages 截断）"标记。
+    // mergeThreadConvs 据此决定要不要 prune cache 里 listAllThreads 没回的 channelId。
+    NSMutableSet<NSString*> *completeGroups = [NSMutableSet set];
+
+    // PR review #4/#7 warning：listAllThreads(maxPages:10) 对 N 个群并发，冷启动可
+    // 多到 N*10 个 listThreads 请求。maxPages:10 只对「有已关注子区」的群有意义 ——
+    // Follow tab 的「+N 子区」/ Follow tab badge 都按 followedKeys 过滤，无任何
+    // 已关注子区的群即便分页拉到 1000 条也没有 UI 消费方。
+    //
+    // 两阶段策略：
+    //   1) store 已加载：一次性算出有已关注子区的 group set，剩下的群 maxPages=1
+    //   2) store 未加载（冷启动 race）：所有群都先 maxPages=1（threadCount/preview
+    //      估值够用），等 onFollowedKeysStoreDidUpdate 触发时再走 coldStartCatchupIfNeeded
+    //      对那些有已关注子区的群补一次 maxPages=10 完整分页。
+    // 不再像之前那样在 store 未加载时给所有群无脑发 10 页 —— 大账户冷启 N×10 网络放大。
+    NSSet<NSString*> *groupsWithFollowedThreads = [self groupNosWithFollowedThreads];
+    BOOL storeLoaded = [WKFollowedKeysStore shared].loaded;
+    if (storeLoaded) {
+        self.didColdStartFullPaging = YES; // 标记本次 fetch 已经拿到 followed 信息
+    }
+    // PR review #13 critical：捕获 generation，回包时校验，避免 reset(切 Space)
+    // 之后旧 Space 的 listThreads 响应 merge 进 cache
+    NSInteger startGen = self.vmGeneration;
+
+    for (WKConversationWrapModel *model in groupModels) {
+        NSString *groupNo = model.channel.channelId;
+        dispatch_group_enter(group);
+        // 大群 followed=176 时 listThreads 单页只回 100，moreUnread 计算会偏小（实测
+        // 92 vs 实际 832），所以「有已关注子区」的群必须 maxPages=10。
+        NSInteger maxPages;
+        if (!storeLoaded) {
+            maxPages = 1; // 冷启 race：先 1 页，等 store 加载好后 catchup 补全
+        } else if ([groupsWithFollowedThreads containsObject:groupNo]) {
+            maxPages = 10;
+        } else {
+            maxPages = 1;
+        }
+        [[WKThreadService shared] listAllThreadsWithCompleteness:groupNo maxPages:maxPages].then(^(NSDictionary *result) {
+            // generation 闸门 + syncedGroups 二重保险：reset 之后丢弃整批，单条响应
+            // 父群不在当前 Space 白名单也丢弃（防御 syncedGroups 已重建但本群非属）
+            if (startGen != self.vmGeneration) { dispatch_group_leave(group); return; }
+            if (self.syncedGroupChannelIds && ![self.syncedGroupChannelIds containsObject:groupNo]) {
+                dispatch_group_leave(group); return;
+            }
+            NSArray<WKThreadModel*> *threads = result[@"threads"] ?: @[];
+            BOOL complete = [result[@"complete"] boolValue];
+            NSArray *sorted = [self sortThreadsByLocalTimestamp:threads];
+            // 去掉旧的 3 天客户端切片：会话列表 preview 行直接展示子区列表 API
+            // 返回的全部 status=active 子区（对齐 web ConversationList groupThreadsWithParent）。
+            // dormant active 子区也属于活跃，归档区单独走下面的 archived count 探查。
+            NSMutableArray *activeThreads = [NSMutableArray array];
+            for (WKThreadModel *t in sorted) {
+                if (t.status != WKThreadStatusActive) continue;
+                [activeThreads addObject:t];
+            }
+            model.threadPreviews = [activeThreads copy];
+            model.threadCount = (NSInteger)activeThreads.count;
+            NSArray<WKConversation*> *convs = [self materializeThreadConvs:sorted];
+            @synchronized (threadConvsAccum) {
+                threadConvsAccum[groupNo] = convs;
+                if (complete) [completeGroups addObject:groupNo];
+            }
+            dispatch_group_leave(group);
+        }).catch(^(NSError *error) {
+            dispatch_group_leave(group);
+        });
+    }
+    dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        // PR review #13 critical：完成时再校验一次 generation —— 全部 leg 都
+        // dispatch_group_leave 后才会跑这个 block，期间可能已经 reset；
+        // 此时 mergeThreadConvs 把累积下来的旧 Space 数据进 cache 就把空间隔离破了
+        self.threadCountsFetchInFlight = NO;
+        if (startGen != self.vmGeneration) {
+            if (completion) completion();
+            return;
+        }
+        [self mergeThreadConvs:threadConvsAccum prunableGroups:completeGroups];
+        // 全量 fetch 完成后也同步 threadWrapModels — 否则 cold boot 走的是这条路径
+        // （loadConversationList → fetchThreadCountsForGroups → 这里），子区永远进不
+        // 了 threadWrapModels，最近 tab 一片空白
+        [self syncThreadWrapModelsFromCachedTopics];
+        if (completion) completion();
+    });
+}
+
+/// 拉取所有群组的子区数量，完成后统一通知 VC 刷新（不再逐个发通知）
+-(void) fetchThreadCountsForGroups {
+    WK_THREAD_BADGE_DBG(@"[ThreadDebug] fetchThreadCountsForGroups START, groupCount=%ld", (long)[self groupModelCount]);
+    [self fetchThreadCountsForGroupsWithCompletion:^{
+        WK_THREAD_BADGE_DBG(@"[ThreadDebug] fetchThreadCountsForGroups DONE, posting WKThreadCountBatchUpdated");
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"WKThreadCountBatchUpdated" object:nil];
+    }];
+}
+
+-(NSInteger) groupModelCount {
+    NSInteger count = 0;
+    for (WKConversationWrapModel *m in self.conversationWrapModels) {
+        if (m.channel.channelType == WK_GROUP) count++;
+    }
+    return count;
+}
+
+/// 把 followedKeys 中所有 thread 类型的 key 解析出来，按 groupNo 聚合成 set。
+/// 给 fetchThreadCountsForGroupsWithCompletion / refreshThreadCountForGroups 决定
+/// 每个群的 maxPages：有已关注子区的群 → 全分页（10），无的 → 1 页就够。
+/// store 未加载（key 列表空集）时返回空集合，caller 负责按"未知"保守取 10 页。
+- (NSSet<NSString*>*)groupNosWithFollowedThreads {
+    NSMutableSet<NSString*> *result = [NSMutableSet set];
+    NSString *threadPrefix = [NSString stringWithFormat:@"%ld::", (long)WKFollowTargetTypeThread];
+    for (NSString *k in [WKFollowedKeysStore shared].followedKeys) {
+        if (![k hasPrefix:threadPrefix]) continue;
+        NSString *channelId = [k substringFromIndex:threadPrefix.length]; // groupNo____shortId
+        NSRange sep = [channelId rangeOfString:@"____"];
+        if (sep.location == NSNotFound) continue;
+        [result addObject:[channelId substringToIndex:sep.location]];
+    }
+    return result;
+}
+
+/// 冷启动两阶段分页 catchup（PR review #7 warning）：
+/// 当 fetchThreadCountsForGroupsWithCompletion 在 store 未加载时跑过一遍
+/// （所有群都是 maxPages=1），等 store 加载完成后 VC 调本方法补一次：
+/// 仅对「现已知有已关注子区」的群发 maxPages=10 完整分页 listAllThreads，
+/// 把单页截断的 followed 子区 unread 补全。已经跑过 storeLoaded 分支
+/// (didColdStartFullPaging=YES) 时直接 no-op，保证只跑一次。
+- (void)coldStartCatchupIfNeeded {
+    if (self.didColdStartFullPaging) return;
+    if (![WKFollowedKeysStore shared].loaded) return;
+    self.didColdStartFullPaging = YES;
+    NSSet<NSString*> *groupsWithFollowedThreads = [self groupNosWithFollowedThreads];
+    if (groupsWithFollowedThreads.count == 0) return;
+    WK_THREAD_BADGE_DBG(@"[ThreadBadgeDbg] coldStartCatchup: %lu groups with followed threads need full paging",
+                        (unsigned long)groupsWithFollowedThreads.count);
+    [self refreshThreadCountForGroups:groupsWithFollowedThreads];
+}
+
+/// 刷新指定群组的子区数量（批量请求，统一刷新）
+-(void) refreshThreadCountForGroups:(NSSet<NSString*>*)groupNos {
+    NSMutableArray<WKConversationWrapModel *> *models = [NSMutableArray array];
+    for (NSString *groupNo in groupNos) {
+        WKConversationWrapModel *model = [self modelAtChannel:[WKChannel groupWithChannelID:groupNo]];
+        if (model) [models addObject:model];
+    }
+    if (models.count == 0) return;
+
+    dispatch_group_t batchGroup = dispatch_group_create();
+    NSMutableDictionary<NSString*, NSArray<WKConversation*>*> *threadConvsAccum = [NSMutableDictionary dictionary];
+    NSMutableSet<NSString*> *completeGroups = [NSMutableSet set];
+
+    // 与 fetchThreadCountsForGroupsWithCompletion 同款 maxPages 收敛：无已关注子区
+    // 的群单页够用（PR review #4 warning）。
+    NSSet<NSString*> *groupsWithFollowedThreads = [self groupNosWithFollowedThreads];
+    BOOL storeLoaded = [WKFollowedKeysStore shared].loaded;
+    // PR review #13 critical：捕获 generation，回包/最终 merge 时校验，避免 reset
+    // (切 Space) 之后旧 Space 的响应 merge 进 cache
+    NSInteger startGen = self.vmGeneration;
+
+    for (WKConversationWrapModel *model in models) {
+        NSString *groupNo = model.channel.channelId;
+        dispatch_group_enter(batchGroup);
+        NSInteger maxPages = (storeLoaded && ![groupsWithFollowedThreads containsObject:groupNo]) ? 1 : 10;
+        [[WKThreadService shared] listAllThreadsWithCompleteness:groupNo maxPages:maxPages].then(^(NSDictionary *result) {
+            if (startGen != self.vmGeneration) { dispatch_group_leave(batchGroup); return; }
+            if (self.syncedGroupChannelIds && ![self.syncedGroupChannelIds containsObject:groupNo]) {
+                dispatch_group_leave(batchGroup); return;
+            }
+            NSArray<WKThreadModel*> *threads = result[@"threads"] ?: @[];
+            BOOL complete = [result[@"complete"] boolValue];
+            NSArray *sorted = [self sortThreadsByLocalTimestamp:threads];
+            // 与 fetchThreadCountsForGroupsWithCompletion 同款：去 3 天切片，
+            // 全部 active 子区都进 previews（dormant active 也算活跃）。
+            NSMutableArray *activeThreads = [NSMutableArray array];
+            for (WKThreadModel *t in sorted) {
+                if (t.status != WKThreadStatusActive) continue;
+                [activeThreads addObject:t];
+            }
+            WKConversationWrapModel *currentModel = [self modelAtChannel:[WKChannel groupWithChannelID:groupNo]];
+            if (!currentModel) currentModel = model;
+            currentModel.threadPreviews = [activeThreads copy];
+            currentModel.threadCount = (NSInteger)activeThreads.count;
+            for (WKThreadModel *t in activeThreads) {
+                if (t.channelId.length > 0) {
+                    [WKThreadCreatedContent messageCountCache][t.channelId] = @(t.messageCount);
+                }
+            }
+            NSArray<WKConversation*> *convs = [self materializeThreadConvs:sorted];
+            @synchronized (threadConvsAccum) {
+                threadConvsAccum[groupNo] = convs;
+                if (complete) [completeGroups addObject:groupNo];
+            }
+            dispatch_group_leave(batchGroup);
+        }).catch(^(NSError *error) {
+            dispatch_group_leave(batchGroup);
+        });
+    }
+    dispatch_group_notify(batchGroup, dispatch_get_main_queue(), ^{
+        // PR review #13 critical：reset 后丢弃 merge + 通知，保持空间隔离
+        if (startGen != self.vmGeneration) return;
+        [self mergeThreadConvs:threadConvsAccum prunableGroups:completeGroups];
+        // listThreads 拿到的子区也同步进 threadWrapModels —— 不然最近 tab 冷启动时
+        // SDK getConversationList 没返回子区，threadWrapModels 是空的，列表里看不到
+        // 任何子区行；用户必须发条子区消息触发 onConversationUpdate 才出来。
+        [self syncThreadWrapModelsFromCachedTopics];
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"WKThreadCountBatchUpdated" object:nil];
+        [[NSNotificationCenter defaultCenter] postNotificationName:WKThreadMessageCountUpdatedNotification object:nil];
+    });
+}
+
+/// 把 listThreads 已发现的所有子区同步到 threadWrapModels（最近 tab 平铺渲染源）。
+/// 优先用 SDK 缓存的真实 WKConversation；SDK 没有时（冷启 SDK 还没把 thread 加载完）
+/// 用 WKThreadModel 信息**合成一个最小 WKConversation**作为占位 — 保证 cell 至少
+/// 能渲染（标题 + 未读数；preview/time 暂空，等真实 conv 到来时由
+/// applyThreadConversationUpdates: setConversation: 替换）。
+- (void)syncThreadWrapModelsFromCachedTopics {
+    // 把当前 wrap 拷一份当复用池，然后只从最新 listThreads 已发现的 thread 重建 byChannel。
+    // 不再用旧 threadWrapModels 做 seed —— 关闭 / 归档 / 服务端筛掉的子区必须立即从 Recent
+    // 消失，否则旧行会一直停留到 VM 全量 reset 才清。
+    NSMutableDictionary<NSString *, WKConversationWrapModel *> *oldByChannel = [NSMutableDictionary dictionary];
+    for (WKConversationWrapModel *m in self.threadWrapModels) {
+        if (m.channel.channelId) oldByChannel[m.channel.channelId] = m;
+    }
+    NSMutableDictionary<NSString *, WKConversationWrapModel *> *byChannel = [NSMutableDictionary dictionary];
+    NSSet<NSString *> *syncedGroups = self.syncedGroupChannelIds;
+    BOOL changed = NO;
+    NSInteger parentCount = 0;
+    NSInteger threadsTotal = 0;
+    NSInteger sdkHits = 0;
+    NSInteger synthesized = 0;
+    NSInteger reused = 0;
+    for (WKConversationWrapModel *parent in self.conversationWrapModels) {
+        if (parent.channel.channelType != WK_GROUP) continue;
+        // 父群不在当前 Space 白名单 → 整组子区都跳过（避免漏到最近 tab）
+        if (syncedGroups && ![syncedGroups containsObject:parent.channel.channelId]) continue;
+        parentCount++;
+        for (WKThreadModel *t in parent.threadPreviews) {
+            if (t.channelId.length == 0) continue;
+            threadsTotal++;
+            WKChannel *threadChannel = [WKChannel channelID:t.channelId channelType:WK_COMMUNITY_TOPIC];
+            WKConversation *conv = [[WKSDK shared].conversationManager getConversation:threadChannel];
+            WKConversationWrapModel *existing = oldByChannel[t.channelId];
+            if (existing) {
+                // 仍在 discovered 集合 → 复用旧 wrap，保住 onConversationUpdate 写入的 preview / lastMessage。
+                // 旧 wrap 是 placeholder（lastMessage 空）且 SDK 现在有真实 conv → 顺手刷一次。
+                if (conv && !existing.lastMessage) {
+                    [existing setConversation:conv];
+                    changed = YES;
+                }
+                byChannel[t.channelId] = existing;
+                reused++;
+                continue;
+            }
+            if (conv) {
+                sdkHits++;
+                byChannel[t.channelId] = [[WKConversationWrapModel alloc] initWithConversation:conv];
+                changed = YES;
+            } else {
+                // SDK 没有 → 合成一个最小 WKConversation 作为占位，避免子区在最近
+                // tab 完全消失。lastMessage 留空，cell 显示标题 + 未读数即可，等
+                // 真实消息到来时由 applyThreadConversationUpdates 替换。
+                WKConversation *placeholder = [[WKConversation alloc] init];
+                placeholder.channel = threadChannel;
+                placeholder.unreadCount = t.unreadCount;
+                synthesized++;
+                byChannel[t.channelId] = [[WKConversationWrapModel alloc] initWithConversation:placeholder];
+                changed = YES;
+            }
+        }
+    }
+    // 检测 prune：oldByChannel 里有但 byChannel 没了的项 = 该子区已不在最新 discovered 集合，需要清掉。
+    if (!changed && byChannel.count != oldByChannel.count) changed = YES;
+    if (!changed) {
+        for (NSString *k in oldByChannel) {
+            if (!byChannel[k]) { changed = YES; break; }
+        }
+    }
+    WK_THREAD_BADGE_DBG(@"[ThreadSync] syncThreadWrapModels: parents=%ld threadsInPreviews=%ld sdkHits=%ld synthesized=%ld reused=%ld changed=%d total=%ld old=%ld",
+          (long)parentCount, (long)threadsTotal, (long)sdkHits, (long)synthesized, (long)reused, changed, (long)byChannel.count, (long)oldByChannel.count);
+    if (changed) {
+        self.threadWrapModels = [byChannel.allValues copy];
+        // 总是 rebuildFilteredList — Follow tab 启动时也要让 filteredConversations
+        // 准备好，避免切到 Recent 才发现里面没子区
+        [self rebuildFilteredList];
+        WK_THREAD_BADGE_DBG(@"[ThreadSync] threadWrapModels=%ld filteredConversations=%ld filterType=%ld",
+              (long)self.threadWrapModels.count, (long)self.filteredConversations.count, (long)self.filterType);
+    }
+}
+
+/// 用本地会话时间戳排序子区（解决服务端 updated_at 延迟导致首条消息排序不更新）
+-(NSArray<WKThreadModel*>*) sortThreadsByLocalTimestamp:(NSArray<WKThreadModel*>*)threads {
+    NSMutableDictionary<NSString*, NSNumber*> *tsMap = [NSMutableDictionary dictionaryWithCapacity:threads.count];
+    for (WKThreadModel *t in threads) {
+        if (t.channelId.length == 0) continue;
+        WKConversation *conv = [[WKSDK shared].conversationManager getConversation:
+                                [WKChannel channelID:t.channelId channelType:WK_COMMUNITY_TOPIC]];
+        tsMap[t.channelId] = @(conv ? conv.lastMsgTimestamp : 0);
+    }
+    return [threads sortedArrayUsingComparator:^NSComparisonResult(WKThreadModel *a, WKThreadModel *b) {
+        double tsA = [tsMap[a.channelId] doubleValue];
+        double tsB = [tsMap[b.channelId] doubleValue];
+        if (tsA != tsB) return tsA > tsB ? NSOrderedAscending : NSOrderedDescending;
+        return [b.updatedAt compare:a.updatedAt];
+    }];
+}
+
+/// 判断会话是否应在当前空间显示
+-(BOOL) shouldShowConversation:(WKConversation*)conversation {
+    NSString *currentSpaceId = [[NSUserDefaults standardUserDefaults] objectForKey:@"currentSpaceId"];
+    if(!currentSpaceId || currentSpaceId.length == 0) {
+        return YES; // 无空间上下文，不过滤
+    }
+    NSString *channelId = conversation.channel.channelId;
+    // 系统通知、文件助手始终显示
+    if([channelId isEqualToString:[WKApp shared].config.systemUID] ||
+       [channelId isEqualToString:[WKApp shared].config.fileHelperUID]) {
+        return YES;
+    }
+    // BotFather：检查当前空间是否已隐藏
+    NSString *botfatherUID = [WKApp shared].config.botfatherUID;
+    if(botfatherUID && [channelId isEqualToString:botfatherUID]) {
+        NSString *hiddenKey = [NSString stringWithFormat:@"WKBotFatherHidden_%@", currentSpaceId];
+        if([[NSUserDefaults standardUserDefaults] boolForKey:hiddenKey]) {
+            return NO;
+        }
+        return YES;
+    }
+    // 群聊：优先走 WKSpaceFilter（支持外部群 source_space_id 兜底，对齐 dmwork-web PR #1036 #1037）
+    //   - Keep: channelInfo.space_id == currentSpaceId 或 member.source_space_id == currentSpaceId
+    //   - Skip: channelInfo.space_id 明确不匹配且我不是外部成员
+    //   - FailOpen: channelInfo 未缓存，降级走白名单（iOS 原有兼容路径）
+    if(conversation.channel.channelType == WK_GROUP) {
+        WKSpaceFilterDecision decision = [[WKSpaceFilter shared] decideChannel:conversation.channel.channelId
+                                                                  channelType:conversation.channel.channelType];
+        if(decision == WKSpaceFilterDecisionKeep) {
+            return YES;
+        }
+        if(decision == WKSpaceFilterDecisionSkip) {
+            return NO;
+        }
+        // fail-open：用 sync 白名单兜底
+        //   - nil: 尚未sync（首次启动DB清空后），暂不过滤（shouldShowConversation 主要在
+        //         loadConversationList 的 DB 冷启动路径调用；DB 是上次 sync 的持久化真值，
+        //         此时放行不会带来跨 Space 串台。新消息路径不走本方法——它走
+        //         WKConversationListVC.filterConversationsBySpace，那里已按 收紧。）
+        //   - 空集合: sync完成但当前空间无群聊，过滤掉所有群聊
+        //   - 非空: 只显示白名单中的群聊
+        if(self.syncedGroupChannelIds) {
+            return [self.syncedGroupChannelIds containsObject:conversation.channel.channelId];
+        }
+        return YES; // 白名单未初始化（首次sync前），暂不过滤
+    }
+
+    // Person 频道：默认放行（消息级隔离在聊天页面 shouldShowMessageInCurrentSpace 处理）。
+    // 例外：channelId 带 `s{otherSpace}_` 前缀（Bot 与私聊均会被后端前缀化）→ Skip。
+    // 对齐 web `shouldSkipChannelForSpace`（dmwork-web/.../SpaceService.tsx:23-25）。
+    // 无前缀的私聊保持向前兼容。
+    if(conversation.channel.channelType == WK_PERSON) {
+        WKSpaceFilterDecision decision = [[WKSpaceFilter shared]
+                                           decideChannel:conversation.channel.channelId
+                                             channelType:conversation.channel.channelType];
+        if(decision == WKSpaceFilterDecisionSkip) {
+            return NO;
+        }
+        // 注意：这里**不要**再加一道"内存 DM 白名单"过滤。
+        //
+        // 曾经加过（用 syncedPersonChannelIds 按归属表过滤 DM），结果是"进聊天详情再返回，
+        // 所有私聊全部消失"：会话列表里的 DM 有两个来源 —— DB 读路径（已被 SQL 空间作用域
+        // 过滤过）和实时路径（onConversationUpdate → uiAddConversation，走的是
+        // isConversationInCurrentSpace）。实时路径加进来的 DM 不一定在归属表里，于是
+        // 内存白名单比 DB 作用域更严，返回列表触发一次完整 loadConversationList 就把它们
+        // 全筛掉了。
+        //
+        // 空间隔离由 SQL 作用域负责（getConversationList 只返回归属于当前空间的行），
+        // 一份事实一个权威源；再叠一层内存集合只会因为两者漂移而丢数据。
+        // 跨空间残留由 prune / sweep 在拿到明确证据时清理。
+        // 跨 Space 私聊 lastMessage.space_id 兜底：与实时路径
+        // (WKConversationListVC.filterConversationsBySpace → isConversationInCurrentSpace) 对齐。
+        // 场景：在 Space A 时收到 Space B 的人私聊，SDK 把该 WKConversation 写进 DB；
+        // 此时 channelId 是裸 UID（无 s{spaceB}_ 前缀），channelInfo.extra 也未必有 space_id，
+        // WKSpaceFilter 判 FailOpen → 这里默认 YES，pop 回会话列表时 loadConversationList
+        // 重新走 DB，会把 B 的私聊浮到 A 的列表里。必须看 lastMessage.space_id 显式排除。
+        if(conversation.lastMessage) {
+            id v = conversation.lastMessage.content.contentDict[@"space_id"];
+            if([v isKindOfClass:[NSString class]]) {
+                NSString *msgSpaceId = (NSString *)v;
+                if(msgSpaceId.length > 0 && ![msgSpaceId isEqualToString:currentSpaceId]) {
+                    return NO;
+                }
+            }
+        }
+        return YES;
+    }
+    return YES;
+}
+
+-(void) handleProhibitwords:(WKConversationWrapModel*)model {
+    if(!model.lastMessage) {
+        return;
+    }
+    if(model.lastMessage.contentType != WK_TEXT) {
+        return;
+    }
+    if( model.lastMessage.remoteExtra.isEdit) {
+        if(model.lastMessage.remoteExtra.isEdit) {
+            WKTextContent *content = (WKTextContent*)model.lastMessage.remoteExtra.contentEdit;
+            content.content =[WKProhibitwordsService.shared filter:content.content]; // 违禁词过滤
+            return;
+        }
+        WKTextContent *content = (WKTextContent*)model.lastMessage.content;
+        content.content = [WKProhibitwordsService.shared filter:content.content]; // 违禁词过滤
+    }
+}
+
+-(WKConversationWrapModel*) addOrCreateParentConversation:(WKChannel*) parentChannel newConversationWrapModel:(WKConversationWrapModel*)wrapModel conversationWrapModels:(NSArray<WKConversationWrapModel*>*)conversationWrapModels {
+    WKConversationWrapModel *parentConversation = [self getConversationWrap:parentChannel conversations:conversationWrapModels];
+    if(parentConversation) {
+        [self handleProhibitwords:wrapModel];
+        [parentConversation addOrUpdateChildren:wrapModel];
+    }else{
+        WKConversation *newParentConversation = [[WKConversation alloc] init];
+        newParentConversation.channel = wrapModel.parentChannel;
+        WKConversationWrapModel *parentConversationWrap = [[WKConversationWrapModel alloc] initWithConversation:newParentConversation];
+        [self handleProhibitwords:wrapModel];
+        [parentConversationWrap addOrUpdateChildren:wrapModel];
+        return parentConversationWrap;
+    }
+    return nil;
+}
+
+-(WKConversationWrapModel*) getConversationWrap:(WKChannel*)channel conversations:(NSArray<WKConversationWrapModel*>*)conversations{
+    for (WKConversationWrapModel *conversation in conversations) {
+        if([conversation.channel isEqual:channel]) {
+            return conversation;
+        }
+    }
+    return nil;
+}
+
+// 获取真实显示的最近会话对象
+-(WKConversationWrapModel*) getRealShowConversationWrap:(WKConversationWrapModel*) wrapModel {
+    if(!wrapModel.parentChannel) {
+        return wrapModel;
+    }
+    WKConversationWrapModel *conversation = [self modelAtChannel:wrapModel.parentChannel];
+    if (conversation) {
+        [self handleProhibitwords:wrapModel];
+        [conversation addOrUpdateChildren:wrapModel];
+        return conversation;
+    }
+    WKConversation *parentConversation = [[WKConversation alloc] init];
+    parentConversation.channel = wrapModel.parentChannel;
+    WKConversationWrapModel *parentConversationWrap = [[WKConversationWrapModel alloc] initWithConversation:parentConversation];
+    [self handleProhibitwords:wrapModel];
+    [parentConversationWrap addOrUpdateChildren:wrapModel];
+    return parentConversationWrap;
+}
+
+-(void) sortConversationList {
+    [self.conversationWrapModels sortUsingComparator:^NSComparisonResult(WKConversationWrapModel   *obj1, WKConversationWrapModel   *obj2) {
+
+        if(obj1.stick && !obj2.stick) {
+            return NSOrderedAscending;
+        }
+        if(obj2.stick && !obj1.stick) {
+            return NSOrderedDescending;
+        }
+        if(obj1.lastMsgTimestamp < obj2.lastMsgTimestamp) {
+            return NSOrderedDescending;
+        }else if(obj1.lastMsgTimestamp == obj2.lastMsgTimestamp) {
+            return NSOrderedSame;
+        }
+        return NSOrderedAscending;
+    }];
+    [self rebuildFilteredList];
+}
+
+#pragma mark - 过滤
+
++ (BOOL)isInactiveGroup:(WKConversationWrapModel *)model {
+    // 去掉"群聊 3 天无消息就从会话列表隐藏"的逻辑(用户要求): 一律按活跃处理。
+    // 单一判定点, 同时覆盖最近 tab 过滤(modelMatchesFilter)、未读统计(getRecentUnreadCount)、
+    // @提醒(recentHasMention)三处, 保证"列表显示 / 未读计数 / 提醒"口径一致, 不会出现
+    // 列表显示了某群但它的未读不计入的错位。子区(thread)的 3 天切片此前已移除。
+    return NO;
+}
+
+- (void)applyThreadConversationUpdates:(NSArray<WKConversation*>*)threadConversations {
+    if (threadConversations.count == 0) return;
+    // 把现有 threadWrapModels 按 channelId 建索引
+    NSMutableDictionary<NSString*, WKConversationWrapModel*> *byChannel = [NSMutableDictionary dictionary];
+    for (WKConversationWrapModel *m in self.threadWrapModels) {
+        if (m.channel.channelId) byChannel[m.channel.channelId] = m;
+    }
+    NSSet<NSString *> *syncedGroups = self.syncedGroupChannelIds;
+    BOOL mutated = NO;
+    // cachedTopicsByGroup mutable 副本，把本批 subzone 也并进去 —— 这份 cache 是
+    // "+N个子区" badge / getFollowUnreadCount 的唯一数据源，loadConversationList
+    // 之后再不主动 merge 就永远漏算冷启动后才到达的子区，"+N" 后面的数字一直不亮
+    // 直到下次 loadConversationList（如切空间）触发 rebuild。
+    NSMutableDictionary<NSString*, NSMutableArray<WKConversation*>*> *topicsMut = nil;
+    if (self.cachedTopicsByGroup) {
+        topicsMut = [NSMutableDictionary dictionaryWithCapacity:self.cachedTopicsByGroup.count];
+        [self.cachedTopicsByGroup enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSArray<WKConversation*> *v, BOOL *stop) {
+            topicsMut[k] = [v mutableCopy];
+        }];
+    } else {
+        topicsMut = [NSMutableDictionary dictionary];
+    }
+    BOOL cacheMutated = NO;
+    for (WKConversation *c in threadConversations) {
+        if (!c.channel.channelId) continue;
+        // 空间隔离：父群必须在当前 Space 白名单（fail-closed）—— syncedGroups 未初始化（reset 后
+        // sync 完成前的 race 窗口）一律拒绝，与 VC.filterConversationsBySpace 的 topic 分支同步,
+        // 避免跨 Space 子区在启动期被错误吸进 threadWrapModels（PR review #1C）。
+        NSRange sep = [c.channel.channelId rangeOfString:@"____"];
+        if (sep.location == NSNotFound) continue;
+        NSString *parentGroupNo = [c.channel.channelId substringToIndex:sep.location];
+        if (!syncedGroups || ![syncedGroups containsObject:parentGroupNo]) continue;
+        WKConversationWrapModel *existing = byChannel[c.channel.channelId];
+        if (existing) {
+            // 已知子区：刷新 lastMessage / lastMsgTimestamp 让 cell 拿到新值（对齐
+            // onlyAddOrUpdateConversation: 里 setConversation: 的处理）。
+            [existing setConversation:c];
+            mutated = YES;
+        }
+        // 未知子区：不再凭空 add 进 threadWrapModels。
+        // 用户进 group 详情时，SDK 会回放/同步一批"幽灵"子区 conversation（早就不活跃但
+        // SDK cache 还在），之前 applyThreadConversationUpdates 来者不拒全部 alloc 新 wrap，
+        // threadWrapModels 瞬间从 20 涨到 185，badge 算上这 165 个的 unread 跳到 872；随后
+        // syncThreadWrapModelsFromCachedTopics 按 parent.threadPreviews（listThreads 真实结果）
+        // prune 回 20，但 badge 中间态已经 leak 给用户。
+        //
+        // 子区进入 threadWrapModels 的唯一通道交给 syncThreadWrapModelsFromCachedTopics
+        // 单点驱动（走 parent.threadPreviews / listThreads 真实结果）+ loadConversationList
+        // 同款口径。这条路径只负责给已知子区更新 preview / timestamp。
+
+        // 但 cachedTopicsByGroup 必须收，否则"+N子区"的 unread 数字永远漏算这次推送 —
+        // 它只是按 parent groupNo 聚合的快照，不影响 Recent tab 独立行的渲染口径
+        // （那是 threadWrapModels 的领地）。已存在则替换为最新引用（SDK 通常同实例，
+        // 但保险起见做去重）。
+        NSMutableArray<WKConversation*> *topics = topicsMut[parentGroupNo];
+        if (!topics) {
+            topics = [NSMutableArray array];
+            topicsMut[parentGroupNo] = topics;
+        }
+        NSInteger foundIdx = NSNotFound;
+        for (NSInteger i = 0; i < (NSInteger)topics.count; i++) {
+            if ([topics[i].channel.channelId isEqualToString:c.channel.channelId]) {
+                foundIdx = i; break;
+            }
+        }
+        if (foundIdx == NSNotFound) {
+            [topics addObject:c];
+            cacheMutated = YES;
+        } else if (topics[foundIdx] != c) {
+            topics[foundIdx] = c;
+            cacheMutated = YES;
+        }
+    }
+    if (mutated) {
+        self.threadWrapModels = [byChannel.allValues copy];
+    }
+    if (cacheMutated) {
+        NSMutableDictionary<NSString*, NSArray<WKConversation*>*> *frozen = [NSMutableDictionary dictionaryWithCapacity:topicsMut.count];
+        [topicsMut enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSMutableArray<WKConversation*> *v, BOOL *stop) {
+            frozen[k] = [v copy];
+        }];
+        self.cachedTopicsByGroup = frozen;
+    }
+    WK_THREAD_BADGE_DBG(@"[ThreadBadgeDbg] applyThreadConvUpdates incoming=%lu wrapMutated=%d cacheMutated=%d cacheGroups=%lu",
+          (unsigned long)threadConversations.count, mutated, cacheMutated, (unsigned long)self.cachedTopicsByGroup.count);
+    [self rebuildFilteredList];
+}
+
+- (BOOL)updateCachedSubzoneUnread:(WKChannel*)channel unreadCount:(NSInteger)unreadCount {
+    if (!channel || channel.channelType != WK_COMMUNITY_TOPIC) return NO;
+    NSString *channelId = channel.channelId;
+    if (channelId.length == 0) return NO;
+    NSRange sep = [channelId rangeOfString:@"____"];
+    if (sep.location == NSNotFound) return NO;
+    NSString *parentGroupNo = [channelId substringToIndex:sep.location];
+
+    NSArray<WKConversation*> *topics = self.cachedTopicsByGroup[parentGroupNo];
+    if (topics.count == 0) return NO;
+
+    BOOL updated = NO;
+    for (WKConversation *conv in topics) {
+        if ([conv.channel.channelId isEqualToString:channelId]) {
+            if (conv.unreadCount != unreadCount) {
+                conv.unreadCount = (int)unreadCount;
+                updated = YES;
+            }
+            break;
+        }
+    }
+    if (updated) {
+        WK_THREAD_BADGE_DBG(@"[ThreadBadgeDbg] updateCachedSubzoneUnread channelId=%@ unread=%ld", channelId, (long)unreadCount);
+    }
+    return updated;
+}
+
+-(BOOL) modelMatchesFilter:(WKConversationWrapModel *)model {
+    uint8_t type = model.channel.channelType;
+    if (self.filterType == WKConversationFilterFollow) {
+        // P2 stage 1：关注 tab 行为不变，仍走分组 group 视图（VC 用 groupDisplayList，
+        // 这里只决定 filteredConversations 内容，对 follow tab 不直接生效）。
+        if (type != WK_GROUP && type != WK_PERSON) return YES;
+        return type == WK_GROUP;
+    }
+    // 最近 tab：DM + 群（3 天活跃）+ 子区，全部平铺
+    if (type == WK_PERSON) return YES;
+    if (type == WK_GROUP) {
+        return ![WKConversationListVM isInactiveGroup:model];
+    }
+    if (type == WK_COMMUNITY_TOPIC) return YES;
+    // 系统通知、文件助手等特殊频道一直展示
+    return YES;
+}
+
+-(void) rebuildFilteredList {
+    // 先去重（同一个 channel 只保留一条，防止外部分享时同时发文件+文本导致重复）
+    NSMutableSet *seenKeys = [NSMutableSet set];
+    NSMutableArray *deduped = [NSMutableArray array];
+    for (WKConversationWrapModel *model in self.conversationWrapModels) {
+        NSString *key = [self channelKey:model.channel];
+        if ([seenKeys containsObject:key]) continue;
+        [seenKeys addObject:key];
+        [deduped addObject:model];
+    }
+    if (deduped.count != self.conversationWrapModels.count) {
+        NSLog(@"[ShareExt] rebuildFilteredList 去重: %lu -> %lu", (unsigned long)self.conversationWrapModels.count, (unsigned long)deduped.count);
+        [self.conversationWrapModels removeAllObjects];
+        [self.conversationWrapModels addObjectsFromArray:deduped];
+        [self rebuildChannelIndex]; // 去重后同步索引
+    }
+
+    NSMutableArray *filtered = [NSMutableArray array];
+    if (self.filterType == WKConversationFilterRecent) {
+        // 最近 tab：DM 用原始 wrap；群用 shadow wrap（不挂子区，避免群行借子区的 lastMessage
+        // 渲染 + 隐藏子区数量指示）；子区独立成行；置顶（stick）参与排序 — 用户在最近 tab
+        // 长按置顶时希望能浮顶。
+        for (WKConversationWrapModel *model in self.conversationWrapModels) {
+            uint8_t type = model.channel.channelType;
+            if (![self modelMatchesFilter:model]) continue;
+            if (type == WK_GROUP) {
+                // shadow wrap：同一个底层 WKConversation，但没有 lastChildConversation/threadCount，
+                // 所以 cell 渲染时取群自己的 lastMessage / 不显示子区角标（修 #2 #4）。
+                // 缺点是 channelInfoInner 缓存丢失，需要 cell 自己懒加载；可以接受。
+                WKConversationWrapModel *shadow = [[WKConversationWrapModel alloc] initWithConversation:[model getConversation]];
+                [filtered addObject:shadow];
+            } else {
+                [filtered addObject:model];
+            }
+        }
+        // 子区独立成行
+        for (WKConversationWrapModel *thread in self.threadWrapModels) {
+            [filtered addObject:thread];
+        }
+        [filtered sortUsingComparator:^NSComparisonResult(WKConversationWrapModel *a, WKConversationWrapModel *b) {
+            // 置顶优先，再按时间倒序
+            if (a.stick && !b.stick) return NSOrderedAscending;
+            if (!a.stick && b.stick) return NSOrderedDescending;
+            if (a.lastMsgTimestamp > b.lastMsgTimestamp) return NSOrderedAscending;
+            if (a.lastMsgTimestamp < b.lastMsgTimestamp) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+    } else {
+        for (WKConversationWrapModel *model in self.conversationWrapModels) {
+            if ([self modelMatchesFilter:model]) {
+                [filtered addObject:model];
+            }
+        }
+    }
+    self.filteredConversations = [filtered copy];
+    WK_THREAD_BADGE_DBG(@"[ThreadSync] rebuildFilteredList done: filterType=%ld convWraps=%ld threadWraps=%ld filtered=%ld",
+          (long)self.filterType, (long)self.conversationWrapModels.count,
+          (long)self.threadWrapModels.count, (long)self.filteredConversations.count);
+}
+
+-(NSInteger) getFollowUnreadCount {
+    // 关注 tab 未读 = 关注集合（DM / 群 / 子区，!mute）的未读总和。
+    WKFollowedKeysStore *store = [WKFollowedKeysStore shared];
+    if (!store.loaded) return 0;
+    NSInteger count = 0;
+    for (WKConversationWrapModel *m in self.conversationWrapModels) {
+        if ([self isChannelMuted:m]) continue;
+        if (m.channel.channelType == WK_PERSON) {
+            if ([store isFollowedWithType:WKFollowTargetTypeDM targetId:m.channel.channelId]) {
+                count += m.unreadCount;
+            }
+        } else if (m.channel.channelType == WK_GROUP) {
+            if ([store isFollowedWithType:WKFollowTargetTypeChannel targetId:m.channel.channelId]) {
+                count += m.unreadCount;
+            }
+        }
+    }
+    // 子区：与 cell 端 "+N个子区" badge 同源，走 cachedTopicsByGroup（cachedAllConversations
+    // 里所有 WK_COMMUNITY_TOPIC 的快照），口径与 getThreadIndicatorForGroup: 一致。
+    // 之前只迭代 threadWrapModels（仅 parent.threadPreviews 那几条预览行），导致已关注
+    // 但不在 preview 行的子区 unread 出现在 +N 行的 badge 里、却没有进 tab 总数 — 用户
+    // 看到的关注 tab 数字比 cell 端总和少。
+    for (NSArray<WKConversation *> *topics in self.cachedTopicsByGroup.allValues) {
+        for (WKConversation *conv in topics) {
+            if ([self isConversationMuted:conv]) continue;
+            if (![store isFollowedWithType:WKFollowTargetTypeThread targetId:conv.channel.channelId]) continue;
+            count += conv.unreadCount;
+        }
+    }
+    return count;
+}
+
+/// 静音判定单一入口：channelInfo.mute 是 SDK 权威源，DB 上的 WKConversation.mute
+/// 是同步快照、冷启动可能滞后，所以优先信 channelInfo，缺失才回退。
+-(BOOL) isChannelMuted:(WKConversationWrapModel *)model {
+    if (!model || !model.channel) return NO;
+    WKChannelInfo *info = [[WKSDK shared].channelManager getChannelInfo:model.channel];
+    if (info) return info.mute;
+    return model.mute;
+}
+
+/// 同上，但接收 WKConversation —— 给 thread cell / cachedTopicsByGroup 这些拿不到 wrap 的路径用。
+-(BOOL) isConversationMuted:(WKConversation *)conv {
+    if (!conv || !conv.channel) return NO;
+    WKChannelInfo *info = [[WKSDK shared].channelManager getChannelInfo:conv.channel];
+    if (info) return info.mute;
+    return conv.mute;
+}
+
+-(NSInteger) getRecentUnreadCount {
+    NSInteger count = 0;
+    // DM + 3 天内活跃的群（与 modelMatchesFilter: 的最近 tab 谓词保持一致）。
+    // 静音同样走 channelInfo.mute（见 getFollowUnreadCount 注释）。
+    for (WKConversationWrapModel *model in self.conversationWrapModels) {
+        if ([self isChannelMuted:model]) continue;
+        uint8_t type = model.channel.channelType;
+        if (type == WK_PERSON) {
+            count += model.unreadCount;
+        } else if (type == WK_GROUP) {
+            if (![WKConversationListVM isInactiveGroup:model]) {
+                count += model.unreadCount;
+            }
+        }
+    }
+    for (WKConversationWrapModel *thread in self.threadWrapModels) {
+        if ([self isChannelMuted:thread]) continue;
+        // 跳过 placeholder thread —— syncThreadWrapModelsFromCachedTopics 在 listThreads 拉回大量
+        // 子区时会合成占位 wrap（无 lastMessage，unreadCount 来自接口的 t.unreadCount）。这个
+        // unread 不一定是当前用户的未读（可能是后端总未读），cell 端 stable 状态也不渲染这些
+        // 占位行，badge 不能把它们算进去。等真实 WKConversation 通过 onConversationUpdate →
+        // setConversation: 到达后 lastMessage 不再 nil，自动开始计入。
+        if (thread.lastMessage == nil) continue;
+        count += thread.unreadCount;
+    }
+    return count;
+}
+
+-(NSArray<NSNumber *> *) recentUnreadRowIndexes {
+    // 关注 tab 的 row 来自 groupDisplayList（含分组 header），下标不能和
+    // filteredConversations 混用 —— 直接返回空，让「只在最近 tab 生效」变成数据层不变式。
+    if (self.filterType != WKConversationFilterRecent) return @[];
+    NSArray<WKConversationWrapModel *> *list = self.filteredConversations;
+    NSMutableArray<NSNumber *> *rows = [NSMutableArray array];
+    for (NSInteger i = 0; i < (NSInteger)list.count; i++) {
+        WKConversationWrapModel *model = list[i];
+        // placeholder 子区：unreadCount 来自接口不一定是本人未读，cell 也不渲染红点
+        // （与 getRecentUnreadCount 的 skip 同理由）
+        if (model.channel.channelType == WK_COMMUNITY_TOPIC && model.lastMessage == nil) continue;
+        if ([self isChannelMuted:model]) continue;
+        // 与最近 tab cell 的 refreshUnread 同一个 getter → 跳过去的行必然有红点
+        if (model.recentTabActivityUnreadCount > 0) [rows addObject:@(i)];
+    }
+    return [rows copy];
+}
+
+-(NSArray<WKConversationWrapModel*> *) conversationList {
+    return self.filteredConversations ?: @[];
+}
+
+-(NSArray<WKConversationWrapModel*> *) allConversations {
+    return self.conversationWrapModels ?: @[];
+}
+
+-(NSArray<WKChannel*> *) allKnownChannelsForWarmup {
+    NSMutableArray<WKChannel*> *result = [NSMutableArray array];
+    NSMutableSet<NSString*> *seen = [NSMutableSet set];
+    void (^addChannel)(WKChannel *) = ^(WKChannel *ch) {
+        if (!ch || !ch.channelId) return;
+        NSString *key = [NSString stringWithFormat:@"%@-%d", ch.channelId, ch.channelType];
+        if ([seen containsObject:key]) return;
+        [seen addObject:key];
+        [result addObject:ch];
+    };
+    for (WKConversationWrapModel *m in self.conversationWrapModels) addChannel(m.channel);
+    for (WKConversationWrapModel *t in self.threadWrapModels) addChannel(t.channel);
+    [self.cachedTopicsByGroup enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSArray<WKConversation*> *topics, BOOL *stop) {
+        for (WKConversation *conv in topics) addChannel(conv.channel);
+    }];
+    return result;
+}
+
+-(NSInteger) conversationCount {
+    return self.filteredConversations.count;
+}
+
+-(NSInteger) indexAtChannel:(WKChannel*)channel {
+    NSArray *list = self.filteredConversations;
+    if (list) {
+        for (NSInteger i = 0; i < (NSInteger)list.count; i++) {
+            WKConversationWrapModel *conversation = list[i];
+            if ([conversation.channel isEqual:channel]) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+-(WKConversationWrapModel*) modelAtChannel:(WKChannel*) channel {
+    if (!channel) return nil;
+    [_conversationsLock lock];
+    WKConversationWrapModel *result = self.channelIndex[[self channelKey:channel]];
+    [_conversationsLock unlock];
+    return result;
+}
+
+/// 同 modelAtChannel: 但若主索引找不到，再扫一遍 threadWrapModels —— 子区不在
+/// conversationWrapModels / channelIndex 里，常规查询路径取不到。用于 unread /
+/// channelInfo 这类需要"无论在哪个 wrap 容器都找到"的更新场景。
+-(WKConversationWrapModel*) anyModelAtChannel:(WKChannel*) channel {
+    WKConversationWrapModel *m = [self modelAtChannel:channel];
+    if (m) return m;
+    if (channel.channelType == WK_COMMUNITY_TOPIC) {
+        for (WKConversationWrapModel *t in self.threadWrapModels) {
+            if ([t.channel isEqual:channel]) return t;
+        }
+    }
+    return nil;
+}
+
+-(WKConversationWrapModel*) modelAtIndex:(NSInteger)index {
+    NSArray *list = self.filteredConversations;
+    if (index < 0 || index >= (NSInteger)list.count) return nil;
+    return list[index];
+}
+
+-(void) replaceAtChannel:(WKConversationWrapModel*)model atChannel:(WKChannel*)channel  {
+    NSString *key = [self channelKey:channel];
+    WKConversationWrapModel *oldModel = self.channelIndex[key];
+    if (!oldModel) return;
+    NSInteger fullIndex = [self.conversationWrapModels indexOfObjectIdenticalTo:oldModel];
+    if (fullIndex == NSNotFound) return;
+    if (oldModel.threadCount > 0 && model.threadCount == 0) {
+        model.threadCount = oldModel.threadCount;
+    }
+    if (oldModel.threadPreviews.count > 0 && model.threadPreviews.count == 0) {
+        model.threadPreviews = oldModel.threadPreviews;
+    }
+    [self handleProhibitwords:model];
+    [self.conversationWrapModels replaceObjectAtIndex:fullIndex withObject:model];
+    self.channelIndex[key] = model;
+    [self rebuildFilteredList];
+}
+-(void) replaceObjectAtIndex:(NSInteger)index withObject:(WKConversationWrapModel*)model{
+    [self handleProhibitwords:model];
+    if (index >= 0 && index < (NSInteger)self.conversationWrapModels.count) {
+        WKConversationWrapModel *oldModel = self.conversationWrapModels[index];
+        [self.channelIndex removeObjectForKey:[self channelKey:oldModel.channel]];
+        [self.conversationWrapModels replaceObjectAtIndex:index withObject:model];
+        self.channelIndex[[self channelKey:model.channel]] = model;
+        [self rebuildFilteredList];
+    }
+}
+
+-(void) removeAtChannnel:(WKChannel*)channel {
+    NSString *key = [self channelKey:channel];
+    WKConversationWrapModel *model = self.channelIndex[key];
+    if (model) {
+        [self.channelIndex removeObjectForKey:key];
+        [self.conversationWrapModels removeObjectIdenticalTo:model];
+        [self rebuildFilteredList];
+    }
+}
+
+-(void) removeAtIndex:(NSInteger)index {
+    if (index >= 0 && index < (NSInteger)self.conversationWrapModels.count) {
+        WKConversationWrapModel *model = self.conversationWrapModels[index];
+        [self.channelIndex removeObjectForKey:[self channelKey:model.channel]];
+        [self.conversationWrapModels removeObjectAtIndex:index];
+        [self rebuildFilteredList];
+    }
+}
+
+
+-(void) removeAll {
+    [self.conversationWrapModels removeAllObjects];
+    [self.channelIndex removeAllObjects];
+    // 子区独立 wrap 也一并清 —— 之前漏清，"删除所有会话"后 recent tab 还能看到旧子区行,
+    // badge 也算它们的 unread。与 reset 路径同款处理。
+    self.threadWrapModels = @[];
+    [self rebuildFilteredList];
+}
+
+-(void) insert:(WKConversationWrapModel*)model atIndex:(NSInteger)insert {
+    if(insert>self.conversationWrapModels.count) {
+        WKLogWarn(@"warn: conversationWrapModels数组大小->%ld insert的大小%ld",(long)self.conversationWrapModels.count,(long)insert);
+        return;
+    }
+    [self handleProhibitwords:model];
+    [self.conversationWrapModels insertObject:model atIndex:insert];
+    self.channelIndex[[self channelKey:model.channel]] = model;
+    [self rebuildFilteredList];
+}
+
+-(NSInteger) insert:(WKConversationWrapModel*)model {
+    [self  handleProhibitwords:model];
+    WKConversationWrapModel *conversationWrapModel = [self getRealShowConversationWrap:model];
+    NSInteger insertPlace =  [self findInsertPlace:conversationWrapModel];
+    [self.conversationWrapModels insertObject:conversationWrapModel atIndex:insertPlace];
+    self.channelIndex[[self channelKey:conversationWrapModel.channel]] = conversationWrapModel;
+    [self rebuildFilteredList];
+    // 返回过滤后数组中的位置
+    NSArray *list = self.filteredConversations;
+    for (NSInteger i = 0; i < (NSInteger)list.count; i++) {
+        if (list[i] == conversationWrapModel) return i;
+    }
+    return 0;
+}
+
+-(NSInteger) findInsertPlace:(WKConversationWrapModel*)m {
+    WKConversationWrapModel *newModel = m;
+    if(newModel.parentChannel) {
+       WKConversationWrapModel *parentConversationWrapModel = [self addOrCreateParentConversation:m.parentChannel newConversationWrapModel:m conversationWrapModels:self.conversationWrapModels];
+        if(parentConversationWrapModel) {
+            newModel = parentConversationWrapModel;
+        }else {
+             parentConversationWrapModel = [self getConversationWrap:m.parentChannel conversations:self.conversationWrapModels];
+            if(parentConversationWrapModel) {
+                newModel = parentConversationWrapModel;
+            }
+        }
+    }
+   
+//    return 0;
+//    __block int topMsgCount = 0;
+//    for (NSInteger i=self.conversationWrapModels.count-1;i>=0;i--) {
+//        WKConversationWrapModel *oldModel = self.conversationWrapModels[i];
+//        if(newModel.stick) {
+//            if(oldModel.stick) {
+//                if(newModel.lastMsgTimestamp>=oldModel.lastMsgTimestamp) {
+//                    return i;
+//                }
+//            }else {
+//                return i;
+//            }
+//        }else if(!oldModel.stick && newModel.lastMsgTimestamp>=oldModel.lastMsgTimestamp) {
+//            return i;
+//        }
+//    }
+    if(!self.conversationWrapModels || self.conversationWrapModels.count == 0) {
+        return 0;
+    }
+    if(self.conversationWrapModels.count == 1) {
+        if( [self.conversationWrapModels[0].channel isEqual:newModel.channel]) {
+            return 0;
+        }
+    }
+   __block bool find = false;
+    __block NSUInteger matchIndex = 0;
+    __block bool beforeHasSelf = false;
+    [self.conversationWrapModels enumerateObjectsUsingBlock:^(WKConversationWrapModel * _Nonnull oldModel, NSUInteger idx, BOOL * _Nonnull stop) {
+        if(newModel.stick) {
+            if(oldModel.stick) {
+                if(newModel.lastMsgTimestamp>=oldModel.lastMsgTimestamp) {
+                    find = YES;
+                    matchIndex = idx;
+                    *stop = YES;
+                    return;
+                }
+            }else {
+                find = YES;
+                matchIndex = idx;
+                *stop = YES;
+            }
+            return;
+        }else if(!oldModel.stick && newModel.lastMsgTimestamp>oldModel.lastMsgTimestamp) {
+            find = YES;
+            matchIndex = idx;
+            *stop = YES;
+            return;
+        }else if(!oldModel.stick && newModel.lastMsgTimestamp == oldModel.lastMsgTimestamp && [newModel.channel isEqual:oldModel.channel]) {
+            find = YES;
+            matchIndex = idx;
+            *stop = YES;
+            return;
+        }else if([newModel.channel isEqual:oldModel.channel]) {
+            beforeHasSelf = true;
+        }
+    }];
+    if (find) {
+        if(beforeHasSelf){
+            return matchIndex-1;
+        }
+        return matchIndex;
+    }else {
+        return self.conversationWrapModels.count-1;
+    }
+}
+
+
+-(WKConversationWrapModel*) conversationAtIndex:(NSInteger)index {
+    NSArray *list = self.filteredConversations;
+    if (index < 0 || index >= (NSInteger)list.count) {
+        return nil;
+    }
+    return list[index];
+}
+
+-(void) removeConversationAtIndex:(NSInteger)index {
+    NSArray *list = self.filteredConversations;
+    if (index >= 0 && index < (NSInteger)list.count) {
+        WKConversationWrapModel *model = list[index];
+        [self.channelIndex removeObjectForKey:[self channelKey:model.channel]];
+        [self.conversationWrapModels removeObjectIdenticalTo:model];
+        [self rebuildFilteredList];
+    }
+}
+
+-(BOOL) hasConversationTop {
+    if(self.conversationWrapModels) {
+        for (WKConversationWrapModel *model in self.conversationWrapModels) {
+            if(model.stick) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+-(NSInteger) getAllUnreadCount {
+    [_conversationsLock lock];
+    NSInteger unreadCount = 0;
+    for (WKConversationWrapModel *model in self.conversationWrapModels) {
+        // 与 follow / recent badge 一致走 channelInfo.mute 权威源；DB 快照可能滞后
+        if(![self isChannelMuted:model]) {
+            unreadCount +=model.unreadCount;
+        }
+    }
+    [_conversationsLock unlock];
+    return unreadCount;
+}
+
+#pragma mark - Category (分组)
+
+-(void) loadCategoriesWithCompletion:(void(^)(void))completion {
+    NSString *spaceId = [[NSUserDefaults standardUserDefaults] objectForKey:@"currentSpaceId"];
+    if(!spaceId || spaceId.length == 0) {
+        self.categoryList = @[];
+        if(completion) completion();
+        return;
+    }
+    // 先用缓存 seed（冷启动 / 切空间的首帧）：关注 tab 的 section header + 分组内会话
+    // 都依赖 categoryList，等网络回来才有内容的话这段时间分组下面是空的。
+    // 已经有内容时不覆盖（避免把服务端刚回的结果盖回缓存值）。
+    if(self.categoryList.count == 0) {
+        NSArray<WKCategoryEntity *> *cached = [[WKCategoryService shared] cachedCategoriesForSpace:spaceId];
+        if(cached.count > 0) {
+            self.categoryList = cached;
+        }
+    }
+    [[WKCategoryService shared] listCategories:spaceId].then(^(NSArray<WKCategoryEntity *> *list) {
+        self.categoryList = list ?: @[];
+        if(completion) completion();
+    }).catch(^(NSError *error) {
+        NSLog(@"加载分组失败: %@", error);
+        // 失败时保留已 seed 的缓存值，不清空 —— 弱网下分组结构不该消失。
+        if(completion) completion();
+    });
+}
+
+/// O(子区数) — 使用预建索引计算子区未读数（替代 O(N) 全量遍历版本）
+-(NSInteger) threadUnreadForGroup:(NSString *)groupNo topicsByGroup:(NSDictionary<NSString*, NSArray<WKConversation*>*>*)topicsByGroup {
+    NSInteger total = 0;
+    for (WKConversation *conv in topicsByGroup[groupNo]) {
+        total += conv.unreadCount;
+    }
+    return total;
+}
+
+/// 关注 tab section unread 用：只算"已关注 + 未静音"的子区未读，与 tab badge
+/// (getFollowUnreadCount) / +N 角标 (getThreadIndicatorForGroup) 同源 cachedTopicsByGroup,
+/// 让三个 badge 数字一致（PR review #6 warning）。
+///
+/// 之前走 threadWrapModels（parent.threadPreviews 派生，跳 placeholder）会把 dormant
+/// 但 API 端有 unread 的已关注子区漏算 —— 用户视角：tab badge 和 +N 显示 5，
+/// section header 折叠后却显示 2。
+///
+/// 「topicsByGroup 含归档幽灵」的隐患由 PR review #1 的 mergeThreadConvs 剪枝单独跟进，
+/// 与本对齐独立。
+-(NSInteger) followedThreadUnreadForGroup:(NSString *)groupNo
+                            topicsByGroup:(NSDictionary<NSString*, NSArray<WKConversation*>*>*)topicsByGroup {
+    WKFollowedKeysStore *store = [WKFollowedKeysStore shared];
+    if (!store.loaded) return 0;
+    NSArray<WKConversation*> *topics = topicsByGroup[groupNo];
+    if (topics.count == 0) return 0;
+    NSInteger total = 0;
+    for (WKConversation *conv in topics) {
+        if ([self isConversationMuted:conv]) continue;
+        if (![store isFollowedWithType:WKFollowTargetTypeThread targetId:conv.channel.channelId]) continue;
+        total += conv.unreadCount;
+    }
+    return total;
+}
+
+/// O(子区数) — 使用预建索引和 reminder 缓存检测@提醒（替代 O(N) 全量遍历 + 逐个 DB 查询版本）
+-(BOOL) hasMentionForGroup:(NSString *)groupNo model:(WKConversationWrapModel *)model topicsByGroup:(NSDictionary<NSString*, NSArray<WKConversation*>*>*)topicsByGroup remindersByChannelId:(NSDictionary<NSString*, NSArray<WKReminder*>*>*)remindersByChannelId {
+    if (model && model.simpleReminders.count > 0) {
+        for (WKReminder *r in model.simpleReminders) {
+            if (r.type == WKReminderTypeMentionMe) return YES;
+        }
+    }
+    for (WKConversation *conv in topicsByGroup[groupNo]) {
+        for (WKReminder *r in remindersByChannelId[conv.channel.channelId]) {
+            if (r.type == WKReminderTypeMentionMe) return YES;
+        }
+    }
+    return NO;
+}
+
+/// 从缓存获取指定群聊下子区的未读数和 @提醒状态（供 cell 渲染用，纯内存查找，无 DB 查询）
+-(void) getThreadIndicatorForGroup:(NSString *)groupNo threadUnread:(NSInteger *)outUnread threadHasMention:(BOOL *)outHasMention {
+    [self getThreadIndicatorForGroup:groupNo excludingChannelIds:nil threadUnread:outUnread threadHasMention:outHasMention];
+}
+
+-(void) getThreadIndicatorForGroup:(NSString *)groupNo
+               excludingChannelIds:(NSSet<NSString *> *)excluded
+                      threadUnread:(NSInteger *)outUnread
+                  threadHasMention:(BOOL *)outHasMention {
+    NSInteger unread = 0;
+    BOOL hasMention = NO;
+    // 与 cell 的 WKConversationGroupThreadCell.visibleThreadPreviewsFor: 同源，按 followedKeys
+    // 过滤 —— 否则 cell 上 preview 行只显示已关注子区、但 indicator 数字 / @ 提醒 / "+N
+    // 子区" 把未关注子区也算进去，违反 spec §0 "Follow tab 严格按 followedKeys 过滤"。
+    // store 未加载时 fail-open（与 visibleThreadPreviewsFor 同款），避免冷启动期一律 0。
+    WKFollowedKeysStore *store = [WKFollowedKeysStore shared];
+    NSArray<WKConversation*> *topics = self.cachedTopicsByGroup[groupNo];
+    NSInteger nMatched = 0, nExcluded = 0, nUnfollowed = 0, nMuted = 0;
+    if (topics) {
+        for (WKConversation *conv in topics) {
+            if (excluded.count > 0 && [excluded containsObject:conv.channel.channelId]) { nExcluded++; continue; }
+            if (store.loaded && ![store isFollowedWithType:WKFollowTargetTypeThread targetId:conv.channel.channelId]) { nUnfollowed++; continue; }
+
+            // mention 检查穿透 mute：@我 优先级高于静音（与微信一致），
+            // 必须放在静音 continue 之前，否则被静音的子区里 @我 提醒
+            // 不会被汇总到群聊 toggle 上 → toggle 显示成普通粉点而非 @ 符号。
+            if (!hasMention) {
+                NSArray<WKReminder*> *rems = self.cachedRemindersByChannelId[conv.channel.channelId];
+                // 不在 cell render 路径上做 DB 查询 (review 提示):
+                //   cachedRemindersByChannelId 在 loadConversationList 重建 + 子区 reminder
+                //   push 路径 (applySubzoneRemindersUpdate) 维护;且 cache 只存 count > 0
+                //   的条目, 没 @我 的子区永远 cache miss → 之前的 DB 兜底等于每次 cell
+                //   render 都查 N 次 (N = 子区数), 是主线程 jank 源, 与 PR 反 HANG 目标
+                //   矛盾。极窄窗口 (DB 已写但 push 未到) 可能短暂漏报, 下一次 reload 会自愈。
+                for (WKReminder *r in rems) {
+                    if (r.type == WKReminderTypeMentionMe) { hasMention = YES; break; }
+                }
+            }
+
+            // unread 数字过滤静音子区（与 follow / recent tab badge 同款口径），
+            // 否则给某个子区设静音后群聊 cell 上的红点数字仍包含该子区的未读。
+            if ([self isConversationMuted:conv]) { nMuted++; continue; }
+            unread += conv.unreadCount;
+            nMatched++;
+        }
+    }
+    WK_THREAD_BADGE_DBG(@"[ThreadBadgeDbg] indicator group=%@ topics=%lu excluded=%lu storeLoaded=%d → unread=%ld mention=%d (matched=%ld excl=%ld unfollowed=%ld muted=%ld)",
+          groupNo, (unsigned long)topics.count, (unsigned long)excluded.count, store.loaded,
+          (long)unread, hasMention, (long)nMatched, (long)nExcluded, (long)nUnfollowed, (long)nMuted);
+    if (outUnread) *outUnread = unread;
+    if (outHasMention) *outHasMention = hasMention;
+}
+
+/// 检测指定群聊及其所有子区是否有未处理的@提醒（使用缓存的会话列表避免重复 DB 查询）
+-(BOOL) hasMentionForGroup:(NSString *)groupNo model:(WKConversationWrapModel *)model allConvs:(NSArray<WKConversation*>*)allConvs {
+    // 检查群聊自身的 reminder
+    if (model && model.simpleReminders.count > 0) {
+        for (WKReminder *r in model.simpleReminders) {
+            if (r.type == WKReminderTypeMentionMe) return YES;
+        }
+    }
+    // 检查该群聊下所有子区的 reminder
+    NSString *prefix = [NSString stringWithFormat:@"%@____", groupNo];
+    for (WKConversation *conv in allConvs) {
+        if (conv.channel.channelType == WK_COMMUNITY_TOPIC && [conv.channel.channelId hasPrefix:prefix]) {
+            NSArray<WKReminder *> *reminders = [[WKReminderDB shared] getWaitDoneReminder:conv.channel];
+            for (WKReminder *r in reminders) {
+                if (r.type == WKReminderTypeMentionMe) return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+/// 计算指定群聊下所有子区的未读数总和（使用缓存的会话列表避免重复 DB 查询）
+-(NSInteger) threadUnreadForGroup:(NSString *)groupNo allConvs:(NSArray<WKConversation*>*)allConvs {
+    NSInteger total = 0;
+    NSString *prefix = [NSString stringWithFormat:@"%@____", groupNo];
+    for (WKConversation *conv in allConvs) {
+        if (conv.channel.channelType == WK_COMMUNITY_TOPIC && [conv.channel.channelId hasPrefix:prefix]) {
+            total += conv.unreadCount;
+        }
+    }
+    return total;
+}
+
+/// 从 cachedAllConversations 构建子区索引和 reminder 缓存
+-(void) rebuildTopicIndexCache {
+    NSArray<WKConversation *> *allConvs = self.cachedAllConversations;
+    if (!allConvs) return;
+    NSMutableDictionary<NSString*, NSMutableArray<WKConversation*>*> *topicsByGroup = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString*, NSArray<WKReminder*>*> *remindersByChannelId = [NSMutableDictionary dictionary];
+    for (WKConversation *conv in allConvs) {
+        if (conv.channel.channelType != WK_COMMUNITY_TOPIC) continue;
+        NSString *channelId = conv.channel.channelId;
+        NSRange sep = [channelId rangeOfString:@"____"];
+        if (sep.location == NSNotFound) continue;
+        NSString *groupId = [channelId substringToIndex:sep.location];
+        NSMutableArray *topics = topicsByGroup[groupId];
+        if (!topics) { topics = [NSMutableArray array]; topicsByGroup[groupId] = topics; }
+        [topics addObject:conv];
+        NSArray<WKReminder*> *reminders = [[WKReminderDB shared] getWaitDoneReminder:conv.channel];
+        if (reminders.count > 0) remindersByChannelId[channelId] = reminders;
+    }
+    self.cachedTopicsByGroup = topicsByGroup;
+    self.cachedRemindersByChannelId = remindersByChannelId;
+}
+
+-(void) applySubzoneRemindersUpdate:(WKChannel *)channel reminders:(NSArray<WKReminder *> *)reminders {
+    if (!channel || channel.channelType != WK_COMMUNITY_TOPIC) return;
+    NSString *channelId = channel.channelId;
+    if (channelId.length == 0) return;
+    NSMutableDictionary<NSString*, NSArray<WKReminder*>*> *mut =
+        self.cachedRemindersByChannelId ? [self.cachedRemindersByChannelId mutableCopy]
+                                        : [NSMutableDictionary dictionary];
+    if (reminders.count > 0) {
+        mut[channelId] = reminders;
+    } else {
+        [mut removeObjectForKey:channelId];
+    }
+    self.cachedRemindersByChannelId = mut;
+}
+
+-(NSInteger) seedFollowedThreadsIntoTopicsCache {
+    WKFollowedKeysStore *store = [WKFollowedKeysStore shared];
+    if (!store.loaded) {
+        WK_THREAD_BADGE_DBG(@"[ThreadBadgeDbg] seedFollowedThreads skipped: store not loaded");
+        return 0;
+    }
+    NSSet<NSString*> *syncedGroups = self.syncedGroupChannelIds;
+    NSString *threadPrefix = [NSString stringWithFormat:@"%ld::", (long)WKFollowTargetTypeThread];
+    NSMutableArray<WKChannel*> *threadChannels = [NSMutableArray array];
+    for (NSString *k in store.followedKeys) {
+        if (![k hasPrefix:threadPrefix]) continue;
+        NSString *cid = [k substringFromIndex:threadPrefix.length];
+        NSRange sep = [cid rangeOfString:@"____"];
+        if (sep.location == NSNotFound) continue;
+        NSString *parentGroup = [cid substringToIndex:sep.location];
+        if (syncedGroups && ![syncedGroups containsObject:parentGroup]) continue;
+        [threadChannels addObject:[WKChannel channelID:cid channelType:WK_COMMUNITY_TOPIC]];
+    }
+    if (threadChannels.count == 0) {
+        WK_THREAD_BADGE_DBG(@"[ThreadBadgeDbg] seedFollowedThreads: no followed threads to fetch");
+        return 0;
+    }
+    NSArray<WKConversation*> *fetched = [[WKSDK shared].conversationManager getConversations:threadChannels];
+
+    NSMutableDictionary<NSString*, NSMutableArray<WKConversation*>*> *topicsMut = [NSMutableDictionary dictionary];
+    [self.cachedTopicsByGroup enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSArray<WKConversation*> *v, BOOL *stop) {
+        topicsMut[k] = [v mutableCopy];
+    }];
+    NSInteger added = 0;
+    for (WKConversation *conv in fetched) {
+        NSString *cid = conv.channel.channelId;
+        if (cid.length == 0) continue;
+        NSRange sep = [cid rangeOfString:@"____"];
+        if (sep.location == NSNotFound) continue;
+        NSString *parentGroup = [cid substringToIndex:sep.location];
+        NSMutableArray<WKConversation*> *topics = topicsMut[parentGroup];
+        if (!topics) { topics = [NSMutableArray array]; topicsMut[parentGroup] = topics; }
+        BOOL dup = NO;
+        for (WKConversation *existing in topics) {
+            if ([existing.channel.channelId isEqualToString:cid]) { dup = YES; break; }
+        }
+        if (!dup) {
+            [topics addObject:conv];
+            added++;
+        }
+    }
+    if (added > 0) {
+        NSMutableDictionary<NSString*, NSArray<WKConversation*>*> *frozen = [NSMutableDictionary dictionaryWithCapacity:topicsMut.count];
+        [topicsMut enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSMutableArray<WKConversation*> *v, BOOL *stop) {
+            frozen[k] = [v copy];
+        }];
+        self.cachedTopicsByGroup = frozen;
+    }
+    WK_THREAD_BADGE_DBG(@"[ThreadBadgeDbg] seedFollowedThreads: queriedChannels=%ld fetched=%ld added=%ld cacheGroups=%lu",
+          (long)threadChannels.count, (long)fetched.count, (long)added, (unsigned long)self.cachedTopicsByGroup.count);
+    return added;
+}
+
+/// 把 listThreads 回的 WKThreadModel 列表物化成 WKConversation 列表。
+/// SDK 缓存有就用真实 conv（unread + lastMessage 都准），SDK miss 时合成一个
+/// 最小 conv（channel + unreadCount 来自 WKThreadModel）—— 让 cachedTopicsByGroup
+/// 至少能给"+N子区" cell badge 用上 API 回的子区未读真值。
+/// 不再过滤 active 时间戳：dormant 子区也可能有未读（用户暂离后服务端推过来的）。
+- (NSArray<WKConversation*> *)materializeThreadConvs:(NSArray<WKThreadModel*> *)threads {
+    if (threads.count == 0) return @[];
+    NSMutableArray<WKConversation*> *out = [NSMutableArray arrayWithCapacity:threads.count];
+    NSInteger nActive = 0, nSynth = 0, nSdkHit = 0;
+    for (WKThreadModel *t in threads) {
+        if (t.status != WKThreadStatusActive) continue;
+        nActive++;
+        if (t.channelId.length == 0) continue;
+        WKChannel *threadChannel = [WKChannel channelID:t.channelId channelType:WK_COMMUNITY_TOPIC];
+        WKConversation *conv = [[WKSDK shared].conversationManager getConversation:threadChannel];
+        if (!conv) {
+            conv = [[WKConversation alloc] init];
+            conv.channel = threadChannel;
+            conv.unreadCount = t.unreadCount;
+            nSynth++;
+        } else {
+            nSdkHit++;
+        }
+        [out addObject:conv];
+    }
+    WK_THREAD_BADGE_DBG(@"[ThreadBadgeDbg] materializeThreadConvs: threadsIn=%lu active=%ld → out=%lu (sdkHit=%ld synth=%ld)",
+          (unsigned long)threads.count, (long)nActive, (unsigned long)out.count, (long)nSdkHit, (long)nSynth);
+    return out;
+}
+
+/// 主线程合并入参 group → [WKConversation] 字典到 cachedTopicsByGroup。
+/// 去重按 channelId：已有的若有 lastMessage（真实 conv）就不被合成 conv 覆盖；
+/// 双方都是合成 conv 时刷新 unreadCount。
+///
+/// PR review #10 critical：原版只 add/replace，不 prune —— 服务端归档/删除的子区
+/// 永远留在 cache 里继续给 Follow tab badge / +N 角标算未读。本版加 prunableGroups
+/// 参数：仅对那些 listAllThreads 响应**完整未截断**的 group，按响应里的 channelId set
+/// reconcile cache（cache 里有但响应没回的 → 移除）。响应被 maxPages 截断时（>1000
+/// 子区大群）这个群不在 prunableGroups，保持原 add/replace 语义，避免误删
+/// page maxPages+ 上的真实数据。
+- (void)mergeThreadConvs:(NSDictionary<NSString*, NSArray<WKConversation*>*> *)convsByGroup {
+    [self mergeThreadConvs:convsByGroup prunableGroups:nil];
+}
+
+- (void)mergeThreadConvs:(NSDictionary<NSString*, NSArray<WKConversation*>*> *)convsByGroup
+          prunableGroups:(nullable NSSet<NSString*> *)prunableGroups {
+    if (convsByGroup.count == 0) return;
+    NSMutableDictionary<NSString*, NSMutableArray<WKConversation*>*> *topicsMut = [NSMutableDictionary dictionary];
+    [self.cachedTopicsByGroup enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSArray<WKConversation*> *v, BOOL *stop) {
+        topicsMut[k] = [v mutableCopy];
+    }];
+    NSInteger addedTotal = 0;
+    NSInteger prunedTotal = 0;
+    for (NSString *groupNo in convsByGroup) {
+        NSArray<WKConversation*> *convs = convsByGroup[groupNo];
+        NSMutableArray<WKConversation*> *arr = topicsMut[groupNo];
+        BOOL canPrune = [prunableGroups containsObject:groupNo];
+
+        // 完整响应：prune cache 里没在新响应里的 channelId（归档/删除的子区）。
+        // 按 channelId set 做 reconcile，仍存在的旧条目（含真实 lastMessage）保持引用,
+        // 防止丢掉运行时 onConversationUpdate 累积的状态。
+        if (canPrune && arr.count > 0) {
+            NSMutableSet<NSString*> *liveIds = [NSMutableSet setWithCapacity:convs.count];
+            for (WKConversation *c in convs) {
+                if (c.channel.channelId.length > 0) [liveIds addObject:c.channel.channelId];
+            }
+            NSMutableArray<WKConversation*> *kept = [NSMutableArray arrayWithCapacity:arr.count];
+            for (WKConversation *c in arr) {
+                if ([liveIds containsObject:c.channel.channelId]) {
+                    [kept addObject:c];
+                } else {
+                    prunedTotal++;
+                }
+            }
+            arr = kept;
+            topicsMut[groupNo] = arr;
+        }
+
+        if (convs.count == 0) continue; // 空响应（无活跃子区）：上面已 prune 完，不再 add
+        if (!arr) { arr = [NSMutableArray array]; topicsMut[groupNo] = arr; }
+        for (WKConversation *newConv in convs) {
+            NSString *cid = newConv.channel.channelId;
+            if (cid.length == 0) continue;
+            BOOL found = NO;
+            for (NSInteger i = 0; i < (NSInteger)arr.count; i++) {
+                if ([arr[i].channel.channelId isEqualToString:cid]) {
+                    if (newConv.lastMessage && !arr[i].lastMessage) {
+                        arr[i] = newConv;  // 真实 conv 替换合成 placeholder
+                    } else if (!arr[i].lastMessage) {
+                        arr[i].unreadCount = newConv.unreadCount;  // 都是合成 conv，刷 unread
+                    }
+                    found = YES;
+                    break;
+                }
+            }
+            if (!found) {
+                [arr addObject:newConv];
+                addedTotal++;
+            }
+        }
+    }
+    NSMutableDictionary<NSString*, NSArray<WKConversation*>*> *frozen = [NSMutableDictionary dictionary];
+    [topicsMut enumerateKeysAndObjectsUsingBlock:^(NSString *k, NSMutableArray<WKConversation*> *v, BOOL *stop) {
+        frozen[k] = [v copy];
+    }];
+    self.cachedTopicsByGroup = frozen;
+    WK_THREAD_BADGE_DBG(@"[ThreadBadgeDbg] mergeThreadConvs: groupsTouched=%lu prunable=%lu added=%ld pruned=%ld cacheGroups=%lu",
+          (unsigned long)convsByGroup.count, (unsigned long)prunableGroups.count,
+          (long)addedTotal, (long)prunedTotal, (unsigned long)self.cachedTopicsByGroup.count);
+}
+
+-(NSArray<WKConversationDisplayItem *> *) buildGroupDisplayList {
+    CFAbsoluteTime _bgStart = CFAbsoluteTimeGetCurrent();
+    // 1. 建立 channelId → WKConversationWrapModel 映射（群 + DM 都加入，关注 tab 需要 DM）
+    NSMutableDictionary<NSString *, WKConversationWrapModel *> *groupChannelMap = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, WKConversationWrapModel *> *dmChannelMap = [NSMutableDictionary dictionary];
+    for (WKConversationWrapModel *model in self.conversationWrapModels) {
+        if(model.channel.channelType == WK_GROUP) {
+            groupChannelMap[model.channel.channelId] = model;
+        } else if (model.channel.channelType == WK_PERSON) {
+            dmChannelMap[model.channel.channelId] = model;
+        }
+    }
+
+    NSMutableArray<WKConversationDisplayItem *> *displayList = [NSMutableArray array];
+
+    // 使用 loadConversationList 时预建的子区索引缓存，无缓存时现场构建（首次调用等边界情况）
+    NSDictionary<NSString*, NSArray<WKConversation*>*> *topicsByGroup = self.cachedTopicsByGroup;
+    NSDictionary<NSString*, NSArray<WKReminder*>*> *remindersByChannelId = self.cachedRemindersByChannelId;
+    if (!topicsByGroup) {
+        [self rebuildTopicIndexCache];
+        topicsByGroup = self.cachedTopicsByGroup ?: @{};
+        remindersByChannelId = self.cachedRemindersByChannelId ?: @{};
+    }
+
+    // 关注 tab 数据装配（P2-2）：合并 WKFollowedKeysStore 提供的 DM 入分组。
+    // store.itemsByCategory[category_id] 是后端 sidebar/sync 已按 follow_sort 排好的
+    // 该分组下所有关注项（含群/DM/子区）；这里只取 DM（target_type=1），群仍以
+    // cat.groups 为权威（categoryList 是 categories 接口的直接结果）。
+    WKFollowedKeysStore *followStore = [WKFollowedKeysStore shared];
+    NSDictionary<NSString *, NSArray<WKSidebarItemEntity *> *> *followItemsByCat = followStore.itemsByCategory;
+
+    // sidebar/sync 已确认 followed 但本地 IM cache miss 的项（冷启 / 缓存清过 / 新关注还没拉到 conv）
+    // 补 placeholder wrap，否则 Follow tab 会丢行 — 用户视角是「明明关注了却看不到」。
+    // 真实 conv 到达后由 onConversationUpdate 流程接管，placeholder 会自然被替换。
+    //
+    // 未读红点：store 是磁盘缓存水化出来的（loadedFromCache）时，placeholder 的 unread
+    // 一律按 0 渲染。原因是 placeholder 没有 lastMessageSeq 锚点，无法用
+    // WKUnreadStore 的已读水位夹取 —— 拿一份可能过期的缓存点亮红点，就有"已读会话
+    // 又变未读"的风险，而这是用户容忍度为 0 的一类错。少一个红点等 sync 回来补上，
+    // 比错亮一个红点好。本地已有真实 conv 行的项不走这个分支，不受影响。
+    BOOL followFromCache = followStore.loadedFromCache;
+    for (NSArray<WKSidebarItemEntity *> *bucket in followItemsByCat.allValues) {
+        for (WKSidebarItemEntity *it in bucket) {
+            if (it.target_id.length == 0) continue;
+            if (it.target_type == WKFollowTargetTypeDM && !dmChannelMap[it.target_id]) {
+                WKConversation *p = [[WKConversation alloc] init];
+                p.channel = [WKChannel channelID:it.target_id channelType:WK_PERSON];
+                p.unreadCount = followFromCache ? 0 : (int)it.unread;
+                p.lastMsgTimestamp = it.timestamp;
+                dmChannelMap[it.target_id] = [[WKConversationWrapModel alloc] initWithConversation:p];
+            } else if (it.target_type == WKFollowTargetTypeChannel && !groupChannelMap[it.target_id]) {
+                WKConversation *p = [[WKConversation alloc] init];
+                p.channel = [WKChannel channelID:it.target_id channelType:WK_GROUP];
+                p.unreadCount = followFromCache ? 0 : (int)it.unread;
+                p.lastMsgTimestamp = it.timestamp;
+                groupChannelMap[it.target_id] = [[WKConversationWrapModel alloc] initWithConversation:p];
+            }
+        }
+    }
+
+    // 3. 非 default 分组（spec §0：关注 tab 隐藏默认分组）
+    NSSet<NSString *> *followedGroupNos = followStore.followedGroupNos;
+    // 用 store.loaded 而不是 count > 0 — 空 vs 未加载严格区分：sidebar/sync 成功
+    // 返回空集合（用户没关注任何东西）就该展示空，不能 fail-open 回退到 cat.groups
+    // 把所有遗留群一股脑亮出来。
+    BOOL followLoaded = followStore.loaded;
+    for (WKCategoryEntity *cat in self.categoryList) {
+        if (cat.is_default) continue;
+        WKConversationDisplayItem *header = [WKConversationDisplayItem sectionHeaderWithId:cat.category_id title:cat.name isDefault:NO];
+        // 解析本分组的 DM 关注项
+        NSArray<WKSidebarItemEntity *> *items = followItemsByCat[cat.category_id ?: @""] ?: @[];
+        NSMutableArray<WKConversationWrapModel *> *followedDMs = [NSMutableArray array];
+        for (WKSidebarItemEntity *it in items) {
+            if (it.target_type != WKFollowTargetTypeDM) continue;
+            WKConversationWrapModel *dmWrap = dmChannelMap[it.target_id];
+            if (dmWrap) [followedDMs addObject:dmWrap];
+        }
+
+        // 严格走 followedGroupNos 过滤；store 未加载完成时 visibleGroups 为空数组,
+        // 避免 fail-open 把 server categories 接口返回的 unfollowed 群也展示出来。
+        // 等 store loaded 后 buildGroupDisplayList 会被通知触发重建。
+        NSMutableArray<WKCategoryGroup *> *visibleGroups = [NSMutableArray array];
+        if (followLoaded) {
+            for (WKCategoryGroup *cg in cat.groups) {
+                if ([followedGroupNos containsObject:cg.group_no]) {
+                    [visibleGroups addObject:cg];
+                }
+            }
+        }
+
+        // 统计：群数 + DM 数 + 群内未读 + DM 未读 + 子区未读 + @提醒
+        NSInteger count = 0;
+        NSInteger totalUnread = 0;
+        BOOL sectionHasMention = NO;
+        for (WKCategoryGroup *cg in visibleGroups) {
+            WKConversationWrapModel *m = groupChannelMap[cg.group_no];
+            if (m) {
+                count++;
+                // 静音判定走 channelInfo.mute（与 getFollowUnreadCount / tab badge 保持一致）—
+                // model.mute 是 DB 快照，冷启动可能滞后，会让 section header 和 tab badge 算不一样。
+                if (![self isChannelMuted:m]) totalUnread += m.unreadCount;
+                totalUnread += [self followedThreadUnreadForGroup:cg.group_no topicsByGroup:topicsByGroup];
+                if (!sectionHasMention) {
+                    sectionHasMention = [self hasMentionForGroup:cg.group_no model:m topicsByGroup:topicsByGroup remindersByChannelId:remindersByChannelId];
+                }
+            }
+        }
+        for (WKConversationWrapModel *dm in followedDMs) {
+            count++;
+            if (![self isChannelMuted:dm]) totalUnread += dm.unreadCount;
+            if (!sectionHasMention && dm.simpleReminders.count > 0) {
+                for (WKReminder *r in dm.simpleReminders) {
+                    if (r.type == WKReminderTypeMentionMe) { sectionHasMention = YES; break; }
+                }
+            }
+        }
+        header.groupCount = count;
+        header.unreadCount = totalUnread;
+        header.hasMention = sectionHasMention;
+        // 空分组也要展示 header — 否则用户从引导页新建分组后引导页不消失、看不到自己刚建的分组，
+        // 也无法在分组管理外的位置感知分组存在。空分组下不会渲染任何会话行，只占一个 header。
+        [displayList addObject:header];
+
+        if(![self.collapsedSections containsObject:cat.category_id]) {
+            // 分组内顺序：优先用 store.itemsByCategory（已按 follow_sort 排好）的顺序,
+            // 保证 P3-1.7 的拖拽排序生效。store 没覆盖到的项（冷启动、新建未同步等）
+            // 兜底按 timestamp 追加在末尾。
+            NSMutableArray<WKConversationWrapModel *> *sectionItems = [NSMutableArray array];
+            NSMutableSet<NSString *> *added = [NSMutableSet set];
+            for (WKSidebarItemEntity *it in items) {
+                WKConversationWrapModel *wrap = nil;
+                if (it.target_type == WKFollowTargetTypeDM) {
+                    wrap = dmChannelMap[it.target_id];
+                } else if (it.target_type == WKFollowTargetTypeChannel) {
+                    wrap = groupChannelMap[it.target_id];
+                }
+                if (wrap && ![added containsObject:wrap.channel.channelId]) {
+                    [sectionItems addObject:wrap];
+                    [added addObject:wrap.channel.channelId];
+                }
+            }
+            // store 没覆盖的群 / DM 兜底（按 timestamp 倒序）
+            NSMutableArray<WKConversationWrapModel *> *leftover = [NSMutableArray array];
+            for (WKCategoryGroup *cg in visibleGroups) {
+                if ([added containsObject:cg.group_no]) continue;
+                WKConversationWrapModel *msg = groupChannelMap[cg.group_no];
+                if (msg) { [leftover addObject:msg]; [added addObject:cg.group_no]; }
+            }
+            for (WKConversationWrapModel *dm in followedDMs) {
+                if ([added containsObject:dm.channel.channelId]) continue;
+                [leftover addObject:dm];
+                [added addObject:dm.channel.channelId];
+            }
+            [leftover sortUsingComparator:^NSComparisonResult(WKConversationWrapModel *a, WKConversationWrapModel *b) {
+                if (a.lastMsgTimestamp > b.lastMsgTimestamp) return NSOrderedAscending;
+                if (a.lastMsgTimestamp < b.lastMsgTimestamp) return NSOrderedDescending;
+                return NSOrderedSame;
+            }];
+            [sectionItems addObjectsFromArray:leftover];
+            for (WKConversationWrapModel *m in sectionItems) {
+                [displayList addObject:[WKConversationDisplayItem itemWithConversation:m]];
+            }
+        }
+    }
+
+    // 4. 默认分组 / 未归组群聊：spec §0 关注 tab 完全隐藏。原来这里有把未归组群挂到
+    // is_default 分组的逻辑（保持向后兼容用），关注 tab 改版后**不再展示**任何属于
+    // 默认分组的会话（这是产品规则，对齐 web）。若用户有未关注的群想看，最近 tab 仍有。
+
+    // 顺便计算 Follow / Recent 两个 tab 各自的 hasMention（复用已有的 remindersByChannelId,
+    // 避免后续单独查 DB）。UI 已下线 tab 上 @我 标识，但 lastBuild*HasMention 留作其他
+    // 诊断/统计入口。
+    // 归属口径严格对齐 getFollowUnreadCount / getRecentUnreadCount：
+    //   - Follow: WKFollowedKeysStore（DM/Channel/Thread）；store 未加载时一律不算（保守，
+    //     与 getFollowUnreadCount 同口径，避免冷启动期把全量 mention 都挂到关注 tab）。
+    //   - Recent: DM 全部；Group 非 3 天 stale；Thread 走 threadWrapModels 排除 placeholder。
+    // 一个会话可能同时落在两个集合（例：关注的 3 天活跃群），两端都会亮。
+    // mention 本身不做静音过滤 —— 与 section header sectionHasMention 行为一致（静音群被
+    // @ 还是要让用户感知）。
+    BOOL followHasMention = NO;
+    BOOL recentHasMention = NO;
+
+    NSMutableSet<NSString*> *recentThreadIds = [NSMutableSet set];
+    for (WKConversationWrapModel *t in self.threadWrapModels) {
+        if (t.lastMessage == nil) continue; // placeholder
+        if (t.channel.channelId.length > 0) [recentThreadIds addObject:t.channel.channelId];
+    }
+
+    for (WKConversationWrapModel *model in self.conversationWrapModels) {
+        if (followHasMention && recentHasMention) break;
+        if (model.simpleReminders.count == 0) continue;
+        BOOL hasMention = NO;
+        for (WKReminder *r in model.simpleReminders) {
+            if (r.type == WKReminderTypeMentionMe) { hasMention = YES; break; }
+        }
+        if (!hasMention) continue;
+        uint8_t type = model.channel.channelType;
+        if (type == WK_PERSON) {
+            if (!recentHasMention) recentHasMention = YES;
+            if (!followHasMention && followLoaded &&
+                [followStore isFollowedWithType:WKFollowTargetTypeDM targetId:model.channel.channelId]) {
+                followHasMention = YES;
+            }
+        } else if (type == WK_GROUP) {
+            if (!recentHasMention && ![WKConversationListVM isInactiveGroup:model]) {
+                recentHasMention = YES;
+            }
+            if (!followHasMention && followLoaded &&
+                [followStore isFollowedWithType:WKFollowTargetTypeChannel targetId:model.channel.channelId]) {
+                followHasMention = YES;
+            }
+        }
+    }
+
+    if (!followHasMention || !recentHasMention) {
+        for (NSString *channelId in remindersByChannelId) {
+            if (followHasMention && recentHasMention) break;
+            // 顶层 channel（群/DM）已在上面通过 simpleReminders 走过；这里只补子区路径,
+            // 子区 channelId 形如 "<groupNo>____<threadId>"。
+            if ([channelId rangeOfString:@"____"].location == NSNotFound) continue;
+            NSArray<WKReminder*> *rems = remindersByChannelId[channelId];
+            BOOL hasMention = NO;
+            for (WKReminder *r in rems) {
+                if (r.type == WKReminderTypeMentionMe) { hasMention = YES; break; }
+            }
+            if (!hasMention) continue;
+            if (!recentHasMention && [recentThreadIds containsObject:channelId]) {
+                recentHasMention = YES;
+            }
+            if (!followHasMention && followLoaded &&
+                [followStore isFollowedWithType:WKFollowTargetTypeThread targetId:channelId]) {
+                followHasMention = YES;
+            }
+        }
+    }
+
+    self.lastBuildFollowHasMention = followHasMention;
+    self.lastBuildRecentHasMention = recentHasMention;
+
+    NSLog(@"[TabPerf] buildGroupDisplayList: %.1fms items=%lu followHasMention=%d recentHasMention=%d", (CFAbsoluteTimeGetCurrent()-_bgStart)*1000, (unsigned long)displayList.count, followHasMention, recentHasMention);
+    return displayList;
+}
+
+static NSString *const kCollapsedSectionsKey = @"collapsed_sections";
+
+-(void) saveCollapsedSections {
+    NSString *uid = [WKApp shared].loginInfo.uid;
+    NSString *key = [NSString stringWithFormat:@"%@_%@", uid, kCollapsedSectionsKey];
+    NSString *value = [[self.collapsedSections allObjects] componentsJoinedByString:@","];
+    [[NSUserDefaults standardUserDefaults] setObject:value forKey:key];
+}
+
+-(void) restoreCollapsedSections {
+    if(!self.collapsedSections) {
+        self.collapsedSections = [NSMutableSet set];
+    }
+    NSString *uid = [WKApp shared].loginInfo.uid;
+    NSString *key = [NSString stringWithFormat:@"%@_%@", uid, kCollapsedSectionsKey];
+    NSString *saved = [[NSUserDefaults standardUserDefaults] objectForKey:key];
+    if(saved && saved.length > 0) {
+        NSArray *ids = [saved componentsSeparatedByString:@","];
+        for (NSString *sectionId in ids) {
+            if(sectionId.length > 0) {
+                [self.collapsedSections addObject:sectionId];
+            }
+        }
+    }
+}
+
+#pragma mark - Thread Expand
+
+static NSString *const kExpandedThreadGroupsKey = @"expanded_thread_groups";
+
+-(BOOL) isThreadExpanded:(NSString*)channelId {
+    return [self.expandedThreadGroups containsObject:channelId];
+}
+
+-(void) toggleThreadExpanded:(NSString*)channelId {
+    if ([self.expandedThreadGroups containsObject:channelId]) {
+        [self.expandedThreadGroups removeObject:channelId];
+    } else {
+        [self.expandedThreadGroups addObject:channelId];
+    }
+    [self saveExpandedThreadGroups];
+}
+
+-(void) saveExpandedThreadGroups {
+    NSString *uid = [WKApp shared].loginInfo.uid;
+    NSString *key = [NSString stringWithFormat:@"%@_%@", uid, kExpandedThreadGroupsKey];
+    NSString *value = [[self.expandedThreadGroups allObjects] componentsJoinedByString:@","];
+    [[NSUserDefaults standardUserDefaults] setObject:value forKey:key];
+}
+
+-(void) restoreExpandedThreadGroups {
+    if (!self.expandedThreadGroups) {
+        self.expandedThreadGroups = [NSMutableSet set];
+    }
+    NSString *uid = [WKApp shared].loginInfo.uid;
+    NSString *key = [NSString stringWithFormat:@"%@_%@", uid, kExpandedThreadGroupsKey];
+    NSString *saved = [[NSUserDefaults standardUserDefaults] objectForKey:key];
+    if (saved && saved.length > 0) {
+        NSArray *ids = [saved componentsSeparatedByString:@","];
+        for (NSString *cid in ids) {
+            if (cid.length > 0) [self.expandedThreadGroups addObject:cid];
+        }
+    }
+}
+
+@end
+
+#pragma mark - WKConversationDisplayItem
+
+@implementation WKConversationDisplayItem
+
++ (instancetype)itemWithConversation:(WKConversationWrapModel *)model {
+    WKConversationDisplayItem *item = [[WKConversationDisplayItem alloc] init];
+    item.conversation = model;
+    item.isSectionHeader = NO;
+    return item;
+}
+
++ (instancetype)sectionHeaderWithId:(NSString *)sectionId title:(NSString *)title isDefault:(BOOL)isDefault {
+    WKConversationDisplayItem *item = [[WKConversationDisplayItem alloc] init];
+    item.isSectionHeader = YES;
+    item.sectionId = sectionId;
+    item.sectionTitle = title;
+    item.isDefaultSection = isDefault;
+    return item;
+}
+
+@end

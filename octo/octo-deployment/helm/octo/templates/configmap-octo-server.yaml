@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "octo.fullname" . }}-octo-server-config
+  labels:
+    {{- include "octo.labels" . | nindent 4 }}
+data:
+  tsdd.yaml: |
+    {{- $cfg      := .Values.server.config     | default dict }}
+    {{- $logger   := $cfg.logger               | default dict }}
+    {{- $register := $cfg.register             | default dict }}
+    {{- $support  := $cfg.support              | default dict }}
+    mode: {{ $cfg.mode | default "release" | quote }}
+
+    external:
+      ip: ""
+      baseURL: ""
+      {{- if $cfg.webLoginURL }}
+      webLoginURL: {{ $cfg.webLoginURL | quote }}
+      {{- end }}
+
+    smsCode: {{ $cfg.smsCode | default "" | quote }}
+    adminPwd: ""
+
+    db:
+      mysqlAddr: ""
+      redisAddr: ""
+      redisPass: ""
+
+    wukongIM:
+      apiURL: "{{ include "octo.wukongim.apiURL" . }}"
+      managerToken: ""
+
+    fileService: {{ $cfg.fileService | default "minio" | quote }}
+    {{- if eq ($cfg.fileService | default "minio") "minio" }}
+    minio:
+      url: "{{ include "octo.minio.url" . }}"
+      downloadURL: ""
+      accessKeyID: ""
+      secretAccessKey: ""
+    {{- else if eq ($cfg.fileService | default "minio") "tencentCOS" }}
+    cos:
+      region: {{ .Values.cos.region | quote }}
+      bucket: {{ .Values.cos.bucket | quote }}
+      downloadURL: {{ .Values.cos.downloadURL | quote }}
+      prefix: {{ .Values.cos.prefix | default "" | quote }}
+      secretId: ""
+      secretKey: ""
+    {{- else if eq ($cfg.fileService | default "minio") "aliOSS" }}
+    oss:
+      endpoint: {{ .Values.oss.endpoint | quote }}
+      bucket: {{ .Values.oss.bucket | quote }}
+      downloadURL: {{ .Values.oss.downloadURL | quote }}
+      prefix: {{ .Values.oss.prefix | default "" | quote }}
+      accessKeyId: ""
+      accessKeySecret: ""
+    {{- else if eq ($cfg.fileService | default "minio") "s3" }}
+    s3:
+      endpoint: {{ .Values.s3.endpoint | quote }}
+      region: {{ .Values.s3.region | quote }}
+      bucket: {{ .Values.s3.bucket | quote }}
+      downloadURL: {{ .Values.s3.downloadURL | default "" | quote }}
+      prefix: {{ .Values.s3.prefix | default "" | quote }}
+      usePathStyle: {{ .Values.s3.usePathStyle | default false }}
+      accessKeyId: ""
+      secretAccessKey: ""
+      sessionToken: ""
+    {{- else if eq ($cfg.fileService | default "minio") "qiniu" }}
+    qiniu:
+      bucket: {{ .Values.qiniu.bucket | quote }}
+      downloadURL: {{ .Values.qiniu.downloadURL | quote }}
+      accessKey: ""
+      secretKey: ""
+    {{- end }}
+
+    logger:
+      level: {{ $logger.level | default 2 }}
+      dir: {{ $logger.dir | default "./logs" | quote }}
+      lineNum: {{ hasKey $logger "lineNum" | ternary (index $logger "lineNum") false }}
+
+    register:
+      "off": {{ hasKey $register "disabled" | ternary (index $register "disabled") true }}
+      onlyChina: {{ hasKey $register "onlyChina" | ternary (index $register "onlyChina") false }}
+      emailOn: {{ hasKey $register "emailOn" | ternary (index $register "emailOn") false }}
+
+    {{- if or $support.email $support.emailSmtp }}
+    support:
+      {{- if $support.email }}
+      email: {{ $support.email | quote }}
+      {{- end }}
+      {{- if $support.emailSmtp }}
+      emailSmtp: {{ $support.emailSmtp | quote }}
+      {{- end }}
+    {{- end }}

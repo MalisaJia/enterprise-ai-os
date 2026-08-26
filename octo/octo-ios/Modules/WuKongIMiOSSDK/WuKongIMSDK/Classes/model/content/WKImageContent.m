@@ -1,0 +1,248 @@
+//
+//  WKImageMessageContent.m
+//  WuKongIMSDK
+//
+//  Created by tt on 2020/1/13.
+//
+
+#import "WKImageContent.h"
+#import "WKConst.h"
+#import "WKMediaUtil.h"
+#import "WKFileUtil.h"
+#import "WKSDK.h"
+#import "WKMOSContentConvertManager.h"
+@interface WKImageContent ()
+@property(nonatomic,strong) UIImage  *orgImage;
+
+@property(nonatomic,strong) NSData *data;
+
+@property(nonatomic,strong) NSData *thumbData;
+
+@property(nonatomic,copy) NSString *_localPath; // 本地路径
+// 持久化第一次嗅出的扩展名。原实现每次都从 self.data 嗅 magic bytes，
+// 而 self.data 在上传完会被 releaseData 置 nil，导致 extension 默认回 ".png"，
+// localPath 也跟着变 ".png"，但实际文件是按 ".gif" 写盘的——读不到，气泡 GIF
+// 在上传完成那一刻就消失了 (回退到 URL → 经常被 SDImageCache 单帧静态命中)。
+@property(nonatomic,copy) NSString *cachedExtension;
+@end
+
+@implementation WKImageContent
+
++ (instancetype)initWithImage:(UIImage *)image {
+    WKImageContent *content = [WKImageContent new];
+    content.width = image.size.width;
+    content.height = image.size.height;
+    content.orgImage = image;
+    return content;
+}
+
+
++ (instancetype)initWithData:(NSData *)data width:(CGFloat)width height:(CGFloat)height {
+   
+    return [self initWithData:data width:width height:height thumbData:nil];
+}
+
++ (instancetype)initWithData:(NSData *)data width:(CGFloat)width height:(CGFloat)height thumbData:(NSData*)thumbData {
+    WKImageContent *content = [WKImageContent new];
+    content.data = data;
+    content.width = width;
+    content.height = height;
+    content.thumbData = thumbData;
+    return content;
+}
+
+- (UIImage *)originalImage {
+    if(!self.orgImage) {
+        self.orgImage = [UIImage imageWithContentsOfFile:[self localPath]];
+    }
+    return self.orgImage;
+}
+
+- (NSData *)originalImageData {
+    return [[NSData alloc] initWithContentsOfFile:[self localPath]];
+}
+
+
+
+-(UIImage*) thumbnailImage {
+    if(!_thumbnailImage) {
+        _thumbnailImage = [UIImage imageWithContentsOfFile:[self thumbPath]];
+    }
+    return _thumbnailImage;
+}
+
+- (NSData *)thumbnailData {
+    return [[NSData alloc] initWithContentsOfFile:[self thumbPath]];
+}
+
+- (NSString *)extension {
+    // 优先返回已持久化的扩展名，避免 self.data 被 releaseData 置 nil 后 localPath 抖动
+    if (self.cachedExtension.length > 0) {
+        return self.cachedExtension;
+    }
+    NSString *ext = [self detectExtensionFromData];
+    if (ext.length > 0) {
+        self.cachedExtension = ext;
+    }
+    return ext;
+}
+
+// 检测实际图片格式，返回对应扩展名
+- (NSString *)detectExtensionFromData {
+    if (self.data) {
+        if (self.data.length >= 2) {
+            uint8_t header[2];
+            [self.data getBytes:&header length:2];
+            if (header[0] == 0xFF && header[1] == 0xD8) {
+                return @".jpg";
+            }
+        }
+        if (self.data.length >= 4) {
+            uint8_t header[4];
+            [self.data getBytes:&header length:4];
+            if (header[0] == 0x89 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47) {
+                return @".png";
+            }
+            if (header[0] == 0x47 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x38) {
+                return @".gif";
+            }
+        }
+    }
+    // 兜底优先级：remoteUrl 扩展名 → 默认 .png
+    NSString *urlExt = [[self.remoteUrl pathExtension] lowercaseString];
+    if ([urlExt isEqualToString:@"gif"]) return @".gif";
+    if ([urlExt isEqualToString:@"jpg"] || [urlExt isEqualToString:@"jpeg"]) return @".jpg";
+    return @".png";
+}
+
+- (void) writeDataToLocalPath {
+    [super writeDataToLocalPath];
+    // 写盘前先冻结一次 extension (此时 self.data 还在)，避免后续 releaseData
+    // 让 localPath 漂走
+    [self extension];
+    // 获取本地路径
+   if(self.orgImage) {
+       self.width = self.orgImage.size.width;
+       self.height = self.orgImage.size.height;
+       
+        NSData *thumdData = [self compressImageSize:self.orgImage toByte:[WKSDK shared].options.imageMaxBytes];
+                                      [thumdData writeToFile:self.thumbPath atomically:YES];
+       
+       [UIImagePNGRepresentation(self.orgImage) writeToFile:self.localPath atomically:YES];
+    }
+    if(self.data) {
+        if(self.thumbData) {
+             [self.thumbData writeToFile:self.thumbPath atomically:YES];
+        }else {
+            NSData *thumbData = [self compressImageSize:[UIImage imageWithData:self.data] toByte:[WKSDK shared].options.imageMaxBytes];
+            [thumbData writeToFile:self.thumbPath atomically:YES];
+        }
+       
+        [self.data writeToFile:self.localPath atomically:YES];
+    }
+}
+
+/*!
+ *  @brief 使图片压缩后刚好小于指定大小
+ *
+ *  @param image 当前要压缩的图 maxLength 压缩后的大小
+ *
+ *  @return 图片对象
+ */
+//图片质量压缩到某一范围内，如果后面用到多，可以抽成分类或者工具类,这里压缩递减比二分的运行时间长，二分可以限制下限。
+- (NSData *)compressImageSize:(UIImage *)image toByte:(NSUInteger)maxLength{
+    //首先判断原图大小是否在要求内，如果满足要求则不进行压缩，over
+    CGFloat compression = 1;
+    NSData *data = UIImageJPEGRepresentation(image, compression);
+    if (data.length < maxLength) return data;
+    //原图大小超过范围，先进行“压处理”，这里 压缩比 采用二分法进行处理，6次二分后的最小压缩比是0.015625，已经够小了
+    CGFloat max = 1;
+    CGFloat min = 0;
+    for (int i = 0; i < 6; ++i) {
+        compression = (max + min) / 2;
+        data = UIImageJPEGRepresentation(image, compression);
+        if (data.length < maxLength * 0.9) {
+            min = compression;
+        } else if (data.length > maxLength) {
+            max = compression;
+        } else {
+            break;
+        }
+    }
+    //判断“压处理”的结果是否符合要求，符合要求就over
+    UIImage *resultImage = [UIImage imageWithData:data];
+    if (data.length < maxLength) return data;
+    
+    //缩处理，直接用大小的比例作为缩处理的比例进行处理，因为有取整处理，所以一般是需要两次处理
+    NSUInteger lastDataLength = 0;
+    while (data.length > maxLength && data.length != lastDataLength) {
+        lastDataLength = data.length;
+        //获取处理后的尺寸
+        CGFloat ratio = (CGFloat)maxLength / data.length;
+        CGSize size = CGSizeMake((NSUInteger)(resultImage.size.width * sqrtf(ratio)),
+                                 (NSUInteger)(resultImage.size.height * sqrtf(ratio)));
+        //通过图片上下文进行处理图片
+        UIGraphicsBeginImageContext(size);
+        [resultImage drawInRect:CGRectMake(0, 0, size.width, size.height)];
+        resultImage = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        //获取处理后图片的大小
+        data = UIImageJPEGRepresentation(resultImage, compression);
+    }
+    
+    return data;
+}
+
+- (void)decodeWithJSON:(NSDictionary *)contentDic {
+    self.remoteUrl = contentDic[@"url"];
+    self.width = contentDic[@"width"]?[contentDic[@"width"] floatValue]:0;
+    self.height = contentDic[@"height"]?[contentDic[@"height"] floatValue]:0;
+
+    // 服务端未返回宽高时(如Bot发送的图片)，给一个默认尺寸，避免渲染异常
+    if(self.width <= 0 || self.height <= 0) {
+        self.width = 200;
+        self.height = 200;
+    }
+
+    // [DEBUG] 打印图片消息解码详情
+    NSLog(@"[BOT-DEBUG] WKImageContent解码: url=%@, width=%.0f, height=%.0f, allKeys=%@",
+          self.remoteUrl ?: @"(nil)",
+          self.width,
+          self.height,
+          contentDic.allKeys);
+}
+
+- (NSDictionary *)encodeWithJSON {
+    NSMutableDictionary *dataDict = [NSMutableDictionary dictionary];
+    [dataDict setObject:self.remoteUrl?:@"" forKey:@"url"];
+    [dataDict setObject:@(self.width) forKey:@"width"];
+    [dataDict setObject:@(self.height) forKey:@"height"];
+    return dataDict;
+}
+
++(NSNumber*) contentType {
+    return @(WK_IMAGE);
+}
+
+- (NSString *)conversationDigest {
+    return @"[图片]";
+}
+
+- (NSString *)searchableWord {
+    return @"[图片]";
+}
+
+- (BOOL)viewedOfVisible {
+    if(self.message && self.message.isSend) {
+        return true;
+    }
+    return false;
+}
+
+-(void) releaseData {
+    self.orgImage = nil;
+    self.thumbnailImage = nil;
+    self.thumbData = nil;
+    self.data = nil;
+}
+@end

@@ -1,0 +1,597 @@
+/*
+ * Copyright 2026-present OctoIM contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.chat.base.msg;
+
+import android.text.TextUtils;
+import android.view.View;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+
+import androidx.annotation.NonNull;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
+
+import com.chad.library.adapter.base.BaseProviderMultiAdapter;
+import com.chad.library.adapter.base.provider.BaseItemProvider;
+import com.chad.library.adapter.base.viewholder.BaseViewHolder;
+import com.chat.base.R;
+import com.chat.base.endpoint.EndpointManager;
+import com.chat.base.endpoint.entity.ShowMsgReactionMenu;
+import com.chat.base.msgitem.WKChatBaseProvider;
+import com.chat.base.msgitem.WKChatIteMsgFromType;
+import com.chat.base.msgitem.WKContentType;
+import com.chat.base.msgitem.WKMsgItemViewManager;
+import com.chat.base.msgitem.WKUIChatMsgItemEntity;
+import com.chat.base.ui.components.AvatarView;
+import com.chat.base.ui.components.SecretDeleteTimer;
+import com.chat.base.utils.WKReader;
+import com.chat.base.views.ChatItemView;
+import com.chat.base.views.pinnedsectionitemdecoration.utils.FullSpanUtil;
+import com.xinbida.wukongim.entity.WKChannel;
+import com.xinbida.wukongim.entity.WKMsg;
+import com.xinbida.wukongim.entity.WKMsgReaction;
+
+import org.jetbrains.annotations.NotNull;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * 2020-08-03 13:46
+ * 消息适配器
+ */
+public class ChatAdapter extends BaseProviderMultiAdapter<WKUIChatMsgItemEntity> {
+    private final IConversationContext iConversationContext;
+    private final HashMap<String, Integer> clientMsgNoIndex = new HashMap<>(512);
+    private final HashMap<String, Integer> messageIdIndex = new HashMap<>(512);
+    private final HashMap<Long, Integer> orderSeqIndex = new HashMap<>(512);
+
+    // 持久化高亮目标：不受 setNewInstance 替换 item 影响，bind 时按 orderSeq 匹配
+    private volatile long pendingHighlightOrderSeq = 0;
+
+    public void setPendingHighlightOrderSeq(long orderSeq) {
+        this.pendingHighlightOrderSeq = orderSeq;
+    }
+
+    public long consumeHighlightIfMatch(long itemOrderSeq) {
+        if (pendingHighlightOrderSeq != 0 && pendingHighlightOrderSeq == itemOrderSeq) {
+            pendingHighlightOrderSeq = 0;
+            return itemOrderSeq;
+        }
+        return 0;
+    }
+
+    public enum AdapterType {
+        normalMessage, pinnedMessage
+    }
+
+
+    @Override
+    public void onAttachedToRecyclerView(@NotNull RecyclerView recyclerView) {
+        super.onAttachedToRecyclerView(recyclerView);
+        FullSpanUtil.onAttachedToRecyclerView(recyclerView, this, WKContentType.msgPromptTime);
+    }
+
+    /**
+     * RecyclerView 主动断开本 adapter 时（{@code setAdapter(newAdapter)} / {@code swapAdapter}
+     * / {@code setAdapter(null)}）触发。转发到 {@link #disposeProviders()} 做统一清理——
+     * 注意本 hook <b>不</b>会在 Activity/Fragment onDestroy 自然结束时触发，宿主须自行
+     * 显式调 {@link #disposeProviders()}（见 ChatActivity.onDestroy）。
+     */
+    @Override
+    public void onDetachedFromRecyclerView(@NotNull RecyclerView recyclerView) {
+        super.onDetachedFromRecyclerView(recyclerView);
+        disposeProviders();
+    }
+
+    /**
+     * 统一释放所有 provider 内的重资源（LRU 缓存的 SDK 视图、pending Handler 回调
+     * 等）。宿主 Activity/Fragment 的 onDestroy 必须调本方法，否则 provider 可能短时
+     * 持有 Activity 引用直到 pending 回调 fire 或 GC 收走。
+     *
+     * <p>幂等：同一 adapter 反复调用不会崩，只是重复 no-op。
+     */
+    public void disposeProviders() {
+        if (localProviderList == null) return;
+        for (BaseItemProvider<WKUIChatMsgItemEntity> provider : localProviderList.values()) {
+            if (provider instanceof WKChatBaseProvider) {
+                try {
+                    ((WKChatBaseProvider) provider).dispose();
+                } catch (Throwable t) {
+                    // 单个 provider 抛异常不应影响其它 provider 的清理
+                    android.util.Log.w("ChatAdapter", "provider dispose failed", t);
+                }
+            }
+        }
+    }
+
+    public interface OnMessageDisplayedListener {
+        void onMessageDisplayed(WKUIChatMsgItemEntity item, View itemView);
+    }
+
+    private OnMessageDisplayedListener messageDisplayedListener;
+
+    public void setOnMessageDisplayedListener(OnMessageDisplayedListener listener) {
+        this.messageDisplayedListener = listener;
+    }
+
+    @Override
+    public void onViewAttachedToWindow(@NotNull BaseViewHolder holder) {
+        super.onViewAttachedToWindow(holder);
+        FullSpanUtil.onViewAttachedToWindow(holder, this, WKContentType.msgPromptTime);
+        if (messageDisplayedListener != null) {
+            int pos = holder.getBindingAdapterPosition();
+            if (pos >= 0 && pos < getData().size()) {
+                messageDisplayedListener.onMessageDisplayed(getData().get(pos), holder.itemView);
+            }
+        }
+    }
+
+    private final AdapterType adapterType;
+    private ConcurrentHashMap<Integer, BaseItemProvider<WKUIChatMsgItemEntity>> localProviderList;
+
+    ConcurrentHashMap<Integer, BaseItemProvider<WKUIChatMsgItemEntity>> getItemProviderList() {
+        return localProviderList;
+    }
+
+    /**
+     * 取本 adapter 实际用于渲染的 provider 实例（构造时反射 clone 的那份，非 WKMsgItemViewManager 单例原型）。
+     * 需要向"正在渲染的" provider 投递 bind 无关信号（如交互卡提交完成后清 submit 态）时用；
+     * 打到单例原型上会因 provider 内部状态 per-instance 而成为 no-op。返回基类，由 wkuikit 侧按需 cast。
+     */
+    public BaseItemProvider<WKUIChatMsgItemEntity> getRenderingProvider(int type) {
+        return localProviderList == null ? null : localProviderList.get(type);
+    }
+
+    public ChatAdapter(@NonNull IConversationContext iConversationContext, AdapterType adapterType) {
+        super();
+        this.adapterType = adapterType;
+        this.iConversationContext = iConversationContext;
+        ConcurrentHashMap<Integer, BaseItemProvider<WKUIChatMsgItemEntity>> sourceList =
+                adapterType == AdapterType.normalMessage
+                        ? WKMsgItemViewManager.getInstance().getChatItemProviderList()
+                        : WKMsgItemViewManager.getInstance().getPinnedChatItemProviderList();
+        localProviderList = new ConcurrentHashMap<>();
+        for (int type : sourceList.keySet()) {
+            BaseItemProvider<WKUIChatMsgItemEntity> provider = null;
+            try {
+                provider = sourceList.get(type).getClass().getDeclaredConstructor().newInstance();
+            } catch (Exception ignored) {
+            }
+            if (provider == null) {
+                // 带 int 参数的构造函数（如 WKSystemProvider(int type)），
+                // 避免 fallback 到单例原始实例导致 Activity 泄漏
+                try {
+                    //noinspection unchecked
+                    provider = (BaseItemProvider<WKUIChatMsgItemEntity>)
+                            sourceList.get(type).getClass().getDeclaredConstructor(int.class).newInstance(type);
+                } catch (Exception ignored) {
+                }
+            }
+            if (provider == null) {
+                continue; // 反射均失败，跳过该 provider，避免使用单例实例导致 Activity 泄漏
+            }
+            localProviderList.put(type, provider);
+            addItemProvider(provider);
+        }
+    }
+
+    @Override
+    protected int getItemType(@NotNull List<? extends WKUIChatMsgItemEntity> list, int i) {
+        if (list.get(i).wkMsg.remoteExtra != null && list.get(i).wkMsg.remoteExtra.revoke == 1) {
+            //撤回消息
+            return WKContentType.revoke;
+        }
+        if (getItemProviderList().containsKey(list.get(i).wkMsg.type)) {
+            return list.get(i).wkMsg.type;
+        }
+        if (list.get(i).wkMsg.type >= 1000 && list.get(i).wkMsg.type <= 2000) {
+            //系统消息
+            return WKContentType.systemMsg;
+        }
+        // 截屏消息等提示类消息，当作系统消息显示
+        if (list.get(i).wkMsg.type == WKContentType.screenshot) {
+            return WKContentType.screenshot;
+        }
+        return WKContentType.unknown_msg;
+    }
+
+    public long getLastTimeMsg() {
+        long timestamp = 0;
+        for (int i = getData().size() - 1; i >= 0; i--) {
+            if (getData().get(i).wkMsg != null && getData().get(i).wkMsg.timestamp > 0) {
+                timestamp = getData().get(i).wkMsg.timestamp;
+                break;
+            }
+        }
+        return timestamp;
+    }
+
+
+    public IConversationContext getConversationContext() {
+        return iConversationContext;
+    }
+
+    //显示多选
+    public void showMultipleChoice() {
+        iConversationContext.showMultipleChoice();
+    }
+
+    public void hideSoftKeyboard() {
+        iConversationContext.hideSoftKeyboard();
+    }
+
+    //回复某条消息
+    public void replyMsg(WKMsg wkMsg) {
+        iConversationContext.showReply(wkMsg);
+    }
+
+    public void showTitleRightText(String content) {
+        iConversationContext.setTitleRightText(content);
+    }
+
+    //提示某条消息
+    public void showTipsMsg(String clientMsgNo) {
+        iConversationContext.tipsMsg(clientMsgNo);
+    }
+
+    //设置输入框内容
+    public void setEditContent(String content) {
+        iConversationContext.setEditContent(content);
+    }
+
+    public void rebuildIndex() {
+        clientMsgNoIndex.clear();
+        messageIdIndex.clear();
+        orderSeqIndex.clear();
+        List<WKUIChatMsgItemEntity> data = getData();
+        for (int i = 0, size = data.size(); i < size; i++) {
+            WKMsg msg = data.get(i).wkMsg;
+            if (msg == null) continue;
+            if (!TextUtils.isEmpty(msg.clientMsgNO)) {
+                clientMsgNoIndex.put(msg.clientMsgNO, i);
+            }
+            if (!TextUtils.isEmpty(msg.messageID)) {
+                messageIdIndex.put(msg.messageID, i);
+            }
+            if (msg.orderSeq != 0) {
+                orderSeqIndex.put(msg.orderSeq, i);
+            }
+        }
+    }
+
+    //是否存在某条消息
+    public boolean isExist(String clientMsgNo, String messageId) {
+        if (!TextUtils.isEmpty(messageId) && messageIdIndex.containsKey(messageId)) {
+            return true;
+        }
+        if (!TextUtils.isEmpty(clientMsgNo) && clientMsgNoIndex.containsKey(clientMsgNo)) {
+            return true;
+        }
+        return false;
+    }
+
+    public int findPositionByMsg(WKMsg wkMsg) {
+        if (wkMsg == null) return -1;
+        if (!TextUtils.isEmpty(wkMsg.clientMsgNO)) {
+            Integer pos = clientMsgNoIndex.get(wkMsg.clientMsgNO);
+            if (pos != null && pos >= 0 && pos < getData().size()) return pos;
+        }
+        if (!TextUtils.isEmpty(wkMsg.messageID)) {
+            Integer pos = messageIdIndex.get(wkMsg.messageID);
+            if (pos != null && pos >= 0 && pos < getData().size()) return pos;
+        }
+        // fallback: linear search by clientSeq
+        for (int i = 0, size = getData().size(); i < size; i++) {
+            if (getData().get(i).wkMsg != null && getData().get(i).wkMsg.clientSeq == wkMsg.clientSeq) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    public int findPositionByOrderSeq(long orderSeq) {
+        if (orderSeq == 0) return -1;
+        Integer pos = orderSeqIndex.get(orderSeq);
+        if (pos != null && pos >= 0 && pos < getData().size()) return pos;
+        return -1;
+    }
+
+    //获取最后一条消息
+    public WKMsg getLastMsg() {
+        WKMsg wkMsg = null;
+        for (int i = getData().size() - 1; i >= 0; i--) {
+            if (getData().get(i).wkMsg != null
+                    && getData().get(i).wkMsg.type != WKContentType.msgPromptNewMsg
+                    && getData().get(i).wkMsg.type != WKContentType.typing) {
+                wkMsg = getData().get(i).wkMsg;
+                break;
+            }
+        }
+        return wkMsg;
+    }
+
+    //获取最后一条消息是否为正在输入
+    public boolean lastMsgIsTyping() {
+        boolean isTyping = false;
+        for (int i = getData().size() - 1; i >= 0; i--) {
+            if (getData().get(i).wkMsg != null && getData().get(i).wkMsg.type == WKContentType.typing) {
+                isTyping = true;
+                break;
+            }
+        }
+
+        return isTyping;
+    }
+
+    public long getEndMsgOrderSeq() {
+        long oldestOrderSeq = 0;
+        for (int i = getData().size() - 1; i >= 0; i--) {
+            if (getData().get(i).wkMsg != null && getData().get(i).wkMsg.orderSeq != 0) {
+                oldestOrderSeq = getData().get(i).wkMsg.orderSeq;
+                break;
+            }
+        }
+        return oldestOrderSeq;
+    }
+
+    public long getFirstMsgOrderSeq() {
+        long oldestOrderSeq = 0;
+        for (int i = 0, size = getData().size(); i < size; i++) {
+            if (getData().get(i).wkMsg != null && getData().get(i).wkMsg.orderSeq != 0) {
+                oldestOrderSeq = getData().get(i).wkMsg.orderSeq;
+                break;
+            }
+        }
+        return oldestOrderSeq;
+    }
+
+    public void resetData(List<WKUIChatMsgItemEntity> list) {
+        if (WKReader.isEmpty(list)) return;
+        for (int i = 0, size = list.size(); i < size; i++) {
+            int previousIndex = i - 1;
+            int nextIndex = i + 1;
+            if (previousIndex >= 0) {
+                list.get(i).previousMsg = list.get(previousIndex).wkMsg;
+            }
+            if (nextIndex <= list.size() - 1) {
+                list.get(i).nextMsg = list.get(nextIndex).wkMsg;
+            }
+        }
+    }
+
+    public int getFirstVisibleItemIndex(int startIndex) {
+        int index = startIndex;
+        if (startIndex >= 0 && startIndex <= getData().size() - 1) {
+            if (getData().get(startIndex).wkMsg == null || getData().get(startIndex).wkMsg.orderSeq == 0) {
+                for (int i = startIndex; i < getData().size(); i++) {
+                    if (getData().get(i).wkMsg != null && getData().get(i).wkMsg.orderSeq != 0) {
+                        index = i;
+                        break;
+                    }
+                }
+            }
+        }
+        return index;
+    }
+
+    public WKMsg getFirstVisibleItem(int startIndex) {
+        WKMsg wkMsg = null;
+        if (startIndex >= 0 && startIndex <= getData().size() - 1) {
+            if (getData().get(startIndex).wkMsg == null || getData().get(startIndex).wkMsg.orderSeq == 0) {
+                for (int i = startIndex; i < getData().size(); i++) {
+                    if (getData().get(i).wkMsg != null && getData().get(i).wkMsg.orderSeq != 0) {
+                        wkMsg = getData().get(i).wkMsg;
+                        break;
+                    }
+                }
+            } else {
+                wkMsg = getData().get(startIndex).wkMsg;
+            }
+        }
+        return wkMsg;
+    }
+
+    public boolean isShowChooseItem() {
+        boolean isShowChoose = false;
+        for (int i = 0, size = getData().size(); i < size; i++) {
+            if (getData().get(i).isChoose) {
+                isShowChoose = true;
+                break;
+            }
+        }
+        return isShowChoose;
+    }
+
+    public boolean isCanSwipe(int index) {
+        if (index < 0 || index >= getData().size()) {
+            return false;
+        }
+        int type = getData().get(index).wkMsg.type;
+        if (type <= 0 || getData().get(index).wkMsg.flame == 1 || (getData().get(index).wkMsg.remoteExtra != null && getData().get(index).wkMsg.remoteExtra.revoke == 1)) {
+            return false;
+        }
+        WKChannel channel = iConversationContext.getChatChannelInfo();
+        ConcurrentHashMap<Integer, BaseItemProvider<WKUIChatMsgItemEntity>> list = getItemProviderList();
+        WKChatBaseProvider baseItemProvider = (WKChatBaseProvider) list.get(type);
+        if (baseItemProvider != null && channel.status == 1)
+            return baseItemProvider.getMsgConfig(type).isCanReply;
+        return false;
+    }
+
+    public void updateDeleteTimer(int position) {
+        WKUIChatMsgItemEntity entity = getData().get(position);
+        LinearLayoutManager linearLayoutManager = (LinearLayoutManager) getRecyclerView().getLayoutManager();
+        if (linearLayoutManager == null) return;
+        View view = linearLayoutManager.findViewByPosition(position);
+        LinearLayout baseView = null;
+        if (view != null) {
+            baseView = view.findViewById(R.id.wkBaseContentLayout);
+        }
+        if (baseView == null) return;
+        ConcurrentHashMap<Integer, BaseItemProvider<WKUIChatMsgItemEntity>> list = getItemProviderList();
+        WKChatBaseProvider baseItemProvider = (WKChatBaseProvider) list.get(entity.wkMsg.type);
+        if (baseItemProvider != null) {
+            SecretDeleteTimer deleteTimer = null;
+            WKChatIteMsgFromType from = baseItemProvider.getMsgFromType(entity.wkMsg);
+            if (baseView.getChildCount() > 1) {
+                if (from == WKChatIteMsgFromType.SEND) {
+                    View childView = baseView.getChildAt(0);
+                    if (childView instanceof SecretDeleteTimer) {
+                        deleteTimer = (SecretDeleteTimer) childView;
+                    }
+                } else if (from == WKChatIteMsgFromType.RECEIVED) {
+                    View childView = baseView.getChildAt(1);
+                    if (childView instanceof SecretDeleteTimer) {
+                        deleteTimer = (SecretDeleteTimer) childView;
+                    }
+                }
+            }
+
+            if (deleteTimer != null) {
+                deleteTimer.setVisibility(View.VISIBLE);
+                deleteTimer.setDestroyTime(entity.wkMsg.clientMsgNO, entity.wkMsg.flameSecond, entity.wkMsg.viewedAt, false);
+            }
+        }
+    }
+
+
+    public enum RefreshType {
+        status, background, data, reaction, reply, listener
+    }
+
+    public void notifyStatus(int position) {
+        notify(position, RefreshType.status, null);
+    }
+
+    public void notifyData(int position) {
+        // Provider 声明 hasDynamicHeight=true（如 Interactive Card 的 contentEdit 帧带来
+        // 更多控件）时，必须走标准 notifyItemChanged 让 RecyclerView 重新测量本 item 并
+        // reflow 相邻 item——否则 in-place 更新完，相邻消息会沿用旧高度定位而重叠错位。
+        // 固定高度类型（文本 / 图片 / 语音 / 贴纸等，默认 hasDynamicHeight=false）走原
+        // 轻量 in-place 更新路径，跳过 RecyclerView rebind + 动画，性能更优。
+        if (isDynamicHeightAt(position)) {
+            notifyItemChanged(position);
+            return;
+        }
+        notify(position, RefreshType.data, null);
+    }
+
+    private boolean isDynamicHeightAt(int position) {
+        if (position < 0 || position >= getData().size()) return false;
+        WKUIChatMsgItemEntity entity = getData().get(position);
+        if (entity == null || entity.wkMsg == null) return false;
+        WKChatBaseProvider provider =
+                (WKChatBaseProvider) getItemProviderList().get(entity.wkMsg.type);
+        return provider != null && provider.getHasDynamicHeight();
+    }
+
+    public void notifyListener(int position) {
+        notify(position, RefreshType.listener, null);
+    }
+
+    public void notifyBackground(int position) {
+        notify(position, RefreshType.background, null);
+    }
+
+    public void notifyReaction(int position, List<WKMsgReaction> reactionList) {
+        notify(position, RefreshType.reaction, reactionList);
+    }
+
+    private void notify(int position, RefreshType refreshType, List<WKMsgReaction> reactionList) {
+        if (position < 0 || position >= getData().size()) return;
+        WKUIChatMsgItemEntity entity = getData().get(position);
+        LinearLayoutManager linearLayoutManager = (LinearLayoutManager) getRecyclerView().getLayoutManager();
+        if (linearLayoutManager == null) return;
+        View view = linearLayoutManager.findViewByPosition(position);
+        View baseView = null;
+        if (view != null) {
+            baseView = view.findViewById(R.id.wkBaseContentLayout);
+        }
+        if (baseView == null) return;
+        ConcurrentHashMap<Integer, BaseItemProvider<WKUIChatMsgItemEntity>> list = getItemProviderList();
+        WKChatBaseProvider baseItemProvider = (WKChatBaseProvider) list.get(entity.wkMsg.type);
+        if (baseItemProvider != null) {
+            WKChatIteMsgFromType from = baseItemProvider.getMsgFromType(entity.wkMsg);
+            if (refreshType == RefreshType.data) {
+                baseItemProvider.refreshData(position, baseView, entity, from);
+            } else if (refreshType == RefreshType.reaction) {
+                FrameLayout reactionsView = view.findViewById(R.id.reactionsView);
+                EndpointManager.getInstance().invoke(
+                        "refresh_msg_reaction", new ShowMsgReactionMenu(
+                                reactionsView,
+                                from,
+                                this,
+                                reactionList)
+                );
+                AvatarView avatarView = view.findViewById(R.id.avatarView);
+                if (avatarView != null) {
+                    baseItemProvider.setAvatarLayoutParams(entity, from, avatarView);
+                }
+            } else if (refreshType == RefreshType.background) {
+                AvatarView avatarView = view.findViewById(R.id.avatarView);
+                if (avatarView != null) {
+                    baseItemProvider.setAvatarLayoutParams(entity, from, avatarView);
+                }
+                baseItemProvider.resetCellBackground(baseView, entity, from);
+                LinearLayout fullContentLayout = view.findViewById(R.id.fullContentLayout);
+                if (fullContentLayout != null) {
+                    baseItemProvider.setFullLayoutParams(entity, from, fullContentLayout);
+                }
+                ChatItemView viewGroupLayout = view.findViewById(R.id.viewGroupLayout);
+                if (viewGroupLayout != null) {
+                    baseItemProvider.setItemPadding(position, viewGroupLayout);
+                }
+            } else if (refreshType == RefreshType.status) {
+                baseItemProvider.resetCellListener(position, baseView, entity, from);
+                baseItemProvider.setMsgTimeAndStatus(
+                        entity,
+                        baseView,
+                        from
+                );
+            } else if (refreshType == RefreshType.listener) {
+                baseItemProvider.resetCellListener(position, baseView, entity, from);
+            } else if (refreshType == RefreshType.reply) {
+                baseItemProvider.refreshReply(position, baseView, entity, from);
+            }
+        }
+    }
+
+    public void refreshReplyMsg(WKMsg wkMsg) {
+        if (wkMsg == null || wkMsg.remoteExtra == null || TextUtils.isEmpty(wkMsg.remoteExtra.messageID))
+            return;
+        List<WKUIChatMsgItemEntity> list = getData();
+        for (int i = 0, size = list.size(); i < size; i++) {
+            // loading / 占位 item 的 wkMsg 是 null（同 #129 在其它遍历点补的空判），
+            // 这里原来直接解引用，列表里存在占位项时会 NPE。
+            if (list.get(i) == null || list.get(i).wkMsg == null) continue;
+            if (list.get(i).wkMsg.baseContentMsgModel == null || list.get(i).wkMsg.baseContentMsgModel.reply == null) {
+                continue;
+            }
+            if (list.get(i).wkMsg.baseContentMsgModel.reply.message_seq == wkMsg.messageSeq) {
+                list.get(i).wkMsg.baseContentMsgModel.reply.contentEditMsgModel = wkMsg.remoteExtra.contentEditMsgModel;
+                list.get(i).wkMsg.baseContentMsgModel.reply.contentEdit = wkMsg.remoteExtra.contentEdit;
+                list.get(i).wkMsg.baseContentMsgModel.reply.editAt = wkMsg.remoteExtra.editedAt;
+                list.get(i).wkMsg.baseContentMsgModel.reply.revoke = wkMsg.remoteExtra.revoke;
+                notify(i, RefreshType.reply, null);
+            }
+        }
+
+    }
+}

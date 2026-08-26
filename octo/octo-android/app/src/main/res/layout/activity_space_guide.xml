@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_space_guide_gradient">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:layout_marginStart="32dp"
+        android:layout_marginEnd="32dp"
+        android:background="@drawable/bg_space_guide_card"
+        android:elevation="8dp"
+        android:orientation="vertical"
+        android:padding="32dp">
+
+        <ViewFlipper
+            android:id="@+id/viewFlipper"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <!-- View 0: 欢迎页 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_horizontal"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="\uD83D\uDC4B"
+                    android:textSize="48sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:text="@string/space_guide_welcome"
+                    android:textColor="#1a1a1a"
+                    android:textSize="24sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/space_guide_subtitle"
+                    android:textColor="#6B7280"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:id="@+id/btnJoin"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="32dp"
+                    android:background="@drawable/bg_space_guide_btn"
+                    android:gravity="center"
+                    android:text="@string/space_guide_join_team"
+                    android:textColor="#374151"
+                    android:textSize="15sp" />
+
+                <TextView
+                    android:id="@+id/btnCreate"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="12dp"
+                    android:background="@drawable/bg_space_guide_btn"
+                    android:gravity="center"
+                    android:text="@string/space_guide_create_team"
+                    android:textColor="#374151"
+                    android:textSize="15sp"
+                    android:visibility="gone" />
+
+            </LinearLayout>
+
+            <!-- View 1: 加入页 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_horizontal"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="\uD83D\uDC4B"
+                    android:textSize="48sp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:text="@string/space_guide_welcome"
+                    android:textColor="#1a1a1a"
+                    android:textSize="24sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="@string/space_guide_subtitle"
+                    android:textColor="#6B7280"
+                    android:textSize="14sp" />
+
+                <EditText
+                    android:id="@+id/etInviteCode"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="24dp"
+                    android:background="@drawable/bg_space_guide_btn"
+                    android:hint="@string/space_guide_input_invite_code"
+                    android:importantForAutofill="no"
+                    android:inputType="text"
+                    android:maxLength="20"
+                    android:paddingStart="16dp"
+                    android:paddingEnd="16dp"
+                    android:singleLine="true"
+                    android:textColor="#1a1a1a"
+                    android:textColorHint="#9CA3AF"
+                    android:textSize="15sp" />
+
+                <TextView
+                    android:id="@+id/btnDoJoin"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="16dp"
+                    android:background="@drawable/bg_space_guide_btn_primary"
+                    android:gravity="center"
+                    android:text="@string/space_guide_join"
+                    android:textColor="#FFFFFF"
+                    android:textSize="15sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/btnBack"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="12dp"
+                    android:background="@drawable/bg_space_guide_btn"
+                    android:gravity="center"
+                    android:text="@string/space_guide_back"
+                    android:textColor="#6B7280"
+                    android:textSize="15sp" />
+
+            </LinearLayout>
+
+        </ViewFlipper>
+
+        <!-- 退出登录入口 (issue #66, 对齐 web)：放在 ViewFlipper 之外，
+             欢迎页 / 加入页都能看到；新注册用户在此能切换账号，避免卡死。 -->
+        <TextView
+            android:id="@+id/btnLogout"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="20dp"
+            android:padding="8dp"
+            android:text="@string/login_out"
+            android:textColor="#9CA3AF"
+            android:textSize="13sp" />
+
+    </LinearLayout>
+
+</FrameLayout>

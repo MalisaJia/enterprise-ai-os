@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/ISSUE_TEMPLATE/**'
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+    # paths-ignore is intentionally NOT set here — workflow-level path filtering
+    # prevents GitHub from creating any check run, which deadlocks required-status
+    # checks on docs-only PRs. Path-based skipping is handled by the `changes`
+    # preflight job below instead (dorny/paths-filter produces "skipped" statuses
+    # that GitHub counts as passing for required checks).
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      # code=true when at least one changed file matches the code filter.
+      # predicate-quantifier:every + negation patterns (no bare '**'):
+      # a file matches 'code' iff ALL negation patterns are satisfied
+      # (file is not a doc/template). code=false only when all changed files
+      # are docs/templates. Push events default to 'true'.
+      code: ${{ github.event_name == 'pull_request' && steps.filter.outputs.code || 'true' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@6852f92c20ea7fd3b0c25de3b5112db3a98da050 # v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # predicate-quantifier: every — a file matches 'code' only when ALL
+          # negation patterns are satisfied (file is NOT a doc/template file).
+          #
+          # Validated by picomatch v4 unit test (same library used internally):
+          #   README.md:    !**/*.md=false → every=false → not match → code=false ✅
+          #   main file:    all negations=true → every=true → match → code=true ✅
+          #   mixed PR:     code file matches → code=true (some over changed files) ✅
+          #   dotfiles:     all negations=true → every=true → CI runs ✅
+          #   Dockerfile:   all negations=true → CI runs ✅
+          #
+          # Do NOT add '**': picomatch('**') doesn't match dotfiles (e.g. .golangci.yml)
+          # causing them to incorrectly skip CI with the 'every' quantifier.
+          # Do NOT use 'some' + negation: every changed file matches at least one
+          # negation pattern (e.g. main.go matches !**/*.md), so some=true always
+          # and the skip logic becomes a no-op.
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '!**/*.md'
+              - '!docs/**'
+              - '!.github/ISSUE_TEMPLATE/**'
+
+  build:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@48b5f213c81028ace310571dc5ec0fbbca0b2947 # v4
+
+      - name: Build with Gradle
+        run: ./gradlew testDebugUnitTest assembleDevDebug

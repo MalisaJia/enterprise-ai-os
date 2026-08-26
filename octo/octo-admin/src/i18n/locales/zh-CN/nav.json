@@ -1,0 +1,17 @@
+{
+  "groupOverview": "概览",
+  "groupManagement": "管理",
+  "groupSystem": "系统",
+  "dashboard": "仪表盘",
+  "users": "用户管理",
+  "groups": "群组管理",
+  "spaces": "空间管理",
+  "appBots": "应用 Bot",
+  "systemSetting": "系统配置",
+  "systemMcp": "MCP 市场",
+  "skillMarket": "Skill 市场",
+  "expertMarket": "专家市场",
+  "backup": "备份管理",
+  "download": "下载配置",
+  "systemSkill": "Skill 市场"
+}

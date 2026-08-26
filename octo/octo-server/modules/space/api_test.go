@@ -1,0 +1,2847 @@
+package space
+
+import (
+	"bytes"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-lib/server"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	modulescommon "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/db"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/go-redis/redis"
+	"github.com/stretchr/testify/assert"
+)
+
+var (
+	testSrv     *server.Server
+	testCtx     *config.Context
+	testSpaceDB *DB
+)
+
+// TestMain 确保 space 迁移所依赖的外部表存在，并创建共享测试服务器。
+//
+// OCTO_MASTER_KEY 必须在 NewTestServer 之前设置：space 包通过
+// email_invite_sender.go 直接 import modules/common，会触发 common 的
+// init() 注册 Module；NewTestServer 走到 common.Route() 时会调用
+// insertAppConfigIfNeed → encryptKey/decryptKey，缺 key 会 panic。
+// 这里 fallback 一个固定值，CI 已显式 export 同名变量，本地裸跑也能过。
+func TestMain(m *testing.M) {
+	if os.Getenv("OCTO_MASTER_KEY") == "" {
+		_ = os.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+	}
+
+	db, err := sql.Open("mysql", "root:demo@tcp(127.0.0.1)/test?charset=utf8mb4&parseTime=true")
+	if err != nil {
+		panic("连接测试数据库失败: " + err.Error())
+	}
+
+	// space 迁移脚本依赖 group 和 robot 表
+	depDDLs := []string{
+		"CREATE TABLE IF NOT EXISTS `group` (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', creator VARCHAR(40) DEFAULT '', status SMALLINT DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_group_no(group_no)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE IF NOT EXISTS group_member (id BIGINT AUTO_INCREMENT PRIMARY KEY, group_no VARCHAR(40) DEFAULT '', uid VARCHAR(40) DEFAULT '', role INT DEFAULT 0, is_deleted SMALLINT DEFAULT 0, status SMALLINT DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		"CREATE TABLE IF NOT EXISTS robot (id BIGINT AUTO_INCREMENT PRIMARY KEY, robot_id VARCHAR(40) NOT NULL DEFAULT '', token VARCHAR(200) DEFAULT '', status SMALLINT DEFAULT 1, creator_uid VARCHAR(40) DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_robot_id(robot_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		// user 表显式重建（DROP + CREATE），不用 CREATE TABLE IF NOT EXISTS。
+		// 原因：复用同一个 test 库时，旧版本可能已建过缺少 username/phone 的 user 表，
+		// IF NOT EXISTS 不会补列，随后成员搜索 SQL 会因 Unknown column 失败。
+		// MySQL 8 无 ADD COLUMN IF NOT EXISTS（MariaDB 语法），故直接重建保证结构最新。
+		// 数据由各测试 setup 的 CleanAllTables 清理，重建只影响结构。
+		// username/phone 对齐生产 user 表（modules/user/sql/20191106000003），管理端成员搜索按这两列做 LIKE 匹配。
+		// phone_last4 对齐 modules/user/sql/20260810000001（手机号加密第一阶的低敏检索列）：
+		// 空间侧成员搜索的后 4 位匹配已改为 COALESCE(NULLIF(u.phone_last4,''), RIGHT(u.phone,4))，
+		// 缺这一列会让搜索 SQL 报 Unknown column。本包不 import modules/user，拿不到它的迁移，
+		// 所以这张 fixture 必须手工跟随被查询到的列。
+		"DROP TABLE IF EXISTS `user`",
+		"CREATE TABLE `user` (id BIGINT AUTO_INCREMENT PRIMARY KEY, uid VARCHAR(40) NOT NULL DEFAULT '', name VARCHAR(100) DEFAULT '', username VARCHAR(40) DEFAULT '', email VARCHAR(200) DEFAULT '', phone VARCHAR(20) DEFAULT '', phone_last4 VARCHAR(4) NOT NULL DEFAULT '', avatar VARCHAR(200) DEFAULT '', robot SMALLINT DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, UNIQUE KEY idx_uid(uid)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+		// user_verification 是 queryMembers 的 name 兜底来源（issue #344）：
+		// u.name 为空时回退 real_name。列对齐 modules/user/sql/20260505000003_user_legacy01.sql。
+		"CREATE TABLE IF NOT EXISTS user_verification (user_id VARCHAR(40) NOT NULL, real_name VARCHAR(128) NOT NULL DEFAULT '', source VARCHAR(32) NOT NULL DEFAULT '', source_sub VARCHAR(128) NOT NULL DEFAULT '', emp_id VARCHAR(64) DEFAULT NULL, dept VARCHAR(255) DEFAULT NULL, email VARCHAR(255) DEFAULT NULL, mobile VARCHAR(32) DEFAULT NULL, verified_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (user_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+	}
+	for _, ddl := range depDDLs {
+		if _, err := db.Exec(ddl); err != nil {
+			panic("创建依赖表失败: " + err.Error())
+		}
+	}
+	db.Close()
+
+	// 创建共享测试服务器（只初始化一次，避免路由重复注册）
+	s, ctx := newRenderedTestServer()
+	testSrv = s
+	testCtx = ctx
+	testSpaceDB = NewDB(ctx)
+
+	os.Exit(m.Run())
+}
+
+func strPtr(s string) *string { return &s }
+
+// newRenderedTestServer wraps testutil.NewTestServer and injects the i18n
+// ErrorRenderer (mirrors main.go at boot) so the migrated handlers respond via
+// the dual envelope with a populated error.code. Without it the route falls back
+// to the legacy {msg,status} carrying the English DefaultMessage.
+// testutil.NewTestServer (octo-lib) is intentionally not touched.
+func newRenderedTestServer() (*server.Server, *config.Context) {
+	srv, ctx := testutil.NewTestServer()
+	srv.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+	// POST /v1/space/join 现在挂了 SharedUIDRateLimiter，桶不随 CleanAllTables 清理。
+	// 这里没有 *testing.T 可用（TestMain 也调用本函数），Redis 不可用时整个包都跑不了，
+	// 因此与 TestMain 处理依赖表失败的方式一致，直接 panic 而不是静默跳过。
+	if err := clearUIDRateLimitBuckets(ctx); err != nil {
+		panic("重置 UID 限流桶失败: " + err.Error())
+	}
+	return srv, ctx
+}
+
+// setup 返回共享的测试服务器和 Space 实例，并清理表数据。
+//
+// 同时重置 UID 限流桶：POST /v1/space/join 现在挂了 SharedUIDRateLimiter，而该桶
+// 存活在 Redis 里，CleanAllTables 不会清理它，跨用例累积会让后续用例收到 429。
+func setup(t *testing.T) (*server.Server, *Space, error) {
+	t.Helper()
+	err := testutil.CleanAllTables(testCtx)
+	assert.NoError(t, err)
+	resetSpaceUIDRateLimit(t, testCtx)
+	return testSrv, New(testCtx), err
+}
+
+func TestGetInvitePreview(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space
+	spaceId := "test-space-001"
+	inviteCode := "abc12345"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:     spaceId,
+		Name:        "测试空间",
+		Description: "这是一个测试空间描述",
+		Logo:        "https://example.com/logo.png",
+		Creator:     testutil.UID,
+		Status:      1,
+	})
+	assert.NoError(t, err)
+
+	// 添加空间成员
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     testutil.UID,
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    testutil.UID,
+		MaxUses:    10,
+		UsedCount:  2,
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 测试获取邀请预览（公开接口，无需 token）
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET", "/v1/space/invite/"+inviteCode+"/preview", nil)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"space_name":"测试空间"`)
+	assert.Contains(t, body, `"description":"这是一个测试空间描述"`)
+	assert.Contains(t, body, `"logo":"https://example.com/logo.png"`)
+	assert.Contains(t, body, `"bots":`)
+	assert.Contains(t, body, `"member_count":1`)
+}
+
+func TestGetInvitePreviewWithBots(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space
+	spaceId := "test-space-002"
+	inviteCode := "xyz98765"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:     spaceId,
+		Name:        "带 Bot 的空间",
+		Description: "测试 Bot 列表",
+		Logo:        "",
+		Creator:     testutil.UID,
+		Status:      1,
+	})
+	assert.NoError(t, err)
+
+	// 添加空间成员（人类用户）
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     testutil.UID,
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建一个 Bot 用户
+	botUID := "bot-001"
+	_, err = testCtx.DB().InsertInto("user").Columns("uid", "name", "avatar").
+		Values(botUID, "AI 助手", "https://example.com/bot.png").Exec()
+	assert.NoError(t, err)
+
+	// 在 robot 表中注册 Bot
+	_, err = testCtx.DB().InsertInto("robot").Columns("robot_id", "token", "status").
+		Values(botUID, "test-token", 1).Exec()
+	assert.NoError(t, err)
+
+	// 将 Bot 添加为空间成员
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     botUID,
+		Role:    0,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    testutil.UID,
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 测试获取邀请预览
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET", "/v1/space/invite/"+inviteCode+"/preview", nil)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"space_name":"带 Bot 的空间"`)
+	assert.Contains(t, body, `"robot_id":"bot-001"`)
+	assert.Contains(t, body, `"name":"AI 助手"`)
+	assert.Contains(t, body, `"member_count":2`)
+}
+
+func TestGetInvitePreviewInvalidCode(t *testing.T) {
+	s, _, err := setup(t)
+
+	// 测试无效邀请码
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("GET", "/v1/space/invite/invalid-code/preview", nil)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "邀请码无效")
+}
+
+func TestUpdateInvite(t *testing.T) {
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space
+	spaceId := "test-space-003"
+	inviteCode := "upd12345"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId,
+		Name:    "更新邀请码测试",
+		Creator: testutil.UID,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 添加空间成员（管理员）
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     testutil.UID,
+		Role:    1, // 管理员
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    testutil.UID,
+		MaxUses:    0,
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 测试更新邀请码设置
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("PUT", "/v1/space/"+spaceId+"/invite/"+inviteCode,
+		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"max_uses":   100,
+			"expires_at": "2026-12-31 23:59:59",
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 验证更新生效
+	invitation, err := f.db.queryInvitationByCode(inviteCode)
+	assert.NoError(t, err)
+	assert.NotNil(t, invitation)
+	assert.Equal(t, 100, invitation.MaxUses)
+	assert.NotNil(t, invitation.ExpiresAt)
+	expiresAt := time.Time(*invitation.ExpiresAt)
+	assert.Equal(t, 2026, expiresAt.Year())
+	assert.Equal(t, time.December, expiresAt.Month())
+	assert.Equal(t, 31, expiresAt.Day())
+}
+
+func TestUpdateInviteNoPermission(t *testing.T) {
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space
+	spaceId := "test-space-004"
+	inviteCode := "nop12345"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId,
+		Name:    "权限测试",
+		Creator: "other-user",
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 添加空间成员（普通成员，Role=0）
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     testutil.UID,
+		Role:    0,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    "other-user",
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 测试普通成员尝试更新邀请码（应该失败）
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("PUT", "/v1/space/"+spaceId+"/invite/"+inviteCode,
+		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"max_uses": 50,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.permission_denied")
+}
+
+func TestUpdateInviteInvalidCode(t *testing.T) {
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space
+	spaceId := "test-space-005"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId,
+		Name:    "无效邀请码测试",
+		Creator: testutil.UID,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 添加空间成员（管理员）
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     testutil.UID,
+		Role:    1,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 测试更新不存在的邀请码
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("PUT", "/v1/space/"+spaceId+"/invite/invalid-code",
+		bytes.NewReader([]byte(util.ToJson(map[string]interface{}{
+			"max_uses": 50,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.invite_code_not_found")
+}
+
+func TestJoinSpaceFullReturnsSpaceFullError(t *testing.T) {
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space（max_users=1，只允许1人）
+	spaceId := "test-space-full"
+	inviteCode := "fullinvite"
+	ownerUID := "owner-uid"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:  spaceId,
+		Name:     "满员空间",
+		Creator:  ownerUID,
+		MaxUsers: 1,
+		Status:   1,
+	})
+	assert.NoError(t, err)
+
+	// 添加空间拥有者（占用唯一名额）
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     ownerUID,
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    ownerUID,
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 新用户尝试加入（应返回 SPACE_FULL）
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{
+			"invite_code": inviteCode,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.full")
+}
+
+func TestJoinSpaceSuccessWithCapacity(t *testing.T) {
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space（max_users=2，允许2人）
+	spaceId := "test-space-cap"
+	inviteCode := "capinvite"
+	ownerUID := "owner-uid-2"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:  spaceId,
+		Name:     "有空位的空间",
+		Creator:  ownerUID,
+		MaxUsers: 2,
+		Status:   1,
+	})
+	assert.NoError(t, err)
+
+	// 添加空间拥有者（占用1个名额）
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     ownerUID,
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    ownerUID,
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 新用户加入（应成功）
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{
+			"invite_code": inviteCode,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"space_id":"test-space-cap"`)
+
+	// 验证成员数
+	count, err := f.db.countActiveMembers(spaceId)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, count)
+}
+
+func TestJoinSpaceUnlimitedCapacity(t *testing.T) {
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space（max_users=0，不限制）
+	spaceId := "test-space-unlimited"
+	inviteCode := "unlimitedinvite"
+	ownerUID := "owner-uid-3"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:  spaceId,
+		Name:     "不限人数空间",
+		Creator:  ownerUID,
+		MaxUsers: 0, // 不限制
+		Status:   1,
+	})
+	assert.NoError(t, err)
+
+	// 添加空间拥有者
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     ownerUID,
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    ownerUID,
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 新用户加入（应成功，不受限制）
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{
+			"invite_code": inviteCode,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"space_id":"test-space-unlimited"`)
+}
+
+// === Preset Group Tests (PR #529) ===
+
+func TestJoinSpaceWithPresetGroup(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试群组
+	groupNo := "test-group-001"
+	_, err = testCtx.DB().InsertInto("group").Columns("group_no", "name", "creator", "status").
+		Values(groupNo, "测试预置群", "admin", 1).Exec()
+	assert.NoError(t, err)
+
+	// 创建测试 Space（带预置群）
+	spaceId := "test-space-preset"
+	inviteCode := "preset123"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:        spaceId,
+		Name:           "带预置群的空间",
+		PresetGroupIds: strPtr(`["` + groupNo + `"]`),
+		Creator:        "admin",
+		Status:         1,
+	})
+	assert.NoError(t, err)
+
+	// 添加管理员成员
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     "admin",
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    "admin",
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 新用户加入 Space
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{
+			"invite_code": inviteCode,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), spaceId)
+
+	// 验证用户已加入预置群（使用 Eventually 等待异步操作完成）
+	assert.Eventually(t, func() bool {
+		var count int
+		_, err := testCtx.DB().SelectBySql("SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0", groupNo, testutil.UID).Load(&count)
+		return err == nil && count == 1
+	}, time.Second, 10*time.Millisecond, "用户应该已自动加入预置群")
+}
+
+func TestJoinSpaceWithNoPresetGroup(t *testing.T) {
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试 Space（不带预置群）
+	spaceId := "test-space-no-preset"
+	inviteCode := "nopreset1"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:        spaceId,
+		Name:           "无预置群的空间",
+		PresetGroupIds: strPtr(""), // 没有预置群
+		Creator:        "admin",
+		Status:         1,
+	})
+	assert.NoError(t, err)
+
+	// 添加管理员成员
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     "admin",
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    "admin",
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 新用户加入 Space
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{
+			"invite_code": inviteCode,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), spaceId)
+
+	// 验证用户已加入 Space
+	member, err := f.db.queryMember(spaceId, testutil.UID)
+	assert.NoError(t, err)
+	assert.NotNil(t, member)
+}
+
+func TestJoinSpacePresetGroupIdempotent(t *testing.T) {
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建测试群组
+	groupNo := "test-group-idem"
+	_, err = testCtx.DB().InsertInto("group").Columns("group_no", "name", "creator", "status").
+		Values(groupNo, "幂等测试群", "admin", 1).Exec()
+	assert.NoError(t, err)
+
+	// 用户已在群中
+	_, err = testCtx.DB().InsertInto("group_member").
+		Columns("group_no", "uid", "role", "is_deleted", "status").
+		Values(groupNo, testutil.UID, 0, 0, 1).Exec()
+	assert.NoError(t, err)
+
+	// 创建测试 Space（带预置群）
+	spaceId := "test-space-idem"
+	inviteCode := "idem1234"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:        spaceId,
+		Name:           "幂等测试空间",
+		PresetGroupIds: strPtr(`["` + groupNo + `"]`),
+		Creator:        "admin",
+		Status:         1,
+	})
+	assert.NoError(t, err)
+
+	// 添加管理员成员
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     "admin",
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    "admin",
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 用户加入 Space（已在群中）
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{
+			"invite_code": inviteCode,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	// 加入 Space 应该成功（不应因为已在群中而失败）
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 验证群成员记录仍然只有一条（使用 Eventually 等待异步操作完成）
+	assert.Eventually(t, func() bool {
+		var count int
+		_, err := testCtx.DB().SelectBySql("SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=?", groupNo, testutil.UID).Load(&count)
+		return err == nil && count == 1
+	}, time.Second, 10*time.Millisecond, "群成员记录应该只有一条（幂等）")
+}
+
+func TestJoinSpacePresetGroupDisbanded(t *testing.T) {
+	s, ctx := newRenderedTestServer()
+	f := New(ctx)
+
+	// 清空旧数据
+	err := testutil.CleanAllTables(ctx)
+	assert.NoError(t, err)
+
+	// 创建已解散的群组（status=2 表示解散）
+	groupNo := "test-group-disbanded"
+	_, err = testCtx.DB().InsertInto("group").Columns("group_no", "name", "creator", "status").
+		Values(groupNo, "已解散的群", "admin", 2).Exec()
+	assert.NoError(t, err)
+
+	// 创建测试 Space（带已解散的预置群）
+	spaceId := "test-space-disbanded"
+	inviteCode := "disband1"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:        spaceId,
+		Name:           "预置群已解散的空间",
+		PresetGroupIds: strPtr(`["` + groupNo + `"]`),
+		Creator:        "admin",
+		Status:         1,
+	})
+	assert.NoError(t, err)
+
+	// 添加管理员成员
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId,
+		UID:     "admin",
+		Role:    2,
+		Status:  1,
+	})
+	assert.NoError(t, err)
+
+	// 创建邀请码
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId:    spaceId,
+		InviteCode: inviteCode,
+		Creator:    "admin",
+		Status:     1,
+	})
+	assert.NoError(t, err)
+
+	// 用户加入 Space
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{
+			"invite_code": inviteCode,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	assert.NoError(t, err)
+	s.GetRoute().ServeHTTP(w, req)
+
+	// 加入 Space 应该成功（预置群解散不影响主流程）
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 验证用户没有加入已解散的群（使用 Eventually 确保异步操作已完成）
+	// 注意：这里验证的是 count == 0，需要等待足够时间确保如果会加入，已经加入了
+	time.Sleep(50 * time.Millisecond) // 给异步操作一点时间
+	var count int
+	_, err = testCtx.DB().SelectBySql("SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=?", groupNo, testutil.UID).Load(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, count, "用户不应该加入已解散的群")
+
+	// 验证用户已加入 Space
+	member, err := f.db.queryMember(spaceId, testutil.UID)
+	assert.NoError(t, err)
+	assert.NotNil(t, member)
+}
+
+// === Join Apply (Approval Flow) Tests ===
+
+func TestJoinSpaceApprovalMode_CreatesPendingApply(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-approve"
+	inviteCode := "appr1234"
+	ownerUID := "owner-approve"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId:  spaceId,
+		Name:     "需审批空间",
+		Creator:  ownerUID,
+		JoinMode: 1,
+		Status:   1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: ownerUID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: inviteCode, Creator: ownerUID, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{
+			"invite_code": inviteCode,
+		}))))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"status":"NEED_APPROVAL"`)
+	assert.Contains(t, body, spaceId)
+
+	// 验证用户没有成为成员
+	mbr, err := f.db.queryMember(spaceId, testutil.UID)
+	assert.NoError(t, err)
+	assert.Nil(t, mbr, "用户不应该直接成为成员")
+
+	// 验证申请记录已创建
+	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, testutil.UID)
+	assert.NoError(t, err)
+	assert.NotNil(t, apply)
+	assert.Equal(t, 0, apply.Status)
+	assert.Equal(t, inviteCode, apply.InviteCode)
+
+	// 验证邀请码使用次数没有增加
+	invitation, err := f.db.queryInvitationByCode(inviteCode)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, invitation.UsedCount, "审批模式不应消耗邀请码次数")
+}
+
+func TestJoinSpaceApprovalMode_DuplicateApply(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-dup-apply"
+	inviteCode := "dup12345"
+	ownerUID := "owner-dup"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "重复申请测试", Creator: ownerUID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: ownerUID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: inviteCode, Creator: ownerUID, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{"invite_code": inviteCode}))))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"status":"NEED_APPROVAL"`)
+
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{"invite_code": inviteCode}))))
+	req2.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w2, req2)
+	assert.Equal(t, http.StatusOK, w2.Code)
+	assert.Contains(t, w2.Body.String(), `"status":"PENDING"`)
+}
+
+func TestJoinSpaceApprovalMode_AlreadyMember(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-already"
+	inviteCode := "alrd1234"
+	ownerUID := "owner-already"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "已是成员测试", Creator: ownerUID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: ownerUID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 0, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: inviteCode, Creator: ownerUID, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{"invite_code": inviteCode}))))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "已经是该空间成员")
+}
+
+func TestJoinApplies_ListPending(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-list-apply"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "申请列表测试", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	_, err = f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: "applicant-1", InviteCode: "inv1", Status: 0,
+	})
+	assert.NoError(t, err)
+	_, err = f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: "applicant-2", InviteCode: "inv2", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/space/"+spaceId+"/join-applies", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"count":2`)
+	assert.Contains(t, body, `"applicant-1"`)
+	assert.Contains(t, body, `"applicant-2"`)
+}
+
+func TestJoinApplies_NoPermission(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-noperm"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "无权限测试", Creator: "other", JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 0, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/space/"+spaceId+"/join-applies", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.permission_denied")
+}
+
+func TestApproveJoinApply_Success(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-approve-ok"
+	applicantUID := "applicant-approve"
+
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "审批通过测试", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "apprinv1", Creator: testutil.UID, Status: 1,
+	}))
+
+	_, err = f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "apprinv1", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, apply)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, apply.Id), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, mbr, "审批通过后用户应成为成员")
+	assert.Equal(t, 0, mbr.Role)
+
+	updatedApply, err := f.db.queryJoinApplyByID(apply.Id)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, updatedApply.Status)
+	assert.Equal(t, testutil.UID, updatedApply.ReviewerUID)
+}
+
+func TestRejectJoinApply_Success(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-reject"
+	applicantUID := "applicant-reject"
+
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "拒绝测试", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	_, err = f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "rejinv1", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/reject", spaceId, apply.Id), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.Nil(t, mbr, "被拒绝的用户不应成为成员")
+
+	updatedApply, err := f.db.queryJoinApplyByID(apply.Id)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, updatedApply.Status)
+}
+
+func TestApproveJoinApply_SpaceFull(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-approve-full"
+	applicantUID := "applicant-full"
+
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "满员审批测试", Creator: testutil.UID,
+		JoinMode: 1, MaxUsers: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "fullinv1", Creator: testutil.UID, Status: 1,
+	}))
+
+	_, err = f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "fullinv1", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, apply.Id), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "空间已满")
+}
+
+func TestJoinSpaceDirectMode_StillWorks(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-direct"
+	inviteCode := "direct12"
+	ownerUID := "owner-direct"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "直接加入空间", Creator: ownerUID, JoinMode: 0, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: ownerUID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	err = f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: inviteCode, Creator: ownerUID, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{"invite_code": inviteCode}))))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"space_id"`)
+	assert.NotContains(t, body, `"pending"`)
+
+	mbr, err := f.db.queryMember(spaceId, testutil.UID)
+	assert.NoError(t, err)
+	assert.NotNil(t, mbr)
+}
+
+// === H5 Approve Flow Tests ===
+
+func TestJoinApproveDetail_ValidAuthCode(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-h5"
+	applicantUID := "applicant-h5"
+
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "H5审批测试", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	_, err = f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "h5inv1",
+	})
+	assert.NoError(t, err)
+
+	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+
+	// 写入 auth_code 到 Redis
+	authCode := "test-auth-code-1"
+	authData := util.ToJson(map[string]interface{}{
+		"apply_id": apply.Id,
+		"space_id": spaceId,
+		"type":     "spaceJoinApprove",
+	})
+	err = testCtx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode), authData, time.Minute*5)
+	assert.NoError(t, err)
+
+	// GET 审批详情
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/space/join-approve/detail?auth_code="+authCode, nil)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, applicantUID)
+	assert.Contains(t, body, spaceId)
+}
+
+func TestJoinApproveDetail_InvalidAuthCode(t *testing.T) {
+	s, _, _ := setup(t)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/space/join-approve/detail?auth_code=invalid-code", nil)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestJoinApproveSure_Approve(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-h5-approve"
+	applicantUID := "applicant-h5-approve"
+
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "H5审批通过", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "h5inv2", Creator: testutil.UID, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "h5inv2",
+	})
+	assert.NoError(t, err)
+
+	// 写入 auth_code
+	authCode := "test-auth-approve"
+	authData := util.ToJson(map[string]interface{}{
+		"apply_id":     applyID,
+		"space_id":     spaceId,
+		"reviewer_uid": testutil.UID,
+		"type":         "spaceJoinApprove",
+	})
+	err = testCtx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode), authData, time.Minute*5)
+	assert.NoError(t, err)
+
+	// POST 审批通过
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/join-approve/sure?auth_code="+authCode+"&action=approve", nil)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 验证用户已成为成员
+	member, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, member)
+
+	// auth_code 保留不删除，审批后仍可查看详情
+	val, _ := testCtx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode))
+	assert.NotEmpty(t, val, "auth_code 应保留到自然过期")
+}
+
+func TestJoinApproveSure_Reject(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-h5-reject"
+	applicantUID := "applicant-h5-reject"
+
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "H5审批拒绝", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "h5inv3",
+	})
+	assert.NoError(t, err)
+
+	authCode := "test-auth-reject"
+	authData := util.ToJson(map[string]interface{}{
+		"apply_id":     applyID,
+		"space_id":     spaceId,
+		"reviewer_uid": testutil.UID,
+		"type":         "spaceJoinApprove",
+	})
+	err = testCtx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode), authData, time.Minute*5)
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/join-approve/sure?auth_code="+authCode+"&action=reject", nil)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 验证用户没有成为成员
+	member, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.Nil(t, member)
+
+	// 验证申请状态为拒绝
+	apply, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, apply.Status)
+}
+
+// Bug: rejectJoinApply 缺少 spaceId 校验，可跨空间拒绝
+func TestRejectJoinApply_CrossSpaceBlocked(t *testing.T) {
+	s, f, err := setup(t)
+
+	// Space A: 有申请记录
+	spaceA := "test-space-a"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceA, Name: "Space A", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceA, UID: "victim-uid", InviteCode: "inv-a",
+	})
+	assert.NoError(t, err)
+
+	// Space B: testutil.UID 是管理员
+	spaceB := "test-space-b"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceB, Name: "Space B", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceB, UID: testutil.UID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	// Space B 的管理员尝试拒绝 Space A 的申请 → 应被拒绝
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/reject", spaceB, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, "跨空间拒绝应被阻止")
+	assertSpaceErrorCode(t, w, "err.server.space.apply_not_found")
+
+	// 验证申请状态未被修改
+	apply, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, apply.Status, "申请状态不应被修改")
+}
+
+// auth_code 不再删除，依靠 DB status 防止重放
+func TestJoinApproveSure_ReplayBlockedByDBStatus(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-authcode-order"
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "AuthCode顺序", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "inv-ac", Creator: testutil.UID, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: "applicant-authcode", InviteCode: "inv-ac",
+	})
+	assert.NoError(t, err)
+
+	authCode := "test-auth-consume"
+	authData := util.ToJson(map[string]interface{}{
+		"apply_id":     applyID,
+		"space_id":     spaceId,
+		"reviewer_uid": testutil.UID,
+		"type":         "spaceJoinApprove",
+	})
+	err = testCtx.GetRedisConn().SetAndExpire(
+		fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode), authData, time.Minute*5)
+	assert.NoError(t, err)
+
+	// 审批通过
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		"/v1/space/join-approve/sure?auth_code="+authCode+"&action=approve", nil)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// auth_code 应保留（不再删除）
+	val, _ := testCtx.GetRedisConn().GetString(
+		fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode))
+	assert.NotEmpty(t, val, "auth_code 应保留到自然过期")
+
+	// 用同一个 auth_code 再次请求应被 DB status 拦截
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("POST",
+		"/v1/space/join-approve/sure?auth_code="+authCode+"&action=approve", nil)
+	s.GetRoute().ServeHTTP(w2, req2)
+	assert.Equal(t, http.StatusBadRequest, w2.Code, "重放应被 DB status 拒绝")
+	assert.Contains(t, w2.Body.String(), "已被处理")
+}
+
+// Fix: 审批后 detail 仍可查看，返回 reviewer 信息
+func TestJoinApproveDetail_AfterApproval_ShowsReviewer(t *testing.T) {
+	s, f, err := setup(t)
+
+	spaceId := "test-space-detail-after"
+	applicantUID := "applicant-detail-after"
+	reviewerUID := testutil.UID
+	reviewerName := "审批管理员"
+
+	err = f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "详情回看", Creator: reviewerUID, JoinMode: 1, Status: 1,
+	})
+	assert.NoError(t, err)
+	err = f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: reviewerUID, Role: 2, Status: 1,
+	})
+	assert.NoError(t, err)
+
+	// 插入 reviewer 用户记录
+	_, err = testCtx.DB().InsertBySql(
+		"INSERT IGNORE INTO `user` (uid, name) VALUES (?, ?)", reviewerUID, reviewerName,
+	).Exec()
+	assert.NoError(t, err)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "inv-detail", Creator: reviewerUID, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "inv-detail",
+	})
+	assert.NoError(t, err)
+
+	authCode := "test-auth-detail-after"
+	authData := util.ToJson(map[string]interface{}{
+		"apply_id":     applyID,
+		"space_id":     spaceId,
+		"reviewer_uid": reviewerUID,
+		"type":         "spaceJoinApprove",
+	})
+	err = testCtx.GetRedisConn().SetAndExpire(
+		fmt.Sprintf("%s%s", common.AuthCodeCachePrefix, authCode), authData, time.Minute*5)
+	assert.NoError(t, err)
+
+	// 先审批通过
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		"/v1/space/join-approve/sure?auth_code="+authCode+"&action=approve", nil)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 用同一个 auth_code 查看详情 — 应返回已通过状态和审批人
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("GET",
+		"/v1/space/join-approve/detail?auth_code="+authCode, nil)
+	s.GetRoute().ServeHTTP(w2, req2)
+	assert.Equal(t, http.StatusOK, w2.Code)
+
+	var resp map[string]interface{}
+	err = json.Unmarshal(w2.Body.Bytes(), &resp)
+	assert.NoError(t, err)
+
+	statusVal, _ := resp["status"].(float64)
+	assert.Equal(t, float64(1), statusVal, "状态应为已通过")
+	assert.Equal(t, reviewerUID, resp["reviewer_uid"], "应返回审批人UID")
+	assert.Equal(t, reviewerName, resp["reviewer_name"], "应返回审批人名称")
+}
+
+// ==================== P2: 全局开关测试 ====================
+
+// TestIsUserCreateDisabled_Parsing 覆盖 env 解析分支
+func TestIsUserCreateDisabled_Parsing(t *testing.T) {
+	cases := []struct {
+		val  string
+		want bool
+	}{
+		{"", false},
+		{"0", false},
+		{"false", false},
+		{"FALSE", false},
+		{"no", false},
+		{"random", false},
+		{"1", true},
+		{"true", true},
+		{"TRUE", true},
+		{"yes", true},
+		{"ON", true},
+		{" true ", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.val, func(t *testing.T) {
+			t.Setenv(envDisableUserCreateSpace, tc.val)
+			assert.Equal(t, tc.want, IsUserCreateDisabled())
+		})
+	}
+}
+
+func TestCreateSpace_AllowedByDefault(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+
+	// 确保开关关闭（默认）
+	t.Setenv(envDisableUserCreateSpace, "")
+
+	body := util.ToJson(map[string]interface{}{
+		"name":      "p2-normal",
+		"join_mode": 0,
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/create", bytes.NewReader([]byte(body)))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), `"name":"p2-normal"`)
+
+	var resp map[string]interface{}
+	err = json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.NoError(t, err)
+	spaceID, _ := resp["space_id"].(string)
+	assert.NotEmpty(t, spaceID, "space_id 应返回")
+
+	// owner 成员已写入
+	mem, err := testSpaceDB.queryMember(spaceID, testutil.UID)
+	assert.NoError(t, err)
+	assert.NotNil(t, mem)
+	assert.Equal(t, 2, mem.Role)
+}
+
+// system_setting 写入 space.disable_user_create=1 后, createSpace 必须返回 403,
+// 不依赖任何环境变量。这是「admin 在管理台实时关闭用户侧创建」核心路径的
+// 守卫用例 —— 离开 env 之后,DB 行 + Reload 立刻让本实例生效,多实例由 60s
+// 自动 reload 收敛(参见 SystemSettings.StartAutoReload)。
+func TestCreateSpace_DisabledBySystemSetting(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+	// 显式清空 env, 证明开关纯由 DB 驱动
+	t.Setenv(envDisableUserCreateSpace, "")
+
+	// 直接 DB 写入 + Reload, 模拟 manager API 的写路径但避开 admin token 与
+	// 路由准备 — 这条用例的关注点是 "DB → SystemSettings → createSpace 拒绝"
+	// 这条链路, 不是 manager API 本身(后者在 common 包已有单测覆盖)。
+	_, err = testCtx.DB().InsertInto("system_setting").
+		Pair("category", "space").
+		Pair("key_name", "disable_user_create").
+		Pair("value", "1").
+		Pair("value_type", "bool").
+		Pair("description", "").
+		Exec()
+	assert.NoError(t, err)
+	settings := modulescommon.EnsureSystemSettings(testCtx)
+	assert.NoError(t, settings.Reload())
+	defer func() {
+		_, _ = testCtx.DB().DeleteFrom("system_setting").
+			Where("category=? AND key_name=?", "space", "disable_user_create").
+			Exec()
+		_ = settings.Reload()
+	}()
+
+	body := util.ToJson(map[string]interface{}{
+		"name":      "p2-blocked-by-db",
+		"join_mode": 0,
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/create", bytes.NewReader([]byte(body)))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code, "DB 开关 ON 时应返回 403, body=%s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "已关闭")
+
+	var count int
+	_, err = testCtx.DB().SelectBySql("SELECT COUNT(*) FROM space WHERE name=?", "p2-blocked-by-db").Load(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, count, "DB 开关 ON 时不应写入任何 space 记录")
+}
+
+func TestCreateSpace_DisabledByEnv(t *testing.T) {
+	s, _, err := setup(t)
+	assert.NoError(t, err)
+
+	t.Setenv(envDisableUserCreateSpace, "true")
+
+	body := util.ToJson(map[string]interface{}{
+		"name":      "p2-blocked",
+		"join_mode": 0,
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/create", bytes.NewReader([]byte(body)))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusForbidden, w.Code, "应返回 403")
+	assert.Contains(t, w.Body.String(), "已关闭")
+
+	// 不应有新空间入库：按 name 反查
+	var count int
+	_, err = testCtx.DB().SelectBySql("SELECT COUNT(*) FROM space WHERE name=?", "p2-blocked").Load(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, count, "开关开启时不应写入任何 space 记录")
+}
+
+// === Issue #1140 follow-up: ErrAlreadyMember 路径不应消耗邀请码名额 ===
+
+// TestJoinSpaceDirect_AlreadyMemberRefundsInvite 直接加入模式下，若用户已是成员，
+// 不应消耗邀请码名额（executeJoinSpace 返回 ErrAlreadyMember 时归还已 increment 的名额）。
+func TestJoinSpaceDirect_AlreadyMemberRefundsInvite(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-direct-already"
+	inviteCode := "direct-al-1"
+	ownerUID := "owner-direct-al"
+
+	assert.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "重复加入", Creator: ownerUID, JoinMode: 0, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: ownerUID, Role: 2, Status: 1,
+	}))
+	// testutil.UID 已经是成员
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 0, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: inviteCode, Creator: ownerUID,
+		MaxUses: 5, UsedCount: 0, Status: 1,
+	}))
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{"invite_code": inviteCode}))))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "你已经是该空间成员")
+
+	inv, err := f.db.queryInvitationByCode(inviteCode)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, inv.UsedCount, "重复加入失败不应消耗邀请码名额")
+}
+
+// === Issue #1140: approve 路径消耗邀请码名额 ===
+
+// TestApproveJoinApply_IncrementsInviteUsedCount 审批通过后 used_count 应递增。
+func TestApproveJoinApply_IncrementsInviteUsedCount(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-apprv-inc"
+	inviteCode := "apprv-inc-1"
+	applicantUID := "u-apprv-inc"
+
+	assert.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "消耗测试", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: inviteCode, Creator: testutil.UID,
+		MaxUses: 2, UsedCount: 0, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: inviteCode, Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	inv, err := f.db.queryInvitationByCode(inviteCode)
+	assert.NoError(t, err)
+	assert.NotNil(t, inv)
+	assert.Equal(t, 1, inv.UsedCount, "审批通过应递增 used_count")
+}
+
+// TestApproveJoinApply_InviteExhaustedBlocksApproval max_uses 用尽后再审批应被拒绝且 apply 回滚。
+func TestApproveJoinApply_InviteExhaustedBlocksApproval(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-apprv-exh"
+	inviteCode := "apprv-exh-1"
+
+	assert.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "用尽测试", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	}))
+	// max_uses=1 已用满
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: inviteCode, Creator: testutil.UID,
+		MaxUses: 1, UsedCount: 1, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: "u-apprv-exh", InviteCode: inviteCode, Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.invite_code_exhausted")
+
+	// 申请状态应回滚为 0，保留 owner 后续处理余地
+	updated, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, updated.Status, "审批失败应回滚申请状态")
+
+	// 用户未成为成员
+	mbr, err := f.db.queryMember(spaceId, "u-apprv-exh")
+	assert.NoError(t, err)
+	assert.Nil(t, mbr)
+}
+
+// TestApproveJoinApply_InviteDisabledBlocksApproval 邀请码被禁用后审批应被拒。
+func TestApproveJoinApply_InviteDisabledBlocksApproval(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-apprv-dis"
+	inviteCode := "apprv-dis-1"
+
+	assert.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "禁用测试", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: inviteCode, Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 0, // disabled
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: "u-apprv-dis", InviteCode: inviteCode, Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	// issue #683 R5：被禁用不再冒充"次数上限"。三种失效条件共用一条原子 WHERE，
+	// 消耗失败后按实际原因分流：用尽 → exhausted，禁用/过期/不存在 → invalid。
+	assertSpaceErrorCode(t, w, "err.server.space.invite_code_invalid")
+
+	updated, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, updated.Status)
+}
+
+// TestApproveJoinApply_SpaceFullRefundsInvite 空间满员导致加入失败时，已消耗的名额应回滚。
+func TestApproveJoinApply_SpaceFullRefundsInvite(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-apprv-full-refund"
+	inviteCode := "apprv-full-1"
+
+	assert.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "满员退款测试", Creator: testutil.UID,
+		JoinMode: 1, MaxUsers: 1, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: inviteCode, Creator: testutil.UID,
+		MaxUses: 5, UsedCount: 0, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: "u-apprv-full", InviteCode: inviteCode, Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "空间已满")
+
+	// 邀请码名额应被回滚
+	inv, err := f.db.queryInvitationByCode(inviteCode)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, inv.UsedCount, "加入失败时应回滚 used_count")
+}
+
+// TestRejectJoinApply_DoesNotConsumeInvite 拒绝不应消耗邀请码名额。
+func TestRejectJoinApply_DoesNotConsumeInvite(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-rej-noconsume"
+	inviteCode := "rej-noc-1"
+
+	assert.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "拒绝不消耗", Creator: testutil.UID, JoinMode: 1, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: inviteCode, Creator: testutil.UID,
+		MaxUses: 3, UsedCount: 0, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: "u-rej-noc", InviteCode: inviteCode, Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/reject", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	inv, err := f.db.queryInvitationByCode(inviteCode)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, inv.UsedCount, "拒绝不消耗名额")
+
+	// reviewer 已记录
+	updated, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, updated.Status)
+	assert.Equal(t, testutil.UID, updated.ReviewerUID)
+}
+
+// TestE2E_DisableUserCreateSpace_FullChain 串起完整的 admin 实时调控链路:
+//
+//	manager POST /v1/manager/common/system_setting  (写 disable_user_create=1)
+//	    → 客户端 GET /v1/common/appconfig            (看到 disable_user_create_space=1)
+//	    → 用户 POST /v1/space/create                 (403)
+//	    → manager POST 写回 0
+//	    → 用户 POST /v1/space/create                 (200)
+//
+// 这条 e2e 守住 "DB 单一真源 + Reload 即时生效 + 前后端用同一 getter" 的整条链路,
+// 任一节点漂移(写路径未触发 Reload、appconfig 漏字段、createSpace 走老 env-only
+// 路径)都会让本用例失败。
+func TestE2E_DisableUserCreateSpace_FullChain(t *testing.T) {
+	srv, _, err := setup(t)
+	assert.NoError(t, err)
+	t.Setenv(envDisableUserCreateSpace, "")
+	t.Setenv("OCTO_MASTER_KEY", "0123456789abcdef0123456789abcdef")
+
+	// CleanAllTables 清空了 app_config,/v1/common/appconfig 没拿到行会 400。
+	// 这里灌一行默认 app_config(其余 NOT NULL 列在 schema 里都有 DEFAULT),
+	// 让 appconfig handler 走到我们要验证的字段下发路径。
+	_, err = testCtx.DB().InsertInto("app_config").Pair("version", 1).Exec()
+	assert.NoError(t, err)
+
+	// 给 testutil.Token 升 super admin 角色,以便调用 manager 写接口。
+	// CleanAllTables 不会清缓存里的 token 行,但 setup 内已重置一次,这里覆盖
+	// 上层角色到 SuperAdmin。还原也走 cache.Set,无副作用。
+	cfg := testCtx.GetConfig()
+	tokenKey := cfg.Cache.TokenCachePrefix + testutil.Token
+	origTokenVal, _ := testCtx.Cache().Get(tokenKey)
+	assert.NoError(t, testCtx.Cache().Set(tokenKey,
+		testutil.UID+"@test@"+string(wkhttp.SuperAdmin)))
+	defer func() { _ = testCtx.Cache().Set(tokenKey, origTokenVal) }()
+
+	defer func() {
+		// 不论用例分支如何退出,把 system_setting 行清掉避免污染后续测试。
+		_, _ = testCtx.DB().DeleteFrom("system_setting").
+			Where("category=? AND key_name=?", "space", "disable_user_create").
+			Exec()
+		_ = modulescommon.EnsureSystemSettings(testCtx).Reload()
+	}()
+
+	writeSetting := func(value string) {
+		t.Helper()
+		body := util.ToJson(map[string]interface{}{
+			"items": []map[string]string{{
+				"category": "space",
+				"key":      "disable_user_create",
+				"value":    value,
+			}},
+		})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST",
+			"/v1/manager/common/system_setting",
+			bytes.NewReader([]byte(body)))
+		req.Header.Set("token", testutil.Token)
+		srv.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code,
+			"manager 写 disable_user_create=%s 应 200, body=%s", value, w.Body.String())
+	}
+
+	getAppconfig := func() string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+		srv.GetRoute().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code, "appconfig 应 200, body=%s", w.Body.String())
+		return w.Body.String()
+	}
+
+	createSpace := func(name string) int {
+		t.Helper()
+		body := util.ToJson(map[string]interface{}{
+			"name":      name,
+			"join_mode": 0,
+		})
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/v1/space/create",
+			bytes.NewReader([]byte(body)))
+		req.Header.Set("token", testutil.Token)
+		srv.GetRoute().ServeHTTP(w, req)
+		return w.Code
+	}
+
+	// --- Step 1: 关闭 ---
+	writeSetting("1")
+	assert.Contains(t, getAppconfig(), `"disable_user_create_space":1`,
+		"manager 写入后 appconfig 必须立刻下发 1")
+	assert.Equal(t, http.StatusForbidden, createSpace("e2e-off"),
+		"开关 ON 时 createSpace 必须 403")
+
+	// --- Step 2: 重新打开 ---
+	writeSetting("0")
+	assert.Contains(t, getAppconfig(), `"disable_user_create_space":0`,
+		"manager 写回 0 后 appconfig 必须立刻下发 0")
+	assert.Equal(t, http.StatusOK, createSpace("e2e-on"),
+		"开关 OFF 时 createSpace 必须 200")
+}
+
+// === Issue #683: pending 申请重申应改用新邀请码 ===
+//
+// 背景：joinSpace 此前在发现 status=0 记录时直接返回 PENDING，申请因此永远绑定
+// 首次提交的邀请码。旧码一旦用尽/被禁用/过期，审批必然失败并回滚为待审批，而
+// uk_space_uid (space_id, uid) 又使申请人无法另建记录，只能等管理员先拒绝。
+
+// joinApplicantToken 为任意 UID 注入一个普通用户 token，使"申请人"与"审批管理员"
+// 可以是两个不同的账号——A1/A2 需要申请人真的走一遍 HTTP 提交。
+func joinApplicantToken(t *testing.T, uid string) string {
+	t.Helper()
+	token := "space-join-applicant-" + uid
+	cfg := testCtx.GetConfig()
+	assert.NoError(t, testCtx.Cache().Set(cfg.Cache.TokenCachePrefix+token, uid+"@"+uid))
+	return token
+}
+
+// postJoinSpace 以指定 token 提交一次加入申请。
+func postJoinSpace(t *testing.T, s *server.Server, token, inviteCode string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/space/join",
+		bytes.NewReader([]byte(util.ToJson(map[string]string{"invite_code": inviteCode}))))
+	req.Header.Set("token", token)
+	s.GetRoute().ServeHTTP(w, req)
+	return w
+}
+
+// seedApprovalSpace 建一个需审批的 Space，testutil.UID 为 owner（审批方）。
+func seedApprovalSpace(t *testing.T, f *Space, spaceId string) {
+	t.Helper()
+	assert.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "重申测试", Creator: testutil.UID, JoinMode: JoinModeApproval, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	}))
+}
+
+// readApplyCreatedAt 直接读申请时间（epoch 秒），绕过业务过滤。
+//
+// 必须取 UNIX_TIMESTAMP 而不是把 created_at 直接 Load 进 time.Time：dbr 会把
+// time.Time 当结构体做列→字段映射，找不到匹配字段就返回 rows=1, err=nil 却留下
+// 零值——静默失败。零值之间的比较恒等，会让"时间没刷新"的断言假绿。
+// 用 epoch 同时绕开会话时区与 NOW() 写入列之间的偏移。
+func readApplyCreatedAt(t *testing.T, applyID int64) int64 {
+	t.Helper()
+	var epoch int64
+	_, err := testCtx.DB().SelectBySql(
+		"SELECT UNIX_TIMESTAMP(created_at) FROM space_join_apply WHERE id=?", applyID).Load(&epoch)
+	assert.NoError(t, err)
+	assert.NotZero(t, epoch, "读取申请时间失败：0 会让后续时间断言假绿")
+	return epoch
+}
+
+// A1 —— 待审批状态下改用新邀请码重申：记录应改用新码并刷新申请时间。
+// 对应 issue #683 复现步骤 6-7。
+func TestJoinSpace_ResubmitWithNewInviteUpdatesPendingApply(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-resubmit"
+	applicantUID := "u-683-resubmit"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+
+	// 码 A：提交时尚有名额（提交只做只读校验，不占名额）
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-a", Creator: testutil.UID,
+		MaxUses: 1, UsedCount: 0, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-b", Creator: testutil.UID,
+		MaxUses: 5, UsedCount: 0, Status: 1,
+	}))
+
+	w := postJoinSpace(t, s, token, "code-683-a")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "NEED_APPROVAL")
+
+	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, apply)
+	assert.Equal(t, "code-683-a", apply.InviteCode)
+	before := readApplyCreatedAt(t, apply.Id)
+
+	// created_at 精度为秒，等待一秒才能断言"确实前移"
+	time.Sleep(1100 * time.Millisecond)
+
+	// 旧码此时用尽（其他人用掉了名额），申请人改用仍然有效的码 B 重申
+	_, err = f.db.incrementInviteUsedCountAtomic("code-683-a")
+	assert.NoError(t, err)
+
+	w = postJoinSpace(t, s, token, "code-683-b")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "NEED_APPROVAL",
+		"重申成功应回到'申请已提交'语义，而不是被当成重复提交短路")
+
+	updated, err := f.db.queryJoinApplyByID(apply.Id)
+	assert.NoError(t, err)
+	assert.Equal(t, apply.Id, updated.Id, "uk_space_uid 决定仍是同一行")
+	assert.Equal(t, "code-683-b", updated.InviteCode, "待审批申请应改用本次提交的邀请码")
+	assert.Equal(t, 0, updated.Status, "重申不得自行授予成员资格，仍需审批")
+	assert.Greater(t, readApplyCreatedAt(t, apply.Id), before, "申请时间应刷新为最近一次提交")
+}
+
+// A2 —— 重申换码后审批应消耗新码的名额，而不是已失效的旧码。
+func TestApproveJoinApply_ConsumesResubmittedInvite(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-consume"
+	applicantUID := "u-683-consume"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-old", Creator: testutil.UID,
+		MaxUses: 1, UsedCount: 1, Status: 1, // 已用尽
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-new", Creator: testutil.UID,
+		MaxUses: 5, UsedCount: 0, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-old", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	// 申请人改用有效码重申
+	w := postJoinSpace(t, s, token, "code-683-new")
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 管理员审批
+	w = httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code, "换成有效邀请码后审批应当通过")
+
+	newInv, err := f.db.queryInvitationByCode("code-683-new")
+	assert.NoError(t, err)
+	assert.Equal(t, 1, newInv.UsedCount, "应消耗重申所用的新邀请码")
+
+	oldInv, err := f.db.queryInvitationByCodeUnfiltered("code-683-old")
+	assert.NoError(t, err)
+	assert.Equal(t, 1, oldInv.UsedCount, "不得再动已失效的旧邀请码")
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, mbr, "审批通过后申请人应成为成员")
+}
+
+// A3 —— 被拒后重新申请应刷新申请时间，并在列表里排到旧申请前面。
+// 对应 issue #683「后台仍显示 7 月 16 日首次申请时间」。
+func TestJoinApplyList_ReappliedApplySortsByLatestTime(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-sort"
+	applicantUID := "u-683-sort"
+	otherUID := "u-683-sort-other"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-sort", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+
+	// 申请人先申请后被拒
+	rejectedID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-sort", Status: 0,
+	})
+	assert.NoError(t, err)
+	firstApplyAt := readApplyCreatedAt(t, rejectedID)
+	_, err = f.db.updateJoinApplyStatus(rejectedID, 2, testutil.UID)
+	assert.NoError(t, err)
+
+	time.Sleep(1100 * time.Millisecond)
+
+	// 另一位用户在其后提交，成为"较早的待审批申请"
+	otherID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: otherUID, InviteCode: "code-683-sort", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	time.Sleep(1100 * time.Millisecond)
+
+	// 被拒的申请人重新提交
+	w := postJoinSpace(t, s, token, "code-683-sort")
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	assert.Greater(t, readApplyCreatedAt(t, rejectedID), firstApplyAt,
+		"重新申请应刷新申请时间，而不是保留首次申请日期")
+
+	list, err := f.db.queryPendingAppliesBySpace(spaceId, 10, 0)
+	assert.NoError(t, err)
+	assert.Len(t, list, 2)
+	assert.Equal(t, rejectedID, list[0].Id, "最新一次申请应排在最前")
+	assert.Equal(t, otherID, list[1].Id)
+
+	adminList, err := newManagerDB(testCtx.DB()).queryJoinAppliesAdmin(spaceId, 0, 10, 1)
+	assert.NoError(t, err)
+	assert.Len(t, adminList, 2)
+	assert.Equal(t, rejectedID, adminList[0].Id, "管理后台列表应同样按最新申请时间排序")
+}
+
+// A4a —— refreshPendingApplyInvite 的 status=0 守卫。
+//
+// 这是并发场景里唯一真正会被踩到的分支：管理员审批会先把状态改成 1 再消耗名额，
+// 若此刻申请人重申且更新无条件执行，就会把审批中/已通过的记录打回待审批，并让已
+// 消耗的名额与记录上的邀请码脱节。HTTP 层难以稳定构造这个时序窗口，所以直接在 DB
+// 层断言守卫本身。
+func TestRefreshPendingApplyInvite_OnlyTouchesPendingRows(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-guard"
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: "u-683-guard", InviteCode: "code-683-guard-a", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	// 待审批：允许换码
+	affected, err := f.db.refreshPendingApplyInvite(applyID, "code-683-guard-b")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, affected)
+
+	// 转为已通过后：更新必须落空
+	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
+	assert.NoError(t, err)
+
+	affected, err = f.db.refreshPendingApplyInvite(applyID, "code-683-guard-c")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 0, affected, "已通过的申请不得被重申覆盖")
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, after.Status)
+	assert.Equal(t, "code-683-guard-b", after.InviteCode, "邀请码应停留在审批时的取值")
+
+	// 已拒绝同样不接受原地改码——重新申请走 upsert 重置整行
+	_, err = testCtx.DB().Exec("UPDATE space_join_apply SET status=2 WHERE id=?", applyID)
+	assert.NoError(t, err)
+	affected, err = f.db.refreshPendingApplyInvite(applyID, "code-683-guard-d")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 0, affected, "已拒绝的申请不得被原地改码")
+}
+
+// A4b —— 已成为成员后再提交：申请不得被打回待审批，成员资格保持。
+// 注意此路径由 joinSpace 的成员校验短路（早于重申分支），A4a 才是守卫本身的用例。
+func TestJoinSpace_ResubmitDoesNotResetApprovedApply(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-race"
+	applicantUID := "u-683-race"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-race-a", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-race-b", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-race-a", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	// 管理员先审批通过（申请人因此已是成员）
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 申请人此时又用另一个码提交
+	w = postJoinSpace(t, s, token, "code-683-race-b")
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.already_member")
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, after.Status, "已通过的申请不得被重申打回待审批")
+	assert.Equal(t, "code-683-race-a", after.InviteCode, "已通过申请的邀请码不得被覆盖")
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, mbr, "成员资格应保持")
+}
+
+// A5 —— 过期邀请码在审批时应报"失效"，而不是"次数上限"。
+// （用尽 → exhausted 见 TestApproveJoinApply_InviteExhaustedBlocksApproval，
+//
+//	禁用 → invalid 见 TestApproveJoinApply_InviteDisabledBlocksApproval）
+func TestApproveJoinApply_ExpiredInviteReportsInvalid(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-expired"
+	applicantUID := "u-683-expired"
+	seedApprovalSpace(t, f, spaceId)
+
+	expired := db.Time(time.Now().Add(-time.Hour))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-expired", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1, ExpiresAt: &expired,
+	}))
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-expired", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.invite_code_invalid")
+
+	// A6 —— 审批失败后申请必须留在待审批，申请人才有机会换码自救。
+	updated, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, updated.Status, "审批失败应回滚为待审批")
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.Nil(t, mbr, "审批失败不得加入成员")
+}
+
+// A7 —— 重复提交同一个邀请码是无变化的：既不刷新申请时间，也不重新惊动管理员。
+// 这是通知扇出的第一道约束（第二道是路由上的 SharedUIDRateLimiter）。
+func TestJoinSpace_ResubmitSameInviteIsNoOp(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-noop"
+	applicantUID := "u-683-noop"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-noop", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+
+	w := postJoinSpace(t, s, token, "code-683-noop")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "NEED_APPROVAL")
+
+	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+	before := readApplyCreatedAt(t, apply.Id)
+
+	time.Sleep(1100 * time.Millisecond)
+
+	// 通知管理员会给每位管理员在 Redis 里种一个 auth_code（7 天 TTL），因此审批
+	// 授权码的数量就是"是否真的通知了管理员"的可观测代理，不需要在生产代码上开测试口子。
+	codesBefore := countAuthCodeKeys(t, testCtx)
+
+	w = postJoinSpace(t, s, token, "code-683-noop")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "PENDING",
+		"同码重复提交应保持'已提交，等待审批'")
+	assert.NotContains(t, w.Body.String(), "NEED_APPROVAL")
+
+	assert.Equal(t, before, readApplyCreatedAt(t, apply.Id),
+		"没有任何变化时不应刷新申请时间")
+
+	// 通知是异步 goroutine，留出落地时间再断言数量没变
+	time.Sleep(300 * time.Millisecond)
+	assert.Equal(t, codesBefore, countAuthCodeKeys(t, testCtx),
+		"同码重复提交不得重新通知管理员")
+}
+
+// countAuthCodeKeys 统计当前存在的审批授权码数量。notifyAdminsNewJoinApply 每通知
+// 一位管理员就写一个 common.AuthCodeCachePrefix 键，因此它是通知扇出的可观测计数。
+func countAuthCodeKeys(t *testing.T, ctx *config.Context) int {
+	t.Helper()
+	rdsClient := redis.NewClient(&redis.Options{
+		Addr:     ctx.GetConfig().DB.RedisAddr,
+		Password: ctx.GetConfig().DB.RedisPass,
+	})
+	defer rdsClient.Close()
+	keys, err := rdsClient.Keys(common.AuthCodeCachePrefix + "*").Result()
+	assert.NoError(t, err)
+	return len(keys)
+}
+
+// A4c —— upsertJoinApply 自身的守卫：已通过不动，已拒绝正常重置。
+func TestUpsertJoinApply_RefusesApprovedRow(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-upsert-guard"
+	uid := "u-683-upsert-guard"
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: uid, InviteCode: "code-guard-a", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	// 已通过：整行不动
+	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
+	assert.NoError(t, err)
+	sameID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: uid, InviteCode: "code-guard-b", Status: 0,
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, applyID, sameID, "仍应定位到同一行")
+
+	row, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, row.Status)
+	assert.Equal(t, testutil.UID, row.ReviewerUID)
+	assert.Equal(t, "code-guard-a", row.InviteCode)
+
+	// 已拒绝：允许重置为待审批并改用新码（被拒后重新申请的正常路径）
+	_, err = testCtx.DB().Exec("UPDATE space_join_apply SET status=2 WHERE id=?", applyID)
+	assert.NoError(t, err)
+	_, err = f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: uid, InviteCode: "code-guard-c", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	row, err = f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, row.Status, "被拒后重新申请应重置为待审批")
+	assert.Equal(t, "", row.ReviewerUID, "重置应清空审批人")
+	assert.Equal(t, "code-guard-c", row.InviteCode)
+}
+
+// A9 —— 三条审批入口的一致性守卫。
+//
+// 邀请码消耗失败的处理曾经在三处逐字节重复，本次合并到 runAtomicApproval。
+// 但"三处行为一致"此前只由代码审查保证：谁把其中一条重新内联回去，不会有任何测试报警
+// （PR #684 review）。这里对每条入口断言同一组不变量，让这个声明自己守住自己。
+func TestApproveJoinApply_AllEntryPointsClassifyInviteFailureAlike(t *testing.T) {
+	// 每条入口：申请绑定一个已被禁用的邀请码 → 同一个错误码、申请回滚待审批、不产生成员。
+	entryPoints := []struct {
+		name   string
+		suffix string
+		// approve 发起一次审批请求；applyID 为待审批申请，adminUID 为审批人。
+		approve func(t *testing.T, s *server.Server, spaceId string, applyID int64) *httptest.ResponseRecorder
+	}{
+		{
+			name:   "space-scoped",
+			suffix: "sp",
+			approve: func(t *testing.T, s *server.Server, spaceId string, applyID int64) *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				req, _ := http.NewRequest("POST",
+					fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+				req.Header.Set("token", testutil.Token)
+				s.GetRoute().ServeHTTP(w, req)
+				return w
+			},
+		},
+		{
+			name:   "manager-console",
+			suffix: "mg",
+			approve: func(t *testing.T, s *server.Server, spaceId string, applyID int64) *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				req, _ := http.NewRequest("POST",
+					fmt.Sprintf("/v1/manager/spaces/%s/join-applies/%d/approve", spaceId, applyID), nil)
+				req.Header.Set("token", adminToken(t))
+				s.GetRoute().ServeHTTP(w, req)
+				return w
+			},
+		},
+		{
+			name:   "h5-auth-code",
+			suffix: "h5",
+			approve: func(t *testing.T, s *server.Server, spaceId string, applyID int64) *httptest.ResponseRecorder {
+				authCode := "parity-authcode-" + spaceId
+				payload := util.ToJson(map[string]interface{}{
+					"apply_id":     applyID,
+					"space_id":     spaceId,
+					"reviewer_uid": testutil.UID,
+					"type":         "spaceJoinApprove",
+				})
+				assert.NoError(t, testCtx.GetRedisConn().SetAndExpire(
+					common.AuthCodeCachePrefix+authCode, payload, time.Hour))
+
+				w := httptest.NewRecorder()
+				req, _ := http.NewRequest("POST",
+					"/v1/space/join-approve/sure?auth_code="+authCode+"&action=approve", nil)
+				s.GetRoute().ServeHTTP(w, req)
+				return w
+			},
+		},
+	}
+
+	for _, ep := range entryPoints {
+		t.Run(ep.name, func(t *testing.T) {
+			s, f, err := setup(t)
+			assert.NoError(t, err)
+
+			spaceId := "sp-683-parity-" + ep.suffix
+			applicantUID := "u-683-parity-" + ep.suffix
+			inviteCode := "code-683-parity-" + ep.suffix
+
+			seedApprovalSpace(t, f, spaceId)
+			// 用尽的邀请码：审批时消耗必然失败，期望 invite_code_exhausted。
+			//
+			// 刻意不用"被禁用"，因为那期望 invite_code_invalid——而 H5 入口在
+			// auth_code 查不到时也返回同一个码，于是"根本没走到审批"和"走到了且分类
+			// 正确"无法区分：把 auth_code 查询打断，这个子用例照样绿（推送前审查已用
+			// 变异法证实）。exhausted 只可能由 classifyInviteConsumeFailure 产生，
+			// 未到达即为不同的码，子用例立刻变红。
+			assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+				SpaceId: spaceId, InviteCode: inviteCode, Creator: testutil.UID,
+				MaxUses: 1, UsedCount: 1, Status: 1,
+			}))
+
+			applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+				SpaceId: spaceId, UID: applicantUID, InviteCode: inviteCode, Status: 0,
+			})
+			assert.NoError(t, err)
+
+			w := ep.approve(t, s, spaceId, applyID)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code, "入口 %s 应拒绝审批", ep.name)
+			assertSpaceErrorCode(t, w, "err.server.space.invite_code_exhausted")
+
+			after, err := f.db.queryJoinApplyByID(applyID)
+			assert.NoError(t, err)
+			assert.Equal(t, 0, after.Status, "入口 %s：审批失败应回滚为待审批", ep.name)
+			assert.Equal(t, "", after.ReviewerUID, "入口 %s：回滚应清空审批人", ep.name)
+
+			mbr, err := f.db.queryMember(spaceId, applicantUID)
+			assert.NoError(t, err)
+			assert.Nil(t, mbr, "入口 %s：审批失败不得产生成员", ep.name)
+
+			inv, err := f.db.queryInvitationByCodeUnfiltered(inviteCode)
+			assert.NoError(t, err)
+			assert.Equal(t, 1, inv.UsedCount, "入口 %s：失败的审批不得再消耗名额", ep.name)
+		})
+	}
+}
+
+// A8 —— 审批是原子的：任何一步失败都整笔回滚，不留中间态。
+//
+// 取代了旧的 TestJoinSpace_ResubmitDuringApprovalWindow。那个用例构造
+// "status=1 且无成员行" 并断言重申应得到 already_member——对"审批进行中"是对的，
+// 但它与"审批中途夭折"逐字节相同，于是把永久锁死也一并断言成了正确行为
+// （PR #684 review round 3）。事务化之后该状态对外不可见，用例失去意义，
+// 改为直接断言原子性。
+func TestApproveJoinApply_IsAtomicOnInviteFailure(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-atomic-inv"
+	applicantUID := "u-683-atomic-inv"
+	seedApprovalSpace(t, f, spaceId)
+	// 被禁用的邀请码：消耗必然失败
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-atomic-inv", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 0,
+	}))
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-atomic-inv", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.invite_code_invalid")
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, after.Status, "失败的审批必须整笔回滚为待审批")
+	assert.Equal(t, "", after.ReviewerUID, "回滚后不得留下审批人")
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.Nil(t, mbr, "失败的审批不得产生成员")
+
+	inv, err := f.db.queryInvitationByCodeUnfiltered("code-atomic-inv")
+	assert.NoError(t, err)
+	assert.Equal(t, 0, inv.UsedCount, "失败的审批不得消耗名额")
+
+	// 关键：申请仍在待审批队列里，管理员和申请人都还有后路
+	list, err := f.db.queryPendingAppliesBySpace(spaceId, 10, 0)
+	assert.NoError(t, err)
+	assert.Len(t, list, 1, "失败的审批必须仍然可被看到和处理")
+}
+
+// A8b —— 空间已满导致的审批失败同样整笔回滚，名额不被消耗。
+func TestApproveJoinApply_IsAtomicOnSpaceFull(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-atomic-full"
+	applicantUID := "u-683-atomic-full"
+	// MaxUsers=1，owner 已占满
+	assert.NoError(t, f.db.insertSpaceNoTx(&SpaceModel{
+		SpaceId: spaceId, Name: "满员", Creator: testutil.UID,
+		JoinMode: JoinModeApproval, MaxUsers: 1, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: testutil.UID, Role: 2, Status: 1,
+	}))
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-atomic-full", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-atomic-full", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.full")
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, after.Status, "满员导致的失败必须整笔回滚")
+
+	inv, err := f.db.queryInvitationByCodeUnfiltered("code-atomic-full")
+	assert.NoError(t, err)
+	assert.Equal(t, 0, inv.UsedCount, "满员时不得消耗名额（旧实现靠事后退还）")
+}
+
+// A8c —— 成功审批后，申请与成员资格必须同时成立（不变量的正向断言）。
+func TestApproveJoinApply_InvariantHoldsAfterSuccess(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-inv-ok"
+	applicantUID := "u-683-inv-ok"
+	seedApprovalSpace(t, f, spaceId)
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-inv-ok", Creator: testutil.UID,
+		MaxUses: 10, UsedCount: 0, Status: 1,
+	}))
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-inv-ok", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, after.Status)
+
+	mbr, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, mbr, "status=1 必须与活跃成员行同时成立")
+
+	inv, err := f.db.queryInvitationByCode("code-inv-ok")
+	assert.NoError(t, err)
+	assert.Equal(t, 1, inv.UsedCount, "成功审批消耗一个名额")
+}
+
+// A10 —— 退出后必须能重新申请（round 2 的 P1）。
+//
+// 现在靠读回点的就地重置实现：status=1 且当前没有活跃成员，只可能是
+// "审批通过之后成员资格结束了"，因为事务保证 status=1 不会先于成员行可见。
+func TestJoinSpace_ExMemberCanReapplyAfterLeaving(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-rejoin"
+	applicantUID := "u-683-rejoin"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-rejoin", Creator: testutil.UID,
+		MaxUses: 100, UsedCount: 0, Status: 1,
+	}))
+
+	w := postJoinSpace(t, s, token, "code-683-rejoin")
+	assert.Equal(t, http.StatusOK, w.Code)
+	apply, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, apply)
+
+	w = httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, apply.Id), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	// 主动退出
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("POST", "/v1/space/"+spaceId+"/leave", nil)
+	req.Header.Set("token", token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	gone, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.Nil(t, gone)
+
+	// 重新申请
+	w = postJoinSpace(t, s, token, "code-683-rejoin")
+	assert.Equal(t, http.StatusOK, w.Code, "老成员必须能重新申请")
+	assert.Contains(t, w.Body.String(), "NEED_APPROVAL")
+
+	pending, err := f.db.queryPendingApplyBySpaceAndUID(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, pending, "重新申请应产生新的待审批记录")
+
+	// 并且能被再次审批通过
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, pending.Id), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code, "重新申请后应能正常审批通过")
+
+	rejoined, err := f.db.queryMember(spaceId, applicantUID)
+	assert.NoError(t, err)
+	assert.NotNil(t, rejoined, "应重新成为成员")
+}
+
+// A10b —— 活跃成员重申时被拒，且已通过的申请不被改动。
+//
+// 覆盖的是用户可见结果，**不是** api.go 读回点那个 active != nil 分支：joinSpace
+// 更早的成员校验会先短路返回，这个请求根本走不到读回点。删掉那个分支本用例照样通过。
+// 守卫本身由 TestResetApprovedApplyForRejoin_NoOpWhenMemberActive 在 DB 层直接覆盖
+// ——这正是本 PR 附带的 learning「测试必须真的走到它要守的分支」所要求的做法，
+// 而第一版又踩了同一个坑（PR #684 review round 4 P1-B）。
+func TestJoinSpace_ActiveMemberResubmitIsRejected(t *testing.T) {
+	s, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-active"
+	applicantUID := "u-683-active"
+	token := joinApplicantToken(t, applicantUID)
+	seedApprovalSpace(t, f, spaceId)
+	assert.NoError(t, f.db.insertInvitation(&InvitationModel{
+		SpaceId: spaceId, InviteCode: "code-683-active", Creator: testutil.UID,
+		MaxUses: 100, UsedCount: 0, Status: 1,
+	}))
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: applicantUID, InviteCode: "code-683-active", Status: 0,
+	})
+	assert.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/v1/space/%s/join-applies/%d/approve", spaceId, applyID), nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	w = postJoinSpace(t, s, token, "code-683-active")
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assertSpaceErrorCode(t, w, "err.server.space.already_member")
+
+	after, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, after.Status, "活跃成员的已通过申请不得被重置")
+	assert.Equal(t, testutil.UID, after.ReviewerUID)
+}
+
+// A10c —— 重置必须自带"当前不是活跃成员"这个条件，而不是依赖调用方先查一次。
+//
+// 调用方的判定与写入之间存在窗口：管理员在此刻把该用户重新拉回空间，若写入不带
+// 谓词，就会留下"人已在空间里、却凭空多出一条待审批申请"的矛盾状态
+// （PR #684 review round 3）。判定与写入分离正是本 PR 前几轮反复栽的同一类错误。
+func TestResetApprovedApplyForRejoin_NoOpWhenMemberActive(t *testing.T) {
+	_, f, err := setup(t)
+	assert.NoError(t, err)
+
+	spaceId := "sp-683-reset-guard"
+	uid := "u-683-reset-guard"
+
+	applyID, err := f.db.upsertJoinApply(&spaceJoinApplyModel{
+		SpaceId: spaceId, UID: uid, InviteCode: "code-reset-a", Status: 0,
+	})
+	assert.NoError(t, err)
+	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
+	assert.NoError(t, err)
+
+	// 成员已退出：陈旧记录应被重置
+	assert.NoError(t, f.db.insertMemberNoTx(&MemberModel{
+		SpaceId: spaceId, UID: uid, Role: 0, Status: 0,
+	}))
+	affected, err := f.db.resetApprovedApplyForRejoin(applyID, "code-reset-b")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, affected, "成员不活跃时应重置为待审批")
+
+	// 恢复已通过状态，并让成员重新活跃：此时重置必须落空
+	_, err = f.db.updateJoinApplyStatus(applyID, 1, testutil.UID)
+	assert.NoError(t, err)
+	assert.NoError(t, f.db.reactivateMember(spaceId, uid, 0))
+
+	affected, err = f.db.resetApprovedApplyForRejoin(applyID, "code-reset-c")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 0, affected, "已是活跃成员时不得重置")
+
+	row, err := f.db.queryJoinApplyByID(applyID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, row.Status, "已通过状态必须保留")
+	assert.Equal(t, testutil.UID, row.ReviewerUID, "审批人必须保留")
+	// 第一次重置（合法）已把码写成 code-reset-b；这里要断言的是第二次重置什么都没做，
+	// 即码没有被改成 code-reset-c。
+	assert.Equal(t, "code-reset-b", row.InviteCode, "落空的重置不得改写邀请码")
+
+	// 其余状态一律不受影响。成员必须先置回非活跃，否则 NOT EXISTS 子句单独就会让
+	// 每个 status 都返回 0 行，这个循环就变成了空转——删掉 SQL 里的 AND ja.status=1
+	// 它照样会绿（第一版正是如此，由推送前的对抗性审查发现）。
+	_, removeErr := f.db.removeMemberLocked(spaceId, uid, 99, testutil.UID, MemberRemoveReasonKicked)
+	assert.NoError(t, removeErr)
+	inactive, err := f.db.queryMember(spaceId, uid)
+	assert.NoError(t, err)
+	assert.Nil(t, inactive, "前提：成员此刻不活跃，status 谓词才是唯一变量")
+
+	for _, st := range []int{0, 2} {
+		_, err = testCtx.DB().Exec("UPDATE space_join_apply SET status=? WHERE id=?", st, applyID)
+		assert.NoError(t, err)
+		affected, err = f.db.resetApprovedApplyForRejoin(applyID, "code-reset-x")
+		assert.NoError(t, err)
+		assert.EqualValues(t, 0, affected, "status=%d 的申请不属于本函数的处理范围", st)
+	}
+
+	// 同样前提下 status=1 必须命中，证明上面的 0 行来自 status 谓词而不是别的原因
+	_, err = testCtx.DB().Exec("UPDATE space_join_apply SET status=1 WHERE id=?", applyID)
+	assert.NoError(t, err)
+	affected, err = f.db.resetApprovedApplyForRejoin(applyID, "code-reset-y")
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, affected, "同等条件下 status=1 必须命中，否则上面的断言不成立")
+}

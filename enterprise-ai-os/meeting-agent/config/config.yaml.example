@@ -1,0 +1,607 @@
+# =============================================================================
+# meeting-agent 配置模板
+#
+# 复制为 config/config.yaml 后按需修改。
+# 支持 ${VAR} 与 ${VAR:-default} 形式的环境变量展开。
+# 优先级：环境变量 > config.yaml
+# =============================================================================
+
+service:
+  name: meeting-agent
+  env: ${APP_ENV:-dev}
+  version: 0.1.0
+  host: 0.0.0.0
+  port: ${MEETING_PORT:-8500}
+  root_path: ""
+  workers: ${MEETING_WORKERS:-2}
+
+logging:
+  level: ${LOG_LEVEL:-info}
+  format: ${LOG_FORMAT:-json}
+  # 会议内容涉密程度往往很高（人事、财务、战略讨论）。
+  # 默认不打印转录与摘要内容，只打印 meeting_id 与阶段。
+  log_transcript_content: false
+
+# -----------------------------------------------------------------------------
+# 存储
+# -----------------------------------------------------------------------------
+storage:
+  postgres:
+    dsn: ${PG_DSN:-postgres://aios:aios@postgres:5432/aios}
+    schema: ${PG_SCHEMA_MEETING:-meeting}
+    pool_min_size: 2
+    pool_max_size: 16
+    statement_timeout: 30000     # ms，摘要归并的写入可能较慢
+    auto_migrate: true
+
+  redis:
+    url: ${REDIS_URL:-redis://redis:6379/4}
+    key_prefix: "meet:"
+    # 异步 job 状态的保留时长。
+    # 设 24h：客户端轮询 job 的窗口不会超过这个量级，
+    # 而永久保留会让 Redis 逐渐被历史 job 塞满。
+    job_ttl_seconds: 86400
+
+  # 音频与中间产物的对象存储
+  object_store:
+    endpoint: ${S3_ENDPOINT:-http://minio:9000}
+    access_key: ${S3_ACCESS_KEY:-minioadmin}
+    secret_key: ${S3_SECRET_KEY:-minioadmin}
+    bucket: ${S3_BUCKET_MEETING:-aios-meeting}
+    region: ${S3_REGION:-us-east-1}
+    # MinIO 必须 true；AWS S3 用 false
+    path_style: true
+
+    # 原始音频的保留期。
+    #
+    # 这是个合规问题不只是成本问题：录音是敏感个人信息，
+    # 无限期保留会显著扩大数据泄露的影响面。转录完成后原始音频的
+    # 唯一用途是"转录有误时回听核对"，90 天足够覆盖这个需求。
+    audio_retention_days: 90
+    # 转码中间文件的清理周期（小时）。这些是纯临时产物。
+    temp_retention_hours: 6
+
+  # 本地临时目录，用于 ffmpeg 转码
+  temp_dir: ${MEETING_TEMP_DIR:-/tmp/meeting-audio}
+  # 单文件大小上限（MB）。超过则拒绝上传。
+  # 4GB 约对应 8 小时会议，超出这个量级基本是误上传了视频原片。
+  max_upload_mb: 4096
+
+# -----------------------------------------------------------------------------
+# 转录
+# -----------------------------------------------------------------------------
+transcription:
+  # 引擎。生产走 octo-speech，本地开发用 mock。
+  #
+  # mock 直接读一份现成的转录 JSON，让摘要与抽取的调优不必真跑 ASR。
+  # 抽取 prompt 通常要改几十轮，每轮都等一遍转录是不可接受的。
+  engine: ${ASR_ENGINE:-octo-speech}    # octo-speech | mock
+
+  octo_speech:
+    base_url: ${OCTO_SPEECH_URL:-http://octo-speech:8600}
+    api_key: ${OCTO_SPEECH_API_KEY:-}
+    # 底层引擎偏好，由 octo-speech 决定是否采纳。
+    #
+    # 中文会议优先 SenseVoice：它的标点、数字规整、中英混说处理
+    # 明显好于 Whisper，而会议转录里"三点五个人日"这类表述极常见，
+    # 转成"3.5 个人日"还是"三点五个人日"直接影响后续抽取质量。
+    preferred_engine: ${ASR_PREFERRED:-sensevoice}
+    fallback_engine: whisper
+    # 单次请求超时。长音频走异步接口，这里只是提交超时。
+    timeout: 30
+    # 异步转写的轮询间隔与上限
+    poll_interval: 5
+    poll_timeout: 3600
+
+  mock:
+    # mock 引擎读取的转录文件路径
+    fixture_path: tests/fixtures/transcript_sample.json
+
+  # 音频预处理
+  preprocess:
+    # 统一转成 ASR 引擎最通用的格式。
+    # 16kHz 单声道 wav 是绝大多数 ASR 的原生输入格式，
+    # 让引擎自己转码会多一次解码开销，且各引擎的转码质量不一。
+    target_format: wav
+    target_sample_rate: 16000
+    target_channels: 1
+    # 是否做降噪。默认关闭——降噪会损失语音细节，
+    # 现代 ASR 模型对中等噪声的鲁棒性已经好过传统降噪算法。
+    # 只在确实有稳定背景噪声（空调、风扇）时开。
+    denoise: false
+
+  # 长音频分片。
+  #
+  # 分片边界必须落在静音处，不能按固定时长硬切——
+  # 从一个词的中间切开会让两个分片各产生一个错词，
+  # 而且拼接处的语义断裂会影响后续的说话人归属。
+  chunking:
+    enabled: true
+    max_chunk_seconds: 600
+    # 在目标边界附近这个范围内寻找静音点
+    silence_search_window_seconds: 30
+    min_silence_ms: 500
+    # 相邻分片重叠时长，用于拼接时对齐
+    overlap_seconds: 2
+
+  # 说话人分离
+  diarization:
+    enabled: true
+    # 预期说话人数。不确定时留空让引擎自动判断，
+    # 但已知参会人列表时**务必传入**：给定人数能显著提升分离准确率。
+    num_speakers: null
+    min_speakers: 2
+    max_speakers: 20
+
+    # 说话人到真实身份的映射策略。
+    #
+    # ASR 只能给出 SPEAKER_00/01/02，映射到真人需要额外信息：
+    #   1. 参会人列表 + 自我介绍语句（"我是张三"）
+    #   2. 声纹库（需要提前注册，隐私敏感，默认不启用）
+    #   3. 人工修正（/transcript/speakers 接口）
+    #
+    # 现实中前两条都不可靠，所以人工修正接口是必需的而非补充。
+    # 责任人认错的 Action Item 比没有 Action Item 更糟。
+    identity_mapping:
+      use_participant_list: true
+      use_self_introduction: true
+      use_voiceprint: false
+      # 自动映射的置信度阈值。低于此值保留 SPEAKER_XX 原样，
+      # 让人工确认。猜错身份不如不猜。
+      min_confidence: 0.8
+
+  # 术语纠错。
+  #
+  # 会议里的专有名词（产品名、代号、人名）是 ASR 的重灾区。
+  # 纠错词表能显著改善，且成本极低——纯字符串替换。
+  terminology:
+    enabled: true
+    # 从 rag-pipeline 拉取本租户的术语表；也支持在此静态配置
+    fetch_from_rag: true
+    static_terms:
+      # 形如 错误转写: 正确写法
+      # 例：{"章鱼系统": "OCTO"}
+      {}
+    # 模糊匹配阈值。太低会把正常词误改，
+    # 而误改的词无法从上下文察觉，比不改更危险。
+    fuzzy_threshold: 0.9
+
+# -----------------------------------------------------------------------------
+# 模型（一律经 model-gateway）
+# -----------------------------------------------------------------------------
+models:
+  gateway_url: ${MODEL_GATEWAY_URL:-http://model-gateway:8200/v1}
+  api_key: ${MODEL_GATEWAY_API_KEY:-}
+  timeout: 120                  # 摘要输入长，超时要给足
+  max_retries: 3
+
+  # 分段摘要用模型。可以用便宜的——单段输入量不大且任务简单。
+  chunk_summary:
+    model: ${MEETING_CHUNK_MODEL:-auto:summary}
+    temperature: 0.2
+    max_tokens: 1024
+
+  # 归并与整体摘要。用中等模型。
+  merge_summary:
+    model: ${MEETING_SUMMARY_MODEL:-auto:summary}
+    temperature: 0.3
+    max_tokens: 2048
+
+  # 抽取用模型。必须用强模型。
+  #
+  # 决策抽取的核心难点是区分"已定"与"只是讨论过"，
+  # 这是细粒度语义判断，廉价模型的误判率高得多。
+  # 而错误的决策记录会误导后续所有讨论——下次开会时
+  # 有人拿着错的"上次结论"当依据，争议只会更大。
+  extraction:
+    model: ${MEETING_EXTRACTION_MODEL:-auto:reasoning}
+    temperature: 0.0
+    max_tokens: 4096
+    json_mode: true
+
+# -----------------------------------------------------------------------------
+# 摘要
+# -----------------------------------------------------------------------------
+summarization:
+  # 分段摘要 + 归并，不做单次长上下文。
+  #
+  # 两小时会议约 3 万字。即使模型支持 128k 上下文，
+  # 单次塞进去也会让中段信息被严重稀释（"lost in the middle"），
+  # 表现为开头结尾抓得准、中间的议题被漏掉。
+  strategy: map_reduce           # map_reduce | single_pass
+
+  # 单段的 token 上限。按 token 而非字符切：
+  # 中英文的 token 密度差三倍，按字符切会让某些分段严重超长。
+  chunk_max_tokens: 6000
+  chunk_overlap_tokens: 300
+
+  # 归并的层数上限。段数很多时需要多轮归并（树形）。
+  # 设上限是防止极端长会导致无限归并。
+  max_merge_depth: 3
+
+  # 产出的结构
+  outputs:
+    overview: true               # 一段话概要
+    topics: true                 # 议题切分（每个议题的起止时间与要点）
+    disagreements: true          # 分歧点：讨论了但没达成一致的
+    next_steps: true             # 下一步（区别于 Action Item：没有明确责任人的）
+
+  # 为什么要单独抽"分歧点"：
+  #
+  # 只记录结论的纪要会掩盖真实状态。一个议题"没定"和"定了"
+  # 对后续工作的影响完全不同，而传统纪要往往把没定的部分省略掉，
+  # 导致所有人以为已经有结论。显式记录分歧是让纪要可信的关键。
+  disagreement:
+    min_confidence: 0.6
+
+  # 议题切分的最短时长。太碎的切分没有意义。
+  min_topic_seconds: 60
+
+# -----------------------------------------------------------------------------
+# 抽取
+# -----------------------------------------------------------------------------
+extraction:
+  # 决策抽取
+  decisions:
+    enabled: true
+
+    # 置信度阈值。**明显高于 actions 的阈值**，这是刻意的：
+    # 决策宁可少抽——错误的决策记录会误导后续所有讨论；
+    # 漏掉的决策通常在下次会议自然被重申。
+    min_confidence: 0.8
+
+    max_per_meeting: 20
+
+    # 必须抽出的字段。缺 decided_by 的"决策"往往其实只是讨论，
+    # 把它设为必需字段是一道有效的过滤——LLM 找不到决策人时
+    # 会倾向于降低置信度，正好达到我们想要的保守效果。
+    required_fields:
+      - statement       # 结论本身
+      - decided_by      # 谁定的
+      - rationale       # 依据
+
+    optional_fields:
+      - alternatives    # 被否掉的方案
+      - impact_scope    # 影响范围
+      - timestamp       # 在会议中的时间点，便于回听核对
+
+    # 敏感决策的判定。命中则分发需走 workflow-engine 审批。
+    #
+    # 为什么需要：会议里可能定下涉及人事、预算、对外承诺的事项，
+    # 这类决策的通告范围一旦搞错，后果不是"发错消息"而是合规事故。
+    sensitive:
+      enabled: true
+      # 关键词粗筛 + LLM 判定二级过滤。
+      # 只用关键词会大量误判（"预算"出现在闲聊里也命中），
+      # 只用 LLM 则每条决策都要多一次调用。两级组合最经济。
+      keywords:
+        - 裁员
+        - 薪酬
+        - 预算
+        - 收购
+        - 融资
+        - 对外发布
+        - 客户承诺
+      llm_confirm: true
+
+  # Action Item 抽取
+  actions:
+    enabled: true
+
+    # 阈值明显低于 decisions。
+    # 漏一个任务的代价大（事情就是没人做），多一个可以一键删掉。
+    min_confidence: 0.6
+
+    max_per_meeting: 50
+
+    required_fields:
+      - task            # 做什么
+      - assignee        # 谁做
+
+    optional_fields:
+      - due_date
+      - acceptance      # 验收标准
+      - priority
+      - depends_on      # 依赖的其他 action
+      - timestamp
+
+    # 责任人解析。
+    #
+    # 转录里出现的是人名（"张三跟一下"），要映射到系统里的 user_id。
+    # 映射不上时**不能猜**：把任务派给错误的人，对方会困惑，
+    # 真正的责任人还不知情，两边都出问题。
+    assignee_resolution:
+      # 参会人列表优先。会议里说的"张三"几乎一定是在场的张三。
+      use_participant_list: true
+      # 兜底查 octo-auth 的用户目录
+      use_directory: true
+      fuzzy_threshold: 0.9
+      # 解析失败时的处理：
+      #   unassigned —— 留空并标记待人工指派（推荐）
+      #   organizer  —— 派给会议组织者兜底
+      #   drop       —— 丢弃该 action（不推荐，会丢事情）
+      on_unresolved: unassigned
+
+    # 截止时间解析。
+    #
+    # "下周三之前"、"月底"、"这周内" 这类隐式表达在会议里极其常见，
+    # 必须能算成具体日期，否则待办进了任务系统也没有提醒。
+    due_date_resolution:
+      enabled: true
+      # 相对时间的基准：会议日期而非处理日期。
+      # 会后第二天才处理录音时，"明天"指的是会议的明天。
+      # 用处理日期会让所有截止时间整体偏移，这个 bug 很隐蔽。
+      base: meeting_date          # meeting_date | processing_date
+      timezone: ${MEETING_TIMEZONE:-Asia/Shanghai}
+      # 无法解析时留空，不猜默认值。
+      # 编一个截止时间比没有截止时间更糟：它会触发错误的逾期提醒。
+      on_unresolved: null
+
+    # 去重。同一件事在会议里可能被提到多次
+    # （"张三跟一下" ... 结尾又说 "张三别忘了那个事"）。
+    dedup:
+      enabled: true
+      similarity_threshold: 0.85
+
+# -----------------------------------------------------------------------------
+# 分发
+# -----------------------------------------------------------------------------
+dispatch:
+  # 默认需人工确认后才分发。
+  #
+  # **上线初期务必保持 true。** 抽取准确率再高也不是 100%，
+  # 而分发是有外部副作用的动作：任务已经派出去、消息已经发到群里，
+  # 撤回的社交成本比"多点一下确认"高得多。
+  # 等在真实数据上验证达标，再按会议类型逐步放开。
+  require_confirmation: ${MEETING_REQUIRE_CONFIRM:-true}
+
+  # 自动分发的白名单会议类型（require_confirmation 为 true 时仍生效）。
+  # 站会这类低风险会议可以先放开，积累信心。
+  auto_dispatch_types:
+    - standup
+
+  # 幂等键模板。分发是有副作用的，重试必须幂等——
+  # 否则一次网络抖动就会让同一个任务被创建两遍。
+  idempotency:
+    key_template: "dispatch:{tenant_id}:{meeting_id}:{version}:{target}"
+    ttl_seconds: 604800          # 7 天
+
+  # 失败重试。
+  #
+  # 注意各目标要**独立重试**而非整体重试：
+  # 任务创建成功但 IM 推送失败时，整体重试会重复创建任务。
+  # 因此每个目标各自记录状态与幂等键。
+  retry:
+    max_attempts: 5
+    backoff: exponential
+    initial_delay_seconds: 30
+    max_delay_seconds: 1800
+
+  targets:
+    # 任务系统
+    octo_matter:
+      enabled: true
+      base_url: ${OCTO_MATTER_URL:-http://octo-matter:8080}
+      api_key: ${OCTO_MATTER_API_KEY:-}
+      # 回填会议与 action 的引用，保证任务可溯源到原话。
+      # 没有这个，用户看到任务时无法确认"我真的答应过这件事吗"。
+      external_ref_template: "meeting:{meeting_id}#action:{action_id}"
+      # 未解析出责任人的 action 是否也创建任务。
+      # 创建（派给组织者待指派）比丢弃好：事情至少不会消失。
+      create_unassigned: true
+
+    # IM 推送
+    octo_adapters:
+      enabled: true
+      base_url: ${OCTO_ADAPTERS_URL:-http://octo-adapters:8080}
+      api_key: ${OCTO_ADAPTERS_API_KEY:-}
+      # 纪要推送形态。
+      # card 优于 text：飞书卡片能折叠长内容并带交互按钮
+      # （"确认"、"这不是我的任务"），而纯文本纪要在群里会刷屏，
+      # 结果是没人看。
+      format: card                 # card | text | markdown
+      # 是否 @ 责任人。默认 true——不 @ 的通知等于没通知。
+      mention_assignees: true
+      # 同一会议的推送合并为一条。逐条推送会刷屏。
+      aggregate: true
+
+    # 纪要入 RAG，供下次会议检索"上次结论"
+    rag_pipeline:
+      enabled: true
+      # 走 Kafka 而非 HTTP：摄入是异步的，
+      # 让分发流程等待摄入完成没有意义。
+      kafka_topic: ${KAFKA_TOPIC_INGEST:-aios.document.ingest}
+      collection: ${RAG_COLLECTION_MEETING:-meeting-minutes}
+
+    # 团队约定进记忆
+    memory_service:
+      enabled: true
+      base_url: ${MEMORY_SERVICE_URL:-http://memory-service:8400}
+      # 写 team 层。它是 confirm 模式，会进待确认队列而非直接生效——
+      # 从一次会议讨论就推断出团队规范，可靠性不足以直接生效。
+      scope: team
+      # 只推送被判定为"规范/约定"类的决策，不是所有决策都进记忆。
+      # 全推会让记忆库被一次性决策（"这版就先这样发"）塞满。
+      only_categories:
+        - rule
+
+    # 敏感决策审批
+    workflow_engine:
+      enabled: true
+      base_url: ${WORKFLOW_ENGINE_URL:-http://workflow-engine:8300}
+      # 审批流定义 key
+      definition_key: meeting-sensitive-decision
+      # 审批通过后回调本服务继续分发
+      callback_path: /api/v1/internal/dispatch/approved
+
+  # 纪要渲染模板（Jinja2）
+  templates:
+    markdown: |
+      # {{ meeting.title }}
+
+      - 时间：{{ meeting.started_at }} ~ {{ meeting.ended_at }}
+      - 参会：{{ meeting.participants | join("、") }}
+
+      ## 概要
+      {{ summary.overview }}
+
+      {% if decisions %}## 决策
+      {% for d in decisions %}- **{{ d.statement }}**（{{ d.decided_by }}）
+        - 依据：{{ d.rationale }}
+      {% endfor %}{% endif %}
+      {% if actions %}## 待办
+      {% for a in actions %}- [ ] {{ a.task }} — @{{ a.assignee_name or "待指派" }}{% if a.due_date %}（{{ a.due_date }}）{% endif %}
+      {% endfor %}{% endif %}
+      {% if summary.disagreements %}## 未达成一致
+      {% for x in summary.disagreements %}- {{ x.topic }}：{{ x.description }}
+      {% endfor %}{% endif %}
+
+# -----------------------------------------------------------------------------
+# 流式（会议中实时转写）
+# -----------------------------------------------------------------------------
+streaming:
+  enabled: ${MEETING_STREAMING_ENABLED:-false}
+
+  # 音频分片时长（毫秒）。
+  # 太小会让请求数暴增，太大会让实时感消失。
+  chunk_ms: 3000
+
+  # 滚动摘要的更新间隔（秒）。
+  # 不宜太频繁：每次更新都是一次 LLM 调用，
+  # 而参会者并不需要每 10 秒看一次摘要变化。
+  rolling_summary_interval: 120
+
+  # 会议中**不做**抽取与分发。
+  #
+  # 会议前半段说"这个交给张三"，后半段可能改成李四。
+  # 边开边派任务会让张三收到一个马上作废的任务，
+  # 而系统里已经留下记录。实时能力只提供"看到目前聊了什么"。
+  extract_during_meeting: false
+  dispatch_during_meeting: false
+
+  # 连接空闲超时（秒）。超时关闭并转入批量处理收尾。
+  idle_timeout: 300
+
+# -----------------------------------------------------------------------------
+# 处理流水线
+# -----------------------------------------------------------------------------
+pipeline:
+  # 各阶段的超时（秒）。超时进入 failed 但保留已完成阶段的产物——
+  # 抽取失败不该让辛苦转录的结果一起丢掉。
+  timeouts:
+    transcription: 3600
+    summarization: 600
+    extraction: 600
+    dispatch: 300
+
+  # 是否保留中间产物。
+  # 建议 true：抽取效果不好时需要能看到"是转录错了还是抽取错了"。
+  # 只留最终结果会让排查无从下手。
+  keep_intermediates: true
+
+  # 版本化。/reprocess 每次产生新版本，旧版本保留。
+  #
+  # 必须如此：prompt 与模型会持续迭代，需要拿历史会议重跑对比效果。
+  # 覆盖式重跑会毁掉基线。
+  versioning:
+    enabled: true
+    max_versions: 10
+
+  # 并发处理的会议数上限。
+  # 转录是长任务，不限并发会在会议高峰期（周一上午）打满 octo-speech。
+  max_concurrent_meetings: 4
+
+# -----------------------------------------------------------------------------
+# 事件（Kafka）
+# -----------------------------------------------------------------------------
+events:
+  enabled: ${MEETING_EVENTS_ENABLED:-true}
+  brokers: ${KAFKA_BROKERS:-kafka:9092}
+  client_id: meeting-agent
+
+  consume:
+    enabled: true
+    group_id: meeting-agent-processor
+    topics:
+      - ${KAFKA_TOPIC_MEETING_ENDED:-octo.meeting.ended}
+    # 手动提交：处理涉及 ASR 与多次 LLM 调用，耗时长且可能失败。
+    # 自动提交会导致失败的会议永久丢失。
+    auto_commit: false
+    max_poll_records: 10
+    dlq_topic: aios.meeting.process.dlq
+    max_retries: 3
+
+  produce:
+    topics:
+      transcribed: aios.meeting.transcribed
+      summarized: aios.meeting.summarized
+      dispatched: aios.meeting.dispatched
+      failed: aios.meeting.failed
+      # 纪要入 RAG
+      ingest: ${KAFKA_TOPIC_INGEST:-aios.document.ingest}
+
+# -----------------------------------------------------------------------------
+# 鉴权
+# -----------------------------------------------------------------------------
+auth:
+  enabled: ${AUTH_ENABLED:-true}
+  provider: octo-auth
+  octo_auth_url: ${OCTO_AUTH_BASE_URL:-http://octo-auth:8080}
+  cache_ttl: 60
+
+  internal_token: ${INTERNAL_SERVICE_TOKEN:-}
+  internal_services:
+    - octo-server
+    - workflow-engine
+
+  admin_roles:
+    - meeting-admin
+    - platform-admin
+
+# -----------------------------------------------------------------------------
+# 多租户与隐私
+# -----------------------------------------------------------------------------
+tenancy:
+  enforce: true
+  rls_enabled: true
+
+privacy:
+  # 会议可见范围继承所在 space 的成员关系。
+  # 不自建一套会议权限模型——两套权限必然不同步，
+  # 而不同步的权限模型意味着有人能看到不该看的会议。
+  visibility: space_members
+
+  # 录音同意。
+  #
+  # 多地法规要求录音需告知参会人。系统层面无法强制，
+  # 但可以在会议开始时推送提示、并在纪要里标注"本次会议已录音"。
+  # 这是产品必须处理的合规点，不能靠"用户自己知道"。
+  consent:
+    require_notice: true
+    notice_template: "本次会议将被录音并由 AI 生成纪要。"
+
+# -----------------------------------------------------------------------------
+# 可观测性
+# -----------------------------------------------------------------------------
+observability:
+  metrics:
+    enabled: true
+    path: /metrics
+    # 核心指标：
+    #   meeting_pipeline_duration{stage}        —— 各阶段耗时
+    #   meeting_pipeline_failures{stage}        —— 各阶段失败数
+    #   meeting_transcription_audio_seconds     —— 转录音频总时长（成本相关）
+    #   meeting_actions_extracted_total         —— 抽出的待办数
+    #   meeting_actions_edited_total            —— 被人工修正的待办数
+    #     这两个的比值是抽取质量最直接的指标：
+    #     修正率持续偏高说明 prompt 需要调，而这个信号只能从
+    #     人工修正行为里得到，无法靠自动评测发现
+    #   meeting_actions_unresolved_assignee     —— 责任人未解析数
+    #   meeting_dispatch_failures{target}       —— 各分发目标的失败数
+    #   meeting_speaker_mapping_confidence      —— 说话人映射置信度分布
+
+  tracing:
+    enabled: ${OTEL_ENABLED:-false}
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}
+    service_name: meeting-agent
+    sample_ratio: 0.2

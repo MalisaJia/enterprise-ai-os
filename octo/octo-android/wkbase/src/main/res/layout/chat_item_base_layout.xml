@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<com.chat.base.views.ChatItemView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/viewGroupLayout"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:paddingTop="2dp"
+    android:paddingBottom="2dp">
+
+    <com.chat.base.ui.components.CheckBox
+        android:id="@+id/checkBox"
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:layout_gravity="end|bottom"
+        android:layout_marginStart="-24dp"
+        android:layout_marginTop="8dp"
+        android:visibility="visible" />
+
+    <FrameLayout
+        android:id="@+id/viewContentLayout"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <com.chat.base.ui.components.AvatarView
+            android:id="@+id/avatarView"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_gravity="end"
+            android:layout_marginStart="10dp"
+            android:layout_marginEnd="10dp" />
+
+        <LinearLayout
+            android:id="@+id/fullContentLayout"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <!--
+               (对齐 web  ·  Phase A / iOS )
+              群聊气泡作者名行：原来只是一个 TextView；本次加一个 12dp × 12dp 的
+              蓝勾 ImageView，由 WKChatBaseProvider#setFromName 根据发送者
+              realname_verified 切换 GONE/VISIBLE。用水平 LinearLayout 包裹，把
+              marginStart/marginBottom 从 TextView 抬升到行容器上，保持与旧布局
+              像素级一致（不加一行高、不挤占原文本行高）。原 receivedNameTv id /
+              样式完全保留，provider 那边兼容无感。
+            -->
+            <LinearLayout
+                android:id="@+id/receivedNameRow"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="5dp"
+                android:layout_marginBottom="3dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/receivedNameTv"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:fontFamily="sans-serif-medium"
+                    android:gravity="center"
+                    android:singleLine="true"
+                    android:textColor="@color/colorDark"
+                    android:textSize="12sp" />
+
+                <androidx.appcompat.widget.AppCompatImageView
+                    android:id="@+id/realnameBadgeIv"
+                    android:layout_width="12dp"
+                    android:layout_height="12dp"
+                    android:layout_marginStart="2dp"
+                    android:contentDescription="@string/realname_verified_badge_cd"
+                    android:src="@drawable/ic_realname_verified_mini"
+                    android:visibility="gone" />
+            </LinearLayout>
+
+
+            <LinearLayout
+                android:id="@+id/wkBaseContentLayout"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:animateLayoutChanges="true"
+                android:orientation="horizontal" />
+
+            <FrameLayout
+                android:id="@+id/reactionsView"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="bottom|end"
+                android:visibility="gone" />
+
+        </LinearLayout>
+
+
+    </FrameLayout>
+
+
+</com.chat.base.views.ChatItemView>

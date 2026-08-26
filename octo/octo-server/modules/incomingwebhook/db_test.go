@@ -1,0 +1,434 @@
+package incomingwebhook
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/stretchr/testify/assert"
+
+	// 迁移依赖链：与 api_test.go 一致，缺任一模块 module.Setup 会在跨模块 ALTER 失败。
+	_ "github.com/Mininglamp-OSS/octo-server/modules/base"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/common"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/group"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/robot"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/space"
+	_ "github.com/Mininglamp-OSS/octo-server/modules/user"
+)
+
+// TestDisableByGroupNo 验证群解散级联禁用的 DB 层语义：disableByGroupNo 把指定群下
+// 所有 webhook 的 status 翻 0，且不影响其他群。这是 #246 列出的便宜回归——只验 DB
+// 层（disband fail-closed 的核心），不依赖完整 HTTP / 鉴权 harness（那部分仍 gated
+// 在 #17 上）。
+func TestDisableByGroupNo(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupA := "g_" + util.GenerUUID()[:12]
+	groupB := "g_" + util.GenerUUID()[:12]
+
+	// groupA：两个启用 webhook；groupB：一个启用 webhook（对照，验证不被误伤）。
+	mustInsertWebhook(t, d, groupA)
+	mustInsertWebhook(t, d, groupA)
+	bID := mustInsertWebhook(t, d, groupB)
+
+	assert.NoError(t, d.disableByGroupNo(groupA))
+
+	listA, err := d.queryByGroupNo(groupA)
+	assert.NoError(t, err)
+	assert.Len(t, listA, 2)
+	for _, m := range listA {
+		assert.Equalf(t, 0, m.Status, "groupA webhook %s must be disabled", m.WebhookID)
+	}
+
+	mb, err := d.queryByWebhookID(bID)
+	assert.NoError(t, err)
+	assert.NotNil(t, mb)
+	assert.Equal(t, 1, mb.Status, "groupB webhook must stay enabled (no cross-group impact)")
+}
+
+// TestSoftDelete 验证软删除（#254）的 DB 层语义：deleteByWebhookID 把行标记为
+// statusDeleted 而非物理删除——记录仍可被 queryByWebhookID 解析（供历史消息渲染），
+// 但从 queryByGroupNo 列表隐藏。
+func TestSoftDelete(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	whID := mustInsertWebhook(t, d, groupNo)
+
+	assert.NoError(t, d.deleteByWebhookID(whID))
+
+	// 行仍在，status=statusDeleted（display datasource 据此仍能渲染发送者名/头像）。
+	m, err := d.queryByWebhookID(whID)
+	assert.NoError(t, err)
+	assert.NotNil(t, m, "soft-deleted row must remain for historical message rendering")
+	if m != nil {
+		assert.Equal(t, statusDeleted, m.Status)
+	}
+
+	// 管理列表隐藏已删除项。
+	list, err := d.queryByGroupNo(groupNo)
+	assert.NoError(t, err)
+	assert.Empty(t, list, "soft-deleted webhook must not appear in management list")
+}
+
+// TestSoftDelete_FreesQuota 验证软删除释放每群配额：填满配额后软删一个应能再建一个。
+func TestSoftDelete_FreesQuota(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	const max = 2
+
+	id1 := mustInsertWebhookWithMax(t, d, groupNo, max)
+	mustInsertWebhookWithMax(t, d, groupNo, max)
+
+	// 配额已满：第三个被拒。
+	over := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
+	assert.ErrorIs(t, d.insertWithQuota(over, quotaLimits{scope: max}), ErrQuotaExceeded)
+
+	// 软删一个释放配额后可再建一个。
+	assert.NoError(t, d.deleteByWebhookID(id1))
+	again := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
+	assert.NoError(t, d.insertWithQuota(again, quotaLimits{scope: max}), "soft-delete must free per-group quota")
+}
+
+// TestDisableByGroupNo_SkipsDeleted 验证群解散级联禁用不会"复活"已软删除的 webhook：
+// disableByGroupNo 把启用项翻为 statusDisabled，但必须跳过 statusDeleted 行（否则
+// status 2→0 会让它重新出现在列表、重新占配额）。
+func TestDisableByGroupNo_SkipsDeleted(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	enabledID := mustInsertWebhook(t, d, groupNo)
+	deletedID := mustInsertWebhook(t, d, groupNo)
+	assert.NoError(t, d.deleteByWebhookID(deletedID))
+
+	assert.NoError(t, d.disableByGroupNo(groupNo))
+
+	enabled, err := d.queryByWebhookID(enabledID)
+	assert.NoError(t, err)
+	assert.NotNil(t, enabled)
+	if enabled != nil {
+		assert.Equal(t, statusDisabled, enabled.Status, "enabled webhook must be disabled on disband")
+	}
+
+	deleted, err := d.queryByWebhookID(deletedID)
+	assert.NoError(t, err)
+	assert.NotNil(t, deleted)
+	if deleted != nil {
+		assert.Equal(t, statusDeleted, deleted.Status, "soft-deleted webhook must NOT be revived to disabled on disband")
+	}
+}
+
+// TestUpdateFields_SkipsDeleted 锁定并发复活漏洞的根因防线（#254 follow-up）：
+// queryManageable 是非事务读，与 updateFields 之间有 TOCTOU 窗口——PUT 先通过校验，
+// 随后并发 DELETE 把行软删，最后 PUT 的 updateFields 把 status 写回 1 即"复活"已删除
+// webhook（重回列表 + 旧 token 复活）。updateFields 必须带 status != statusDeleted
+// 守卫，对已删除行的写入一律落空。这里直接对一个已软删除的行调 updateFields，断言
+// status / 业务字段都【不】被写入。
+func TestUpdateFields_SkipsDeleted(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	whID := mustInsertWebhook(t, d, groupNo)
+	assert.NoError(t, d.deleteByWebhookID(whID)) // status -> statusDeleted
+
+	// 模拟竞态尾部：对已删除行尝试 PUT status=1 + 改名。
+	assert.NoError(t, d.updateFields(whID, map[string]interface{}{
+		"status": statusEnabled,
+		"name":   "revived",
+	}))
+
+	m, err := d.queryByWebhookID(whID)
+	assert.NoError(t, err)
+	assert.NotNil(t, m)
+	if m != nil {
+		assert.Equal(t, statusDeleted, m.Status, "soft-deleted webhook must NOT be revived by a racing updateFields")
+		assert.NotEqual(t, "revived", m.Name, "soft-deleted webhook business fields must not be writable")
+	}
+}
+
+// TestUpdateFields_TokenHash_SkipsDeleted 覆盖 regenerate 路径：不得给已删除 webhook
+// 轮换 token_hash（否则会向调用方返回一个"看似有效"实则指向已删除行的新 token）。
+func TestUpdateFields_TokenHash_SkipsDeleted(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	whID := mustInsertWebhook(t, d, groupNo)
+	before, err := d.queryByWebhookID(whID)
+	assert.NoError(t, err)
+	assert.NotNil(t, before)
+	assert.NoError(t, d.deleteByWebhookID(whID))
+
+	assert.NoError(t, d.updateFields(whID, map[string]interface{}{"token_hash": "newhash"}))
+
+	after, err := d.queryByWebhookID(whID)
+	assert.NoError(t, err)
+	assert.NotNil(t, after)
+	if after != nil && before != nil {
+		assert.Equal(t, before.TokenHash, after.TokenHash, "token_hash of a soft-deleted webhook must not be rotated")
+	}
+}
+
+// TestMarkUsed_SkipsDeleted 锁定纵深防御一致性：push 成功后的异步审计若在行被并发软
+// 删除后才执行，markUsed 不得再给已删除 webhook 记账（call_count 不增）。
+func TestMarkUsed_SkipsDeleted(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	whID := mustInsertWebhook(t, d, groupNo)
+	assert.NoError(t, d.deleteByWebhookID(whID))
+
+	assert.NoError(t, d.markUsed(context.Background(), whID, time.Now()))
+
+	m, err := d.queryByWebhookID(whID)
+	assert.NoError(t, err)
+	assert.NotNil(t, m)
+	if m != nil {
+		assert.Equal(t, int64(0), m.CallCount, "markUsed must not bump a soft-deleted webhook")
+	}
+}
+
+// TestInsertAndQueryAudit 验证 Phase 2 审计扩展的 DB 层：insertAudit 落库成功+失败两
+// 类记录（新增列 status/reason/http_status/adapter 由反射自动映射），queryRecentAudits
+// 按 webhook 取回并受 limit 钳制。同步路径，不依赖异步 submitDelivery，断言确定。
+func TestInsertAndQueryAudit(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	whID := mustInsertWebhook(t, d, groupNo)
+
+	assert.NoError(t, d.insertAudit(context.Background(), &auditModel{
+		WebhookID: whID, GroupNo: groupNo, IP: "1.2.3.4", ByteSize: 12, MessageID: 99,
+		Status: auditSuccess, HTTPStatus: 200, Adapter: adapterNative,
+	}))
+	assert.NoError(t, d.insertAudit(context.Background(), &auditModel{
+		WebhookID: whID, GroupNo: groupNo, IP: "1.2.3.4",
+		Status: auditFailed, Reason: "delivery_failed", HTTPStatus: 502, Adapter: adapterNative,
+	}))
+
+	list, err := d.queryRecentAudits(whID, 10)
+	assert.NoError(t, err)
+	assert.Len(t, list, 2)
+	// created_at 同秒内顺序不保证，只校验集合内容与字段映射。
+	var success, failed int
+	for _, a := range list {
+		assert.Equal(t, adapterNative, a.Adapter)
+		switch a.Status {
+		case auditSuccess:
+			success++
+			assert.Equal(t, 200, a.HTTPStatus)
+			assert.Equal(t, int64(99), a.MessageID)
+		case auditFailed:
+			failed++
+			assert.Equal(t, "delivery_failed", a.Reason)
+			assert.Equal(t, 502, a.HTTPStatus)
+		}
+	}
+	assert.Equal(t, 1, success, "should record one success")
+	assert.Equal(t, 1, failed, "should record one failure")
+
+	// limit 钳制。
+	limited, err := d.queryRecentAudits(whID, 1)
+	assert.NoError(t, err)
+	assert.Len(t, limited, 1)
+}
+
+// TestThreadWebhookQuotaIsPerScope 群 webhook 与每个子区 webhook 各有【独立】配额：
+// insertWithQuota 按投递作用域 (group_no, thread_short_id) 计数——群本体
+// (thread_short_id='')、子区 A、子区 B 各占一份 max 名额，互不共享（子区多的群 /
+// octo-loop 不再被父群总量卡死，acceptance：每子区独立配额）。
+func TestThreadWebhookQuotaIsPerScope(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	const max = 2
+	const threadA = "100000000000001"
+	const threadB = "100000000000002"
+
+	// 群本体桶填满 max。
+	mustInsertWebhookWithMax(t, d, groupNo, max)
+	mustInsertWebhookWithMax(t, d, groupNo, max)
+	// 群本体桶已满：再建【群】webhook 被拒。
+	overGroup := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
+	assert.ErrorIs(t, d.insertWithQuota(overGroup, quotaLimits{scope: max}), ErrQuotaExceeded, "group-self bucket must enforce its own cap")
+
+	// 群本体桶满【不影响】子区 A：子区 A 有独立配额，可各自建满 max。
+	mustInsertThreadWebhookWithMax(t, d, groupNo, threadA, max)
+	mustInsertThreadWebhookWithMax(t, d, groupNo, threadA, max)
+	// 子区 A 桶已满：再建子区 A webhook 被拒。
+	overThreadA := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadA,
+	}
+	assert.ErrorIs(t, d.insertWithQuota(overThreadA, quotaLimits{scope: max}), ErrQuotaExceeded, "thread A bucket must enforce its own cap independently")
+
+	// 群本体 + 子区 A 都已满【不影响】子区 B：另一子区仍有独立名额可建。
+	freshThreadB := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadB,
+	}
+	assert.NoError(t, d.insertWithQuota(freshThreadB, quotaLimits{scope: max}), "thread B has an independent bucket; other scopes being full must not block it")
+}
+
+// TestCreatorQuotaIsPerScope per-creator 个人配额同样按投递作用域计：同一创建者在群
+// 本体填满个人额度后，在子区作用域内仍有【独立】的个人额度可继续创建。
+func TestCreatorQuotaIsPerScope(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	creator := "u_" + util.GenerUUID()[:12]
+	const groupCap, creatorCap = 100, 1
+	const threadA = "100000000000001"
+	const threadB = "100000000000002"
+
+	// 群本体作用域：该创建者建满个人额度(1)。
+	first := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled}
+	assert.NoError(t, d.insertWithQuota(first, quotaLimits{scope: groupCap, perCreator: creatorCap}))
+	// 群本体作用域个人额度已满：同一创建者再建被拒。
+	second := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled}
+	assert.ErrorIs(t, d.insertWithQuota(second, quotaLimits{scope: groupCap, perCreator: creatorCap}), ErrCreatorQuotaExceeded, "creator cap is per-scope; the group-self scope is full")
+
+	// 同一创建者在子区 A 作用域有独立个人额度：可建满 creatorCap。
+	inThreadA := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadA,
+	}
+	assert.NoError(t, d.insertWithQuota(inThreadA, quotaLimits{scope: groupCap, perCreator: creatorCap}), "creator's per-scope cap in thread A is independent of the group-self scope")
+
+	// 子区 A 的个人额度也【真的】受约束：同一创建者在子区 A 再建被拒——防回归把非空
+	// thread_short_id 误豁免 per-creator 校验（那样本用例前一步已过、这步会漏网）。
+	overThreadA := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadA,
+	}
+	assert.ErrorIs(t, d.insertWithQuota(overThreadA, quotaLimits{scope: groupCap, perCreator: creatorCap}), ErrCreatorQuotaExceeded, "per-creator cap must actually apply within a thread scope")
+
+	// 跨子区创建者额度独立：子区 A 满【不影响】同一创建者在子区 B 建。
+	inThreadB := &incomingWebhookModel{
+		WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, CreatorUID: creator, Name: "wh", Status: statusEnabled,
+		ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: threadB,
+	}
+	assert.NoError(t, d.insertWithQuota(inThreadB, quotaLimits{scope: groupCap, perCreator: creatorCap}), "creator's per-scope cap in thread B is independent of thread A")
+}
+
+// TestTotalQuotaCeiling 群级聚合天花板 max_total_per_group（②）：跨群本体 + 所有子区计总数，
+// 即便某作用域仍有空位，只要全群总数触顶即拒绝（ErrTotalQuotaExceeded）；软删除释放名额；
+// total<=0 时不启用。
+func TestTotalQuotaCeiling(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	const total = 3
+	// 作用域上限放大（100），让「聚合天花板」成为唯一约束。
+	lim := quotaLimits{scope: 100, total: total}
+	mkThread := func(shortID string) *incomingWebhookModel {
+		return &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled,
+			ChannelType: int(common.ChannelTypeCommunityTopic.Uint8()), ThreadShortID: shortID}
+	}
+
+	// 群本体 1 + 子区 A 2 = 3，恰好触顶。
+	groupWH := &incomingWebhookModel{WebhookID: generateWebhookID(), TokenHash: "h", GroupNo: groupNo, Name: "wh", Status: statusEnabled}
+	assert.NoError(t, d.insertWithQuota(groupWH, lim))
+	assert.NoError(t, d.insertWithQuota(mkThread("100000000000001"), lim))
+	assert.NoError(t, d.insertWithQuota(mkThread("100000000000001"), lim))
+
+	// 全群总数=3=total：另一个【全新空作用域】子区 B 虽 scope(100) 有空位，仍被聚合天花板拒。
+	assert.ErrorIs(t, d.insertWithQuota(mkThread("100000000000002"), lim), ErrTotalQuotaExceeded,
+		"aggregate ceiling must block even a fresh empty scope once the group total is reached")
+
+	// 聚合计数排除软删除：删掉群本体那个后全群总数回到 2，天花板下可再建一个（回到 3）。
+	assert.NoError(t, d.deleteByWebhookID(groupWH.WebhookID))
+	assert.NoError(t, d.insertWithQuota(mkThread("100000000000002"), lim),
+		"soft-delete must free an aggregate slot under the ceiling")
+
+	// 再次触顶（总数=3）：又被拒。
+	assert.ErrorIs(t, d.insertWithQuota(mkThread("100000000000003"), lim), ErrTotalQuotaExceeded,
+		"ceiling re-applies once the group total is reached again")
+
+	// total<=0 关闭天花板：同一个此时可建。
+	assert.NoError(t, d.insertWithQuota(mkThread("100000000000003"), quotaLimits{scope: 100, total: 0}),
+		"total<=0 disables the aggregate ceiling")
+}
+
+// TestDisableByGroupNo_CoversThreadWebhook 群解散级联禁用覆盖子区 webhook（同 group_no）：
+// disableByGroupNo 仅按 group_no 过滤，子区 webhook 锚父群，故一并翻为 statusDisabled。
+func TestDisableByGroupNo_CoversThreadWebhook(t *testing.T) {
+	_, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	d := newDB(ctx)
+
+	groupNo := "g_" + util.GenerUUID()[:12]
+	groupWH := mustInsertWebhook(t, d, groupNo)
+	threadWH := mustInsertThreadWebhookWithMax(t, d, groupNo, "100000000000003", 100)
+
+	assert.NoError(t, d.disableByGroupNo(groupNo))
+
+	for _, id := range []string{groupWH, threadWH} {
+		m, err := d.queryByWebhookID(id)
+		assert.NoError(t, err)
+		assert.NotNil(t, m)
+		if m != nil {
+			assert.Equalf(t, statusDisabled, m.Status, "disband must disable webhook %s (incl. thread-bound)", id)
+		}
+	}
+}
+
+// mustInsertThreadWebhookWithMax 插入一个绑定到子区的 webhook（channel_type=社区话题 +
+// thread_short_id），供子区维度的配额 / 级联 DB 层断言复用。
+func mustInsertThreadWebhookWithMax(t *testing.T, d *incomingWebhookDB, groupNo, shortID string, max int) string {
+	t.Helper()
+	m := &incomingWebhookModel{
+		WebhookID:     generateWebhookID(),
+		TokenHash:     "h",
+		GroupNo:       groupNo,
+		Name:          "wh",
+		Status:        statusEnabled,
+		ChannelType:   int(common.ChannelTypeCommunityTopic.Uint8()),
+		ThreadShortID: shortID,
+	}
+	assert.NoError(t, d.insertWithQuota(m, quotaLimits{scope: max}))
+	return m.WebhookID
+}
+
+func mustInsertWebhook(t *testing.T, d *incomingWebhookDB, groupNo string) string {
+	t.Helper()
+	return mustInsertWebhookWithMax(t, d, groupNo, 100)
+}
+
+func mustInsertWebhookWithMax(t *testing.T, d *incomingWebhookDB, groupNo string, max int) string {
+	t.Helper()
+	m := &incomingWebhookModel{
+		WebhookID: generateWebhookID(),
+		TokenHash: "h",
+		GroupNo:   groupNo,
+		Name:      "wh",
+		Status:    statusEnabled,
+	}
+	assert.NoError(t, d.insertWithQuota(m, quotaLimits{scope: max}))
+	return m.WebhookID
+}

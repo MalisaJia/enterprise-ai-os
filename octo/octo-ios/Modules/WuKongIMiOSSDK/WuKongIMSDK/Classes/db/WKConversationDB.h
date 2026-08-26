@@ -1,0 +1,245 @@
+//
+//  WKConversationDB.h
+//  WuKongIMSDK
+//
+//  Created by tt on 2019/11/29.
+//
+
+#import <Foundation/Foundation.h>
+#import "WKConversation.h"
+#import "WKDB.h"
+NS_ASSUME_NONNULL_BEGIN
+@class WKConversationAddOrUpdateResult;
+@interface WKConversationDB : NSObject
+
++ (WKConversationDB *)shared;
+
+/// 会话读路径的空间作用域（nil / @"" = 不作用域化，走老行为）。
+///
+/// 设了它之后，下面 4 条读路径只看归属于该空间的会话（归属表 conversation_space，
+/// 见 WKConversationSpaceDB）：
+///   - getConversationList          列表 / 转发选择器的唯一数据源
+///   - getConversationMaxVersion    增量 sync 的 version 必须是本空间的最大版本号
+///                                  （首次进入某空间时自然为 0 → 自动全量拉取）
+///   - getConversationSyncKey       作为 last_msg_seqs 发给 conversation/sync?space_id=X，
+///                                  不作用域化会把别的空间的 channel 报给本空间的 sync
+///   - getAllConversationUnreadCount
+///
+/// 只有一个开关条件：spaceScopeId 非空就生效。某空间归属为 0 行（从未同步过该空间）时
+/// 返回空列表，与原先"清库后等 sync"的行为一致。
+/// ⚠️ **不要**再加"归属表整表为空 → 作用域降级为 Off"的兼容态：它在「升级后首次全量
+/// sync 还没落地就切空间」时会把上一个空间的会话整片漏进新空间（实测到的跨空间污染）。
+/// 升级兼容改由一次性回填解决，详见 -setSpaceScopeId: 的实现注释。
+/// 由上层在启动 / 切空间时设置。
+@property (nonatomic, copy, nullable) NSString *spaceScopeId;
+
+
+/**
+ 添加或修改最近会话
+
+ @param conversation <#conversation description#>
+ */
+-(void) addOrUpdateConversation:(WKConversation*)conversation;
+
+
+/// 取代最近会话
+/// @param conversations <#conversation description#>
+-(void) replaceConversations:(NSArray<WKConversation*>*)conversations;
+
+
+/// 防御性合并 server 的会话快照到本地 DB.
+/// 与 replaceConversations 的差别:
+///  - 拒收 version=0 && lastMsgSeq=0 的"空白行"(防 server 返回缩水的系统通道把
+///    botfather / fileHelper / notification / u_10000 的 lastSeq / unread 擦成 0).
+///  - server.version > local.version 才覆盖元数据(lastMsgSeq / lastMsgTimestamp / extra).
+///  - unreadCount 走 WKUnreadStore.reconcileServerSnapshot(本地优先 + 60s 保护窗口 + 已读 seq).
+///  - 新会话(local 无记录): 整条插入.
+///
+/// 返回 channelKey("channelType:channelId") → 本次 reconcile 后写进 DB 的真实 unread,
+/// 调用方需要把这个真值同步回内存里的 WKConversation.unreadCount 再 dispatch 给 UI,
+/// 否则 UI 会拿到 server 的原始 unread(可能被本地保护策略覆盖前的旧值),出现
+/// "DB 红点对、UI 红点 0" 的不一致(锁屏后偶发的红点丢失就是这一路径).
+-(NSDictionary<NSString*, NSNumber*>*) mergeConversations:(NSArray<WKConversation*>*)conversations;
+
+
+/// 添加最近会话信息
+/// @param conversation <#conversation description#>
+-(void) addConversation:(WKConversation*)conversation;
+
+
+/// 恢复指定会话
+/// @param channel <#channel description#>
+/// @return 如果存在会话的会话则返回，不存在则返回nil
+-(WKConversation*) recoveryConversation:(WKChannel*)channel;
+
+/**
+ 查询指定频道的最近会话
+
+ @param channel <#channel description#>
+ @param db <#db description#>
+ @return <#return value description#>
+ */
+-(WKConversation*) getConversationWithChannel:(WKChannel*)channel db:(FMDatabase*)db;
+
+/// 查询指定频道的最近会话（包含is_deleted=1的频道）
+/// @param channel 指定频道
+/// @param db <#db description#>
+-(WKConversation*) getConversationWithChannelInAll:(WKChannel*)channel db:(FMDatabase*)db;
+
+/**
+ 查询频道类的最近会话数据
+
+ @return <#return value description#>
+ */
+-(NSArray<WKConversation*>*) getConversationList;
+
+
+/**
+ 获取最近会话
+
+ @param channel 频道
+ @return <#return value description#>
+ */
+-(WKConversation*) getConversation:(WKChannel*)channel;
+
+// 通过频道集合获取最近会话集合
+-(NSArray<WKConversation*>*) getConversations:(NSArray<WKChannel*> *)channels;
+
+
+/**
+ 通过最后一条消息的客户端序号获取最近会话
+
+ @param lastClientMsgNo 最后一条消息的编号
+ @return <#return value description#>
+ */
+-(WKConversation*) getConversationWithLastClientMsgNo:(NSString*)lastClientMsgNo;
+
+
+
+/// 获取会话最大数据版本号
+-(long long) getConversationMaxVersion;
+
+
+/// 获取同步key
+-(NSString*) getConversationSyncKey;
+/**
+ 更新最近会话
+
+ @param conversation <#conversation description#>
+ */
+-(void) updateConversation:(WKConversation*)conversation;
+/**
+ 更新最近会话
+
+ @param conversation <#conversation description#>
+ @param db <#db description#>
+ */
+-(void) updateConversation:(WKConversation*)conversation db:(FMDatabase*)db;
+
+
+/**
+ 插入最近会话
+
+ @param conversation <#conversation description#>
+ @param db <#db description#>
+ */
+-(void) insertConversation:(WKConversation*)conversation db:(FMDatabase*)db;
+
+
+/**
+ 清除指定频道的未读消息
+
+ @param channel <#channel description#>
+ */
+-(void) clearConversationUnreadCount:(WKChannel*)channel;
+
+
+
+/// 设置最近会话未读数
+/// @param channel 频道
+/// @param unread 未读数量
+-(void) setConversationUnreadCount:(WKChannel*)channel unread:(NSInteger)unread;
+
+
+/// 删除指定频道的最近会话
+/// @param channel 频道对象
+-(void) deleteConversation:(WKChannel*)channel;
+
+/// 删除所有最近会话
+-(void) deleteAllConversation;
+/**
+ 更新最近会话的标题和头像
+
+ @param channel <#channel description#>
+ @param title <#title description#>
+ @param avatar <#avatar description#>
+ @param db <#db description#>
+ */
+-(void) updateConversation:(WKChannel*)channel title:(NSString*)title avatar:(NSString*) avatar db:(FMDatabase*)db;
+
+
+//
+///**
+// 追加提醒
+//
+// @param reminder 提醒项
+// @param channel 频道
+// @return 追加后的z最近会话
+// */
+//-(WKConversation*) appendReminder:(WKReminder*) reminder channel:(WKChannel*)channel;
+//
+//
+///**
+// 移除某种类型的提醒
+//
+// @param type <#type description#>
+// @param channel <#channel description#>
+// @return <#return value description#>
+// */
+//-(WKConversation*) removeReminder:(WKReminderType)type channel:(WKChannel*)channel;
+//
+///**
+//清除指定频道的所有提醒
+//
+// @param channel 频道
+// @return <#return value description#>
+// */
+//-(WKConversation*) clearAllReminder:(WKChannel*)channel;
+//
+//
+///**
+// 清除指定频道指定类型的提醒
+//
+// @param channel 频道
+// @param type 提醒类型
+// @return <#return value description#>
+// */
+//-(WKConversation*) clearReminder:(WKChannel*)channel type:(NSInteger)type;
+//
+
+/**
+ 获取所有会话未读数量
+ */
+-(NSInteger) getAllConversationUnreadCount;
+
+
+/// 更新频道预览的位置
+/// @param browseTo <#browseTo description#>
+/// @param channel <#channel description#>
+-(void) updateBrowseTo:(uint32_t)browseTo forChannel:(WKChannel*)channel;
+
+@end
+
+// 最近会话添加或修改结果
+@interface WKConversationAddOrUpdateResult : NSObject
+
+@property(nonatomic,assign) BOOL insert;
+
+@property(nonatomic,assign) BOOL modify; // 数据是否修改（添加或更新都为true）
+
+@property(nonatomic,strong) WKConversation *conversation;
+
++(instancetype) initWithInsert:(BOOL)insert modify:(BOOL)modify conversation:(WKConversation*)conversation;
+@end
+
+NS_ASSUME_NONNULL_END

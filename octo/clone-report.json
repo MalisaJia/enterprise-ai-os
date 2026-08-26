@@ -1,0 +1,177 @@
+﻿[
+    {
+        "Repo":  "multica",
+        "Status":  "OK",
+        "Files":  3271,
+        "SizeMB":  59.3,
+        "Commit":  "ccc0d3e"
+    },
+    {
+        "Repo":  "octo-server",
+        "Status":  "OK",
+        "Files":  2588,
+        "SizeMB":  154.3,
+        "Commit":  "a5a293b"
+    },
+    {
+        "Repo":  "octo-web",
+        "Status":  "OK",
+        "Files":  3462,
+        "SizeMB":  59.3,
+        "Commit":  "786afee"
+    },
+    {
+        "Repo":  "octo-admin",
+        "Status":  "OK",
+        "Files":  193,
+        "SizeMB":  2.3,
+        "Commit":  "6498476"
+    },
+    {
+        "Repo":  "codex-channel-octo",
+        "Status":  "OK",
+        "Files":  87,
+        "SizeMB":  1.5,
+        "Commit":  "9da813f"
+    },
+    {
+        "Repo":  "octo-marketplace",
+        "Status":  "OK",
+        "Files":  339,
+        "SizeMB":  3.7,
+        "Commit":  "a62d071"
+    },
+    {
+        "Repo":  "octo-im",
+        "Status":  "OK",
+        "Files":  2423,
+        "SizeMB":  114.7,
+        "Commit":  "613fc2b"
+    },
+    {
+        "Repo":  "octo-auth",
+        "Status":  "OK",
+        "Files":  100,
+        "SizeMB":  0.8,
+        "Commit":  "a52e6d9"
+    },
+    {
+        "Repo":  "octo-deployment",
+        "Status":  "OK",
+        "Files":  124,
+        "SizeMB":  1.3,
+        "Commit":  "61a0c9e"
+    },
+    {
+        "Repo":  "octo-lib",
+        "Status":  "OK",
+        "Files":  157,
+        "SizeMB":  1.3,
+        "Commit":  "233dd6f"
+    },
+    {
+        "Repo":  "octo-search-indexer",
+        "Status":  "OK",
+        "Files":  178,
+        "SizeMB":  1.8,
+        "Commit":  "41395a7"
+    },
+    {
+        "Repo":  "octo-smart-summary",
+        "Status":  "OK",
+        "Files":  376,
+        "SizeMB":  4.6,
+        "Commit":  "59f2caf"
+    },
+    {
+        "Repo":  "octo-speech",
+        "Status":  "OK",
+        "Files":  91,
+        "SizeMB":  6.3,
+        "Commit":  "cf4a449"
+    },
+    {
+        "Repo":  "octo-adapters",
+        "Status":  "OK",
+        "Files":  75,
+        "SizeMB":  1.1,
+        "Commit":  "a187f0f"
+    },
+    {
+        "Repo":  "octo-spec",
+        "Status":  "OK",
+        "Files":  48,
+        "SizeMB":  0.3,
+        "Commit":  "d456507"
+    },
+    {
+        "Repo":  "octo-matter",
+        "Status":  "OK",
+        "Files":  166,
+        "SizeMB":  1.7,
+        "Commit":  "3c2915c"
+    },
+    {
+        "Repo":  "octo-skills",
+        "Status":  "OK",
+        "Files":  12,
+        "SizeMB":  0.1,
+        "Commit":  "14c2e87"
+    },
+    {
+        "Repo":  "octo-cli",
+        "Status":  "OK",
+        "Files":  198,
+        "SizeMB":  3.3,
+        "Commit":  "ab8cfdf"
+    },
+    {
+        "Repo":  "openclaw-channel-octo",
+        "Status":  "OK",
+        "Files":  206,
+        "SizeMB":  4.6,
+        "Commit":  "a2cec1e"
+    },
+    {
+        "Repo":  "cc-channel-octo",
+        "Status":  "OK",
+        "Files":  142,
+        "SizeMB":  2.1,
+        "Commit":  "1871c25"
+    },
+    {
+        "Repo":  "hermes-channel-octo",
+        "Status":  "OK",
+        "Files":  68,
+        "SizeMB":  2.1,
+        "Commit":  "5b7cf4e"
+    },
+    {
+        "Repo":  "octo-version-sync",
+        "Status":  "OK",
+        "Files":  46,
+        "SizeMB":  0.2,
+        "Commit":  "af9d9ff"
+    },
+    {
+        "Repo":  "octo-plugin-lib",
+        "Status":  "CLONED-EMPTY",
+        "Files":  0,
+        "SizeMB":  0,
+        "Commit":  "EMPTY-REPO"
+    },
+    {
+        "Repo":  "octo-android",
+        "Status":  "OK",
+        "Files":  2693,
+        "SizeMB":  86.5,
+        "Commit":  "3133fe3"
+    },
+    {
+        "Repo":  "octo-ios",
+        "Status":  "OK",
+        "Files":  3609,
+        "SizeMB":  58.3,
+        "Commit":  "5b948cb"
+    }
+]

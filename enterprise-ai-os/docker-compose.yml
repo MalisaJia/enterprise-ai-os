@@ -1,0 +1,504 @@
+# =============================================================================
+# Enterprise AI OS — 自研组件本地/单机编排
+#
+#   docker compose up -d postgres redis kafka minio     # 仅基础设施
+#   docker compose up -d --build                        # 基础设施 + 自研服务
+#   docker compose --profile milvus up -d               # 启用 Milvus（替代 pgvector）
+#   docker compose --profile graph up -d                # 启用 Neo4j（memory-service 图存储）
+#
+# 生产环境请使用 K8s（复用 octo-deployment 的 Kustomize 结构），本文件仅供开发联调。
+# 注意：本文件不包含 OCTO 侧服务（octo-server/octo-im/octo-speech 等），
+#       它们由 octo-deployment 独立编排；通过 external network `octo-net` 互通。
+# =============================================================================
+
+name: enterprise-ai-os
+
+x-common-env: &common-env
+  ENV: ${ENV:-dev}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_FORMAT: ${LOG_FORMAT:-json}
+  TZ: ${TZ:-Asia/Shanghai}
+
+x-datastore-env: &datastore-env
+  DATABASE_URL: ${DATABASE_URL}
+  REDIS_URL: ${REDIS_URL}
+  KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+  S3_ENDPOINT: ${S3_ENDPOINT}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+  S3_SECRET_KEY: ${S3_SECRET_KEY}
+  S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+
+x-octo-env: &octo-env
+  OCTO_SERVER_BASE_URL: ${OCTO_SERVER_BASE_URL}
+  OCTO_AUTH_BASE_URL: ${OCTO_AUTH_BASE_URL}
+  OCTO_AUTH_ENABLED: ${OCTO_AUTH_ENABLED:-true}
+  INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  # ===========================================================================
+  # 基础设施
+  # ===========================================================================
+
+  postgres:
+    # pgvector 官方镜像 = postgres:16 + vector 扩展预装
+    image: pgvector/pgvector:pg16
+    container_name: aios-postgres
+    <<: [*restart, *logging]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aios}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-in-production}
+      POSTGRES_DB: ${POSTGRES_DB:-aios}
+      # 首次初始化时自动建 schema 与扩展
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command:
+      - postgres
+      - -c
+      - max_connections=300
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - work_mem=32MB
+      # HNSW 索引构建需要较大 maintenance_work_mem
+      - -c
+      - maintenance_work_mem=1GB
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aios} -d ${POSTGRES_DB:-aios}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [aios-net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: aios-redis
+    <<: [*restart, *logging]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 2gb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [aios-net]
+
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    container_name: aios-zookeeper
+    <<: [*restart, *logging]
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"
+      ZOO_ENABLE_ADMIN_SERVER: "no"
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/bitnami/zookeeper
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [aios-net]
+
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: aios-kafka
+    <<: [*restart, *logging]
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,EXTERNAL://:29092
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_NUM_PARTITIONS: "6"
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_LOG_RETENTION_HOURS: "168"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports:
+      # 9092 供容器内访问；29092 供宿主机调试工具访问
+      - "29092:29092"
+    volumes:
+      - kafka-data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    networks: [aios-net]
+
+  minio:
+    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
+    container_name: aios-minio
+    <<: [*restart, *logging]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-aios-minio}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-change-me-in-production}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [aios-net]
+
+  minio-init:
+    # 一次性任务：创建 bucket，创建完即退出
+    image: minio/mc:RELEASE.2024-09-16T17-43-14Z
+    container_name: aios-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-aios-minio} ${S3_SECRET_KEY:-change-me-in-production} &&
+      mc mb --ignore-existing local/${S3_BUCKET_DOCUMENTS:-aios-documents} &&
+      mc mb --ignore-existing local/${S3_BUCKET_MEDIA:-aios-media} &&
+      echo 'minio buckets ready'
+      "
+    restart: "no"
+    networks: [aios-net]
+
+  # ---------------------------------------------------------------------------
+  # Milvus（可选，与 pgvector 二选一）—— profile: milvus
+  # 数据量 > 5000 万向量或需要 GPU 索引时启用
+  # ---------------------------------------------------------------------------
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.14
+    container_name: aios-etcd
+    profiles: [milvus]
+    <<: [*restart, *logging]
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: >
+      etcd -advertise-client-urls=http://etcd:2379
+      -listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    volumes:
+      - etcd-data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+    networks: [aios-net]
+
+  milvus:
+    image: milvusdb/milvus:v2.4.13
+    container_name: aios-milvus
+    profiles: [milvus]
+    <<: [*restart, *logging]
+    command: ["milvus", "run", "standalone"]
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-aios-minio}
+      MINIO_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-change-me-in-production}
+    ports:
+      - "19530:19530"   # gRPC
+      - "9091:9091"     # metrics / health
+    volumes:
+      - milvus-data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 90s
+    networks: [aios-net]
+
+  # ---------------------------------------------------------------------------
+  # Neo4j（可选，memory-service 的图存储后端）—— profile: graph
+  # ---------------------------------------------------------------------------
+  neo4j:
+    image: neo4j:5-community
+    container_name: aios-neo4j
+    profiles: [graph]
+    <<: [*restart, *logging]
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-change-me}
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_PLUGINS: '["apoc"]'
+    ports:
+      - "7474:7474"   # HTTP Browser
+      - "7687:7687"   # Bolt
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    networks: [aios-net]
+
+  # ===========================================================================
+  # 自研服务
+  # ===========================================================================
+
+  model-gateway:
+    # P0 — 所有模型调用的唯一出口，必须先起
+    build:
+      context: ./model-gateway
+      dockerfile: Dockerfile
+    image: aios/model-gateway:dev
+    container_name: aios-model-gateway
+    <<: [*restart, *logging]
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: [*common-env, *datastore-env, *octo-env]
+      PORT: ${MODEL_GATEWAY_PORT:-8200}
+      # 仅本服务持有厂商凭证
+      QWEN_API_KEY: ${QWEN_API_KEY}
+      QWEN_BASE_URL: ${QWEN_BASE_URL}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL}
+      GLM_API_KEY: ${GLM_API_KEY}
+      GLM_BASE_URL: ${GLM_BASE_URL}
+      YI_API_KEY: ${YI_API_KEY}
+      YI_BASE_URL: ${YI_BASE_URL}
+      VLLM_BASE_URL: ${VLLM_BASE_URL}
+    ports:
+      - "8200:8200"
+    volumes:
+      - ./model-gateway/config:/app/config:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8200/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [aios-net]
+
+  rag-pipeline:
+    # P0 — 文档摄入与混合检索
+    build:
+      context: ./rag-pipeline
+      dockerfile: Dockerfile
+    image: aios/rag-pipeline:dev
+    container_name: aios-rag-pipeline
+    <<: [*restart, *logging]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      model-gateway:
+        condition: service_started
+    environment:
+      <<: [*common-env, *datastore-env, *octo-env]
+      PORT: ${RAG_PORT:-8100}
+      PG_SCHEMA: ${PG_SCHEMA_RAG:-rag}
+      VECTOR_BACKEND: ${VECTOR_BACKEND:-pgvector}
+      MILVUS_HOST: ${MILVUS_HOST:-milvus}
+      MILVUS_PORT: ${MILVUS_PORT:-19530}
+      MODEL_GATEWAY_URL: ${MODEL_GATEWAY_URL}
+      OCTO_SEARCH_INDEXER_URL: ${OCTO_SEARCH_INDEXER_URL}
+      RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-bge-m3}
+      RAG_EMBEDDING_DIM: ${RAG_EMBEDDING_DIM:-1024}
+      RAG_CHUNK_SIZE: ${RAG_CHUNK_SIZE:-512}
+      RAG_CHUNK_OVERLAP: ${RAG_CHUNK_OVERLAP:-64}
+      RAG_HYBRID_ALPHA: ${RAG_HYBRID_ALPHA:-0.5}
+      S3_BUCKET_DOCUMENTS: ${S3_BUCKET_DOCUMENTS:-aios-documents}
+    ports:
+      - "8100:8100"
+    volumes:
+      - ./rag-pipeline/config:/app/config:ro
+      - hf-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8100/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks: [aios-net]
+
+  workflow-engine:
+    # P1 — DAG 编排 + 人工审批
+    build:
+      context: ./workflow-engine
+      dockerfile: Dockerfile
+    image: aios/workflow-engine:dev
+    container_name: aios-workflow-engine
+    <<: [*restart, *logging]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      <<: [*common-env, *datastore-env, *octo-env]
+      PORT: ${WORKFLOW_PORT:-8300}
+      PG_SCHEMA: ${PG_SCHEMA_WORKFLOW:-workflow}
+      MODEL_GATEWAY_URL: ${MODEL_GATEWAY_URL}
+      RAG_PIPELINE_URL: ${RAG_PIPELINE_URL}
+      MEMORY_SERVICE_URL: ${MEMORY_SERVICE_URL}
+      OCTO_MATTER_URL: ${OCTO_MATTER_URL}
+      OCTO_ADAPTERS_URL: ${OCTO_ADAPTERS_URL}
+      WORKFLOW_WORKER_POOL_SIZE: ${WORKFLOW_WORKER_POOL_SIZE:-16}
+      WORKFLOW_MAX_CONCURRENT_RUNS: ${WORKFLOW_MAX_CONCURRENT_RUNS:-100}
+    ports:
+      - "8300:8300"
+    volumes:
+      - ./workflow-engine/config:/app/config:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8300/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [aios-net]
+
+  memory-service:
+    # P1 — 个人/团队/组织三层长期记忆
+    build:
+      context: ./memory-service
+      dockerfile: Dockerfile
+    image: aios/memory-service:dev
+    container_name: aios-memory-service
+    <<: [*restart, *logging]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      model-gateway:
+        condition: service_started
+    environment:
+      <<: [*common-env, *datastore-env, *octo-env]
+      PORT: ${MEMORY_PORT:-8400}
+      PG_SCHEMA: ${PG_SCHEMA_MEMORY:-memory}
+      VECTOR_BACKEND: ${VECTOR_BACKEND:-pgvector}
+      GRAPH_BACKEND: ${GRAPH_BACKEND:-none}
+      NEO4J_URI: ${NEO4J_URI}
+      NEO4J_USER: ${NEO4J_USER}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+      MODEL_GATEWAY_URL: ${MODEL_GATEWAY_URL}
+      RAG_PIPELINE_URL: ${RAG_PIPELINE_URL}
+      MEMORY_EXTRACTION_MODEL: ${MEMORY_EXTRACTION_MODEL:-qwen-plus}
+      MEMORY_DECAY_HALFLIFE_DAYS: ${MEMORY_DECAY_HALFLIFE_DAYS:-90}
+    ports:
+      - "8400:8400"
+    volumes:
+      - ./memory-service/config:/app/config:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8400/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+    networks: [aios-net]
+
+  meeting-agent:
+    # P2 — 转录 → 摘要 → 提取 → 分发
+    build:
+      context: ./meeting-agent
+      dockerfile: Dockerfile
+    image: aios/meeting-agent:dev
+    container_name: aios-meeting-agent
+    <<: [*restart, *logging]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      model-gateway:
+        condition: service_started
+    environment:
+      <<: [*common-env, *datastore-env, *octo-env]
+      PORT: ${MEETING_PORT:-8500}
+      MODEL_GATEWAY_URL: ${MODEL_GATEWAY_URL}
+      MEMORY_SERVICE_URL: ${MEMORY_SERVICE_URL}
+      RAG_PIPELINE_URL: ${RAG_PIPELINE_URL}
+      WORKFLOW_ENGINE_URL: ${WORKFLOW_ENGINE_URL}
+      OCTO_SPEECH_URL: ${OCTO_SPEECH_URL}
+      OCTO_MATTER_URL: ${OCTO_MATTER_URL}
+      OCTO_ADAPTERS_URL: ${OCTO_ADAPTERS_URL}
+      MEETING_ASR_PROVIDER: ${MEETING_ASR_PROVIDER:-octo-speech}
+      MEETING_SUMMARY_MODEL: ${MEETING_SUMMARY_MODEL:-deepseek-chat}
+      S3_BUCKET_MEDIA: ${S3_BUCKET_MEDIA:-aios-media}
+    ports:
+      - "8500:8500"
+    volumes:
+      - ./meeting-agent/config:/app/config:ro
+      - hf-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8500/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks: [aios-net]
+
+networks:
+  aios-net:
+    driver: bridge
+    name: aios-net
+  # OCTO 侧网络：由 octo-deployment 创建。需要跨栈联调时，
+  # 取消下面注释并给对应服务加上 `networks: [aios-net, octo-net]`
+  # octo-net:
+  #   external: true
+
+volumes:
+  postgres-data:
+  redis-data:
+  zookeeper-data:
+  kafka-data:
+  minio-data:
+  etcd-data:
+  milvus-data:
+  neo4j-data:
+  hf-cache:      # embedding / rerank 模型权重缓存，避免每次重建镜像重复下载

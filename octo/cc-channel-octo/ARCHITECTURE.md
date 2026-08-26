@@ -1,0 +1,298 @@
+# Architecture
+
+This document describes the internal architecture of cc-channel-octo: a standalone Node.js gateway that bridges [Claude Code](https://claude.ai/code) (via the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk)) to [Octo](https://github.com/nicco-io/octo) instant messaging.
+
+## Design Goals
+
+1. **Independent process.** No dependency on OpenClaw or any orchestration layer. One binary, one config file, `npm start`.
+2. **Minimal surface area.** 12 source files, ~1200 lines. Every module has a single responsibility and a clear boundary.
+3. **Secure by default.** Headless automation requires `bypassPermissions`, so security is enforced through tool whitelisting (`allowedTools`), working directory isolation (`cwd`), and setting source restriction (`settingSources`).
+4. **Protocol fidelity.** The Octo layer implements the WuKongIM binary protocol directly — DH key exchange, AES-CBC encryption, binary framing — rather than depending on a high-level SDK that may lag behind protocol changes.
+
+## System Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     cc-channel-octo                         │
+│                                                             │
+│  ┌──────────┐   ┌────────────────┐   ┌──────────────────┐  │
+│  │  config   │──▶│    gateway      │──▶│  session-router  │  │
+│  └──────────┘   │  (WS lifecycle)  │   │  (routing +      │  │
+│                 │                  │   │   concurrency +   │  │
+│                 └────────┬─────────┘   │   rate limiting)  │  │
+│                          │             └────────┬──────────┘  │
+│                          │ BotMessage           │             │
+│                          ▼                      ▼             │
+│  ┌──────────────┐   ┌──────────┐   ┌──────────────────────┐ │
+│  │ group-context │   │ session- │   │    agent-bridge      │ │
+│  │ (member cache │   │  store   │   │  (Claude Agent SDK)  │ │
+│  │  + context    │   │ (SQLite) │   └──────────┬───────────┘ │
+│  │  window)      │   └──────────┘              │             │
+│  └──────────────┘                    AsyncIterable<string>   │
+│                                                │             │
+│                                     ┌──────────▼───────────┐ │
+│                                     │    stream-relay      │ │
+│                                     │  (typing + throttle  │ │
+│                                     │   + split + fallback)│ │
+│                                     └──────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+         ▲                                      │
+         │ WuKongIM binary protocol             │ Octo REST API
+         │ (WebSocket)                          │ (send/typing)
+         ▼                                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Octo Server                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Module Reference
+
+The system is organized into three layers and a shared protocol package.
+
+### Layer 0 — Protocol (`src/octo/`)
+
+Forked from [openclaw-channel-octo](https://github.com/Mininglamp-OSS/openclaw-channel-octo) v1.0.13. The fork is intentional: cc-channel-octo will evolve independently (e.g. it does not need OBO, rich text, or COS upload), and the code volume is small enough that maintaining a shared package would cost more than it saves.
+
+| File | Responsibility |
+|---|---|
+| `types.ts` | Octo Bot API types, channel/message enums, mention payloads |
+| `api.ts` | REST API functions: register, send, typing, heartbeat, group members, user info, channel message sync |
+| `socket.ts` | WuKongIM binary protocol over WebSocket: DH key exchange (curve25519), AES-CBC encryption, binary framing (variable-length encoding), CONNECT/CONNACK/RECV/RECVACK/PING/PONG, reconnect with exponential backoff + jitter |
+
+**Protocol details.** The WuKongIM protocol uses a custom binary framing format (not protobuf). Each frame has a 1-byte header (packet type in upper nibble, flags in lower nibble) followed by a variable-length body size and the body. Encryption is AES-128-CBC with keys derived from a Diffie-Hellman exchange (curve25519) during CONNECT/CONNACK. The salt from CONNACK provides the IV. Message IDs are 64-bit integers transmitted as big-endian — the API layer uses `parseOctoJson` to convert 16+ digit numeric IDs to strings before `JSON.parse` to avoid JavaScript precision loss.
+
+### Layer 1 — Infrastructure
+
+| File | Responsibility |
+|---|---|
+| `config.ts` | Three-level config resolution: defaults → `config.json` → `CC_OCTO_*` environment variables. Validates required fields (`botToken`, `apiUrl`). Strips `_`-prefixed keys (comments). Strict integer parsing rejects hex, negative, floating-point, and NaN. |
+| `db-adapter.ts` | Thin abstraction over `better-sqlite3`. WAL journal mode, foreign keys ON, 5s busy timeout. Interface designed for future migration to `node:sqlite` when it reaches GA. |
+| `session-store.ts` | SQLite persistence for sessions and message history. 7-day expiry with cleanup on startup. Prepared statements for all queries. History retrieval returns chronological `[role]: content` pairs for prompt construction. |
+| `gateway.ts` | Process lifecycle: PID lock file (stale detection via `kill(pid, 0)`), bot registration, WebSocket connection management, 30s API heartbeat with 3-failure reconnect trigger, 60s token refresh cooldown, graceful SIGINT/SIGTERM shutdown. |
+
+### Layer 2 — Application
+
+| File | Responsibility |
+|---|---|
+| `session-router.ts` | Message routing pipeline: self-message filter → bot blocklist → group mention gate (`uids` or `ais`, NOT `all`) → rate limiting (token bucket, per-session, debounced notification) → non-text rejection. **Critical design: `routeAndHandle` holds a per-session lock across both routing and handler execution** — this eliminates the TOCTOU gap between "should I process this?" and "processing it". |
+| `group-context.ts` | Group chat context management: in-memory message window (100 messages per channel, budget-capped to `maxContextChars`), member name cache (SQLite-backed, hourly API refresh), bidirectional uid↔name mapping, `@name` mention resolution via regex. Context string is built BEFORE the current message is cached to avoid duplication. |
+| `agent-bridge.ts` | Claude Agent SDK integration. Builds a **frozen** system prompt (security prefix + SOUL + group instructions only — no per-turn history/context, so the SDK's cached system block hits) and always `resume`s the SDK session (the source of truth for conversation history). Calls `query()` with configured permissions/tools/model, yields text chunks as `AsyncIterable<string>`. Recovers from a stale/expired resume by clearing the id + retrying once with an injected history fallback. **Knows nothing about Octo.** |
+| `stream-relay.ts` | Output delivery. Typing indicator heartbeat (5s). Delivers agent output via plain `sendMessage` with intelligent splitting (paragraph > newline > space > hard cut, 3500 char segments). |
+| `index.ts` | Entry point orchestrator. Wires all modules in sequence: config → adapter → store → cleanup → group-context → stream-relay → gateway → router → message handler. The `handleMessage` function coordinates the full pipeline under the router's session lock. |
+
+## Data Flow
+
+### DM Message (Happy Path)
+
+```
+1. Octo user sends text message
+2. WuKongIM delivers encrypted RECV packet via WebSocket
+3. socket.ts decrypts (AES-CBC) and parses → BotMessage
+4. gateway filters self-messages, calls registered handler
+5. session-router: acquires per-session lock → passes blocklist/rate-limit/text checks → calls handler
+6. Inside handler (still under lock):
+   a. session-store: getOrCreate session, build history prefix
+   b. agent-bridge: buildPrompt (history + message) → query() → AsyncIterable<string>
+   c. stream-relay: typing heartbeat + sendMessage delivery to Octo
+   d. session-store: append user message + assistant response
+7. Lock released → next queued message for this session proceeds
+```
+
+### Group Message
+
+Same as DM, with two additions:
+
+- **Mention gate** (step 5): message must contain bot's UID in `mention.uids` or have `mention.ais` set. `mention.all` (humans-only `@所有人`) does NOT trigger the bot.
+- **Group context** (step 6a): `refreshMembers` (hourly), then `buildContextSince` (only group messages newer than the per-channel cursor, within char budget), advance the cursor, then cache the current message AFTER reading the delta to prevent duplication. The group-context delta + any first-turn history block are prepended to the **user message** (not the system prompt, which is frozen); conversation continuity otherwise comes from the resumed SDK session.
+
+Non-mentioned group messages are still cached in `group-context` for future context windows but do not trigger agent invocation.
+
+## Concurrency Model
+
+```
+Session A msg1 ──▶ ┌──────────┐
+Session A msg2 ──▶ │ Lock "A" │ ──▶ serial (FIFO)
+Session A msg3 ──▶ └──────────┘
+
+Session B msg1 ──▶ ┌──────────┐
+Session B msg2 ──▶ │ Lock "B" │ ──▶ serial (FIFO)
+                   └──────────┘
+
+A and B run in parallel. Messages within the same session are strictly serialized.
+```
+
+The lock is a promise chain per session key (`Map<string, Promise<void>>`). This is deliberately simple — no worker threads, no job queues. The bottleneck is the Claude Agent SDK call (seconds to minutes), not the lock mechanism.
+
+Session keys: DM uses `from_uid` (private per peer); group uses `channel_id`
+alone — **a whole group shares one session** (history, working dir, and
+auto-memory). See the shared-group threat model below.
+
+## Security Model
+
+### Threat Model
+
+The bot accepts messages from any Octo user who can reach it. Users can send arbitrary text that becomes a Claude Code prompt. The attack surface is: **any Octo user can instruct Claude Code to do anything the tool whitelist allows within the working directory**.
+
+### Shared-group trust domain (important)
+
+A **group is a single trust domain**, not N isolated users. The session key for a
+group is the `channel_id` alone, so every member of a channel shares **one
+conversation history, one `bypassPermissions` working-directory sandbox, and one
+long-term auto-memory store**. Concretely, within a group any member can:
+
+- **Read and modify another member's working tree** — there is one cwd sandbox
+  per channel, not per member. Files one user has the agent create or edit are
+  visible and mutable by every other member's turns.
+- **Plant persistent facts in shared auto-memory** — member A can have the bot
+  "remember" attacker-controlled information that is later recalled into member
+  B's turn as trusted long-term memory. This **survives `/reset` and restarts**
+  (auto-memory is intentionally exempt from the 7-day cwd TTL).
+- **Influence shared context** — all members read the same history window.
+  User-authored display names (`from_name`) and message bodies are sanitized at
+  the storage layer so they cannot forge `[user …]:` / `[assistant …]:` turn
+  labels, but the *content* of what others said is still shared by design.
+
+DM sessions remain private per peer (`from_uid`). Per-bot isolation is absolute:
+each bot has its own `<baseDir>/<botId>/` subtree (data, workspace, memory).
+
+**Recommendation:** for groups with mutually-untrusted members, drop `Bash`
+(and ideally `Write`/`Edit`) from `allowedTools` and treat the group sandbox as
+collectively owned. If you need per-member isolation, run separate channels (or
+separate bots) — there is no per-(channel×user) split within one group.
+
+### Mitigations
+
+| Layer | Mechanism | Default |
+|---|---|---|
+| **Tool whitelist** | `allowedTools` restricts which Claude Code tools are available | `"*"` (every SDK tool) |
+| **Workspace isolation** | per-session sandbox under `<baseDir>/<botId>/workspace`; keep secrets out of the bot subtree | Derived, not configurable |
+| **System prompt** | Instructs agent to reject credential exfiltration, sensitive file reads, and arbitrary network requests | Hardcoded in `agent-bridge.ts` |
+| **Turn-label sanitization** | `from_name` stripped at write, role labels in content escaped at render — neither can forge a turn in shared history | Always on |
+| **Setting sources** | `settingSources: []` (SDK isolation) — the bot never reads/writes the operator's real `~/.claude` config | Default |
+| **Rate limiting** | Token bucket per session, configurable `maxPerMinute` | 5 req/min |
+| **Bot blocklist** | Prevents bot-to-bot loops | Empty by default |
+| **Process lock** | PID file prevents multiple instances competing for the same bot identity | `<baseDir>/<botId>/data/gateway.lock` |
+
+### Permission Mode
+
+`bypassPermissions` is the only viable mode for headless operation. Without a terminal to answer prompts, any other mode would cause the agent to hang indefinitely. This is an intentional design choice, not a workaround — security comes from the tool whitelist and cwd isolation, not from interactive permission prompts.
+
+### Reducing Attack Surface
+
+| Risk Level | `allowedTools` | Use Case |
+|---|---|---|
+| **Read-only** | `Read, Glob, Grep` | Code review, search, explanation |
+| **No shell** | `Read, Write, Edit, Glob, Grep` | Safe file editing |
+| **No network** | `Read, Write, Edit, Bash, Glob, Grep` | Full local automation |
+| **Full** (default) | All 8 tools | Maximum automation capability |
+
+### Known Cryptographic Weaknesses
+
+The WuKongIM protocol mandates specific cryptographic choices that cc-channel-octo must follow for compatibility:
+
+- **MD5 for AES key derivation.** The DH shared secret is hashed with MD5 to produce the AES-128 key. MD5 is cryptographically broken for collision resistance, but key derivation from a high-entropy DH secret is not vulnerable to collision attacks — the risk is theoretical, not practical. Replacing MD5 would break protocol compatibility with WuKongIM.
+- **AES-128-CBC without HMAC.** The protocol uses AES-128-CBC for message encryption without a separate MAC. This is susceptible to padding oracle attacks in theory, but the WebSocket transport is already TLS-encrypted, and the attacker model (modify ciphertext in transit) requires MITM on the TLS connection itself.
+- **crypto-js dependency.** AES and MD5 operations use `crypto-js` and `md5-typescript` instead of Node.js built-in `crypto`. These could be replaced to reduce supply chain risk, but would increase divergence from the upstream `openclaw-channel-octo` protocol layer, making security patch synchronization harder. Tracked as tech debt.
+
+These are protocol-level constraints, not implementation choices. Changing them requires WuKongIM server-side changes.
+
+### Known Dependency Risks
+
+Three cryptographic dependencies have low maintenance activity:
+
+| Package | Version | Last Published | Risk | Replacement Path |
+|---------|---------|---------------|------|------------------|
+| `crypto-js` | 4.2.0 | 2023-10-24 | CVE-2023-46233 (PBKDF2, not used here). No releases in 2+ years. | Node.js built-in `crypto.createCipheriv` / `crypto.createDecipheriv` for AES-128-CBC. Drop-in replacement, ~20 lines. |
+| `md5-typescript` | 1.0.5 | 2018-03-03 | No known CVEs. Unmaintained (8+ years). | Node.js built-in `crypto.createHash('md5')`. One-line replacement. |
+| `curve25519-js` | 0.0.4 | 2019-08-02 | No known CVEs. Unmaintained (7+ years). Pure JS implementation. | `@noble/curves` (actively maintained, audited). Requires API adaptation. |
+
+**Current assessment:** Production runtime risk is **low** — these libraries perform simple, well-understood operations (AES-CBC, MD5 hash, X25519 DH). No known exploitable vulnerabilities affect our usage patterns. The risk is supply chain (abandoned packages receiving no security patches) rather than functional.
+
+**Replacement plan:** Tracked as tech debt. Replace when (a) a CVE affects our usage, (b) we diverge from upstream `openclaw-channel-octo` anyway, or (c) a dependency audit policy requires actively maintained packages.
+
+## Persistence
+
+All persistent state lives in a single SQLite database (`data/cc-octo.db`):
+
+| Table | Purpose | Lifecycle |
+|---|---|---|
+| `sessions` | Session metadata (channel, timestamps) | 7-day TTL, cleaned on startup |
+| `messages` | Durable conversation record — NOT live prompt history. Used for first-turn/migration injection + stale-resume recovery. Live history lives in the SDK session (resumed each turn). | Cascade-deleted with session |
+| `group_members` | Cached group member uid↔name mappings | Refreshed hourly via API |
+| `group_messages` | Rolling group chat window (per channel) | Trimmed to ~2× window |
+| `group_context_cursors` | Per-channel consumption cursor — highest `group_messages.id` already injected, so only NEW group messages are added to the user message each turn | One row per channel |
+| `sdk_sessions` | Maps `sessionKey` → SDK session id for `resume` (the SDK session owns conversation history) | Cleared by `/reset` |
+| `reset_barriers` | `/reset` watermark so cold-start backfill can't resurrect cleared history | One row per session |
+
+SQLite is configured with WAL journal mode for concurrent read performance and `foreign_keys = ON` for referential integrity. The `db-adapter.ts` abstraction keeps the door open for `node:sqlite` migration.
+
+## Configuration Resolution
+
+```
+Hardcoded defaults
+       ▼
+config.json (file)     ← strips _-prefixed keys
+       ▼
+CC_OCTO_* env vars     ← highest priority
+       ▼
+Validation             ← botToken + apiUrl required
+       ▼
+Final Config object
+```
+
+All 14 config fields are overridable via environment variables. See [README.md](./README.md) for the full reference table.
+
+## Output Delivery
+
+### Text
+
+The stream relay delivers agent text via plain `sendMessage` with intelligent text splitting. Split priority: paragraph break (`\n\n`) > newline (`\n`) > space > hard cut (surrogate-pair safe). Maximum segment size: 3500 characters. Per-segment try/catch ensures one failed segment does not drop the rest.
+
+A typing indicator heartbeat runs at 5-second intervals so the user sees activity during long agent runs.
+
+### @mentions (G7)
+
+Before each `sendMessage` call, the relay runs `resolveMentions()` from `mention-utils.ts`:
+- **Structured form** `@[uid:displayName]` (preferred, generated from system prompt) — converted to `@displayName` with precise `MentionEntity` payload.
+- **Plain form** `@displayName` — resolved via optional `memberMap` (displayName → uid). Longest-prefix match handles names containing spaces.
+- **`@all` / `@所有人`** — detected and surfaced as `mentionAll: true`.
+
+Resolved `mentionUids`, `mentionEntities`, and `mentionAll` are attached to the outbound payload so the IM server can route notifications correctly.
+
+### Outbound media & rich text
+
+cc does not implement an internal media-upload or rich-text-send pipeline. Outbound
+media delivery is handled by the agent's octo-cli skill (`octo-cli file upload` +
+`octo-cli message send`), consistent with the skill-as-data model (see RUNTIME.md).
+cc only reads `getUploadCredentials` once at startup to discover the media CDN host
+(so inbound CDN-hosted image URLs pass URL-policy validation); it uploads nothing
+itself. Inbound media (downloading images the user sent) lives in `media-inbound.ts`
+/ `inbound.ts`.
+
+## Error Handling
+
+- **Agent errors:** Caught per-message, best-effort error reply sent to user, does not crash the process.
+- **WebSocket disconnects:** Exponential backoff reconnect (3s base, 60s max, ±25% jitter). Three consecutive rapid disconnects (<5s each) trigger token refresh instead of reconnect.
+- **Heartbeat failures:** Three consecutive API heartbeat failures trigger reconnect via token refresh.
+- **Token refresh:** 60-second cooldown prevents refresh storms. Re-registers bot and establishes new WebSocket connection.
+- **Process lock:** Stale PID detection via `kill(pid, 0)`. Active PID causes startup abort.
+
+## Relationship to openclaw-channel-octo
+
+cc-channel-octo and [openclaw-channel-octo](https://github.com/Mininglamp-OSS/openclaw-channel-octo) share the same Octo protocol layer (forked at v1.0.13) but serve different use cases:
+
+| | cc-channel-octo | openclaw-channel-octo |
+|---|---|---|
+| **Backend** | Claude Agent SDK (Claude Code) | OpenClaw gateway |
+| **Deployment** | Standalone process | OpenClaw plugin |
+| **Target user** | "Just Claude Code + Octo" | Full OpenClaw ecosystem |
+| **Protocol layer** | Forked, stripped (no OBO/media/COS) | Full feature set |
+
+The protocol fork is synchronized before each release: `diff` upstream, port security fixes, skip OpenClaw-specific features. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the synchronization procedure.
+
+## Future Directions
+
+- **Media support.** Image/file/voice message handling (v0.2).
+- **Multi-bot.** Multiple bot instances in one process with shared SQLite.
+- **Conversation branching.** `/reset`, `/context` commands for session management.
+- **Webhook mode.** HTTP webhook receiver as alternative to WebSocket for serverless deployments.

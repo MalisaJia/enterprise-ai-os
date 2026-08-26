@@ -1,0 +1,1147 @@
+package group
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/gocraft/dbr/v2"
+)
+
+// DB DB
+type DB struct {
+	ctx     *config.Context
+	session *dbr.Session
+}
+
+// NewDB NewDB
+func NewDB(ctx *config.Context) *DB {
+	return &DB{
+		ctx:     ctx,
+		session: ctx.DB(),
+	}
+}
+
+// InsertTx 插入群信息（含事务）
+func (d *DB) InsertTx(m *Model, tx *dbr.Tx) error {
+	_, err := tx.InsertInto("group").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
+	return err
+}
+
+// Insert 插入群信息
+func (d *DB) Insert(m *Model) error {
+	_, err := d.session.InsertInto("group").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
+	return err
+}
+
+// 修改群类型
+func (d *DB) UpdateGroupTypeTx(groupNo string, groupType GroupType, tx *dbr.Tx) error {
+	_, err := tx.Update("group").Set("group_type", int(groupType)).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// 修改群类型
+func (d *DB) UpdateGroupType(groupNo string, groupType GroupType) error {
+	_, err := d.session.Update("group").Set("group_type", int(groupType)).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// InsertMemberTx 插入群成员信息(带事务)
+func (d *DB) InsertMemberTx(m *MemberModel, tx *dbr.Tx) error {
+	_, err := tx.InsertInto("group_member").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
+	return err
+}
+
+// InsertMember 插入群成员信息
+func (d *DB) InsertMember(m *MemberModel) error {
+	_, err := d.session.InsertInto("group_member").Columns(util.AttrToUnderscore(m)...).Record(m).Exec()
+	return err
+}
+
+// DeleteMemberTx 删除群成员
+func (d *DB) DeleteMemberTx(groupNo string, uid string, version int64, tx *dbr.Tx) error {
+	_, err := tx.Update("group_member").Set("is_deleted", 1).Set("version", version).Where("group_no=? and uid=?", groupNo, uid).Exec()
+	return err
+}
+
+// DeleteMember 删除群成员
+func (d *DB) DeleteMember(groupNo string, uid string, version int64) error {
+	_, err := d.session.Update("group_member").Set("is_deleted", 1).Set("version", version).Where("group_no=? and uid=?", groupNo, uid).Exec()
+	return err
+}
+
+// 真实删除群成员
+func (d *DB) deleteMembersWithGroupNOTx(groupNo string, tx *dbr.Tx) error {
+	_, err := tx.DeleteFrom("group_member").Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// 通过vercode查询某个群成员
+func (d *DB) queryMemberWithVercode(vercode string) (*MemberModel, error) {
+	var memberModel *MemberModel
+	_, err := d.session.Select("*").From("group_member").Where("vercode=?", vercode).Load(&memberModel)
+	return memberModel, err
+}
+
+// 通过vercode查询某个群成员
+func (d *DB) queryMemberWithVercodes(vercodes []string) ([]*MemberGroupDetailModel, error) {
+	var memberModels []*MemberGroupDetailModel
+	_, err := d.session.Select("group_member.*,IFNULL(`group`.name,'') group_name").From("group_member").LeftJoin("group", "`group`.group_no=group_member.group_no").Where("group_member.vercode in ?", vercodes).Load(&memberModels)
+	return memberModels, err
+}
+
+// QueryIsGroupManagerOrCreator 是否是群管理者或创建者
+//
+// Fail-safe 过滤：
+//   - is_external=0：外部成员即使在 DB 中残留 role=creator/manager（历史脏数据或
+//     绕过 managerAdd 入口校验写入），也不视为该群的管理者。与 managerAdd /
+//     transferGrouper 的前置 is_external 校验构成双层防御（YUJ-231 / GH#1289，
+//     ReviewBot YUJ-230 P1）。
+//   - status=GroupMemberStatusNormal：黑名单 / 已退出但 is_deleted 仍为 0 的成员
+//     即便保留 role=creator/manager，也不视为有效管理者，避免被踢出的管理者继续
+//     调用敏感 API（PR #31 round-3，Jerry-Xin）。
+func (d *DB) QueryIsGroupManagerOrCreator(groupNo string, uid string) (bool, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("group_member").Where("group_no=? and uid=? and is_deleted=0 and is_external=0 and status=? and (role=? or role=?)", groupNo, uid, int(common.GroupMemberStatusNormal), MemberRoleCreator, MemberRoleManager).Load(&count)
+	return count > 0, err
+}
+
+// QueryIsGroupCreator 是否是群创建者
+func (d *DB) QueryIsGroupCreator(groupNo string, uid string) (bool, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("group_member").Where("group_no=? and uid=? and is_deleted=0 and role=?", groupNo, uid, MemberRoleCreator).Load(&count)
+	return count > 0, err
+}
+
+// QueryGroupManagerOrCreatorUIDS 查询管理者或创建者的uid
+func (d *DB) QueryGroupManagerOrCreatorUIDS(groupNo string) ([]string, error) {
+	var uids []string
+	_, err := d.session.Select("uid").From("group_member").Where("group_no=? and is_deleted=0 and (role=? or role=?)", groupNo, MemberRoleCreator, MemberRoleManager).Load(&uids)
+	return uids, err
+}
+
+func (d *DB) queryGroupMemberMaxVersion(groupNo string) (int64, error) {
+	var version int64
+	_, err := d.session.Select("IFNULL(max(version),0)").From("group_member").Where("group_no=?", groupNo).Load(&version)
+	return version, err
+}
+
+// UpdateMemberRoleTx 更新群成员角色
+func (d *DB) UpdateMemberRoleTx(groupNo string, uid string, role int, version int64, tx *dbr.Tx) error {
+	_, err := tx.Update("group_member").Set("role", role).Set("version", version).Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).Exec()
+	return err
+}
+
+// updateMemberForbiddenExpirTimeTx 修改成员禁言时长
+func (d *DB) updateMemberForbiddenExpirTimeTx(groupNo string, uid string, time int, version int64, tx *dbr.Tx) error {
+	_, err := tx.Update("group_member").Set("forbidden_expir_time", time).Set("version", version).Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).Exec()
+	return err
+}
+
+// UpdateMembersToManager 更新指定群成员为管理员
+func (d *DB) UpdateMembersToManager(groupNo string, members []string, version int64) error {
+	if len(members) <= 0 {
+		return nil
+	}
+	_, err := d.session.Update("group_member").Set("role", MemberRoleManager).Set("version", version).Where("group_no=? and uid in ? and is_deleted=0", groupNo, members).Exec()
+	return err
+}
+
+// UpdateManagersToMember 更新指定管理员为普通成员
+func (d *DB) UpdateManagersToMember(groupNo string, members []string, version int64) error {
+	if len(members) <= 0 {
+		return nil
+	}
+	_, err := d.session.Update("group_member").Set("role", MemberRoleCommon).Set("version", version).Where("group_no=? and uid in ? and is_deleted=0", groupNo, members).Exec()
+	return err
+}
+
+// ExistMember 群成员是否在群内
+func (d *DB) ExistMember(uid string, groupNo string) (bool, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("group_member").Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).Load(&count)
+	return count > 0, err
+}
+
+// ExistMemberActive 群成员是否在群内且处于正常状态（白名单语义，fail closed）。
+// 与 ExistMember 的差别：额外要求 status=GroupMemberStatusNormal，明确排除
+// Blacklist 以及未来可能新增的非正常状态。
+// 用于绕过 IM 层（直接读本地分表）的接口，避免被拉黑用户通过本地直查
+// 拿到本应被 IM datasource 拦截的消息。
+func (d *DB) ExistMemberActive(uid string, groupNo string) (bool, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("group_member").
+		Where("group_no=? and uid=? and is_deleted=0 and status=?",
+			groupNo, uid, common.GroupMemberStatusNormal).Load(&count)
+	return count > 0, err
+}
+
+// ExistMemberActiveInternal 是 ExistMemberActive 的收紧变体：在 is_deleted=0 AND
+// status=Normal 之外额外要求 is_external=0，即只把「内部活跃人类成员」视为存在。
+// 放开的群/子区改名门禁用它替代 ExistMemberActive，避免跨 Space 的外部成员
+// (is_external=1) 越权改名——旧的 QueryIsGroupManagerOrCreator 门禁本就带 is_external=0
+// 边界，放宽为活跃成员时必须保留该边界（YUJ-231 / GH#1289，P1）。
+func (d *DB) ExistMemberActiveInternal(uid string, groupNo string) (bool, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("group_member").
+		Where("group_no=? and uid=? and is_deleted=0 and is_external=0 and status=?",
+			groupNo, uid, common.GroupMemberStatusNormal).Load(&count)
+	return count > 0, err
+}
+
+// ExistCommonGroup 判定两个用户是否至少同属一个「未解散」的未退出群（两侧
+// is_deleted=0 且群 status<>GroupStatusDisband）。用于单聊频道详情的关系可见性判定：
+// 外部群里跨 Space 的非好友成员，既非好友也无共同 Space，仅靠共同群可达；不据此
+// 开放展示资料，群内成员名/头像会裂图。
+//
+// 必须关联 group 排除已解散群：解散（disband）只 UpdateStatusTx 改 group.status=2，
+// 成员清理是异步事件，成员行会在窗口期（或异步失败时）残留 is_deleted=0。若只查
+// group_member，两人仅共同属于已解散群也会被误判为「有共同群」，从而拿到完整个人
+// 资料——授权判定不能 fail-open 依赖异步清理。
+//
+// 用 status<>Disband 黑名单而非 status=Normal 白名单：GroupStatusDisabled(0) 是
+// 管理员可设的独立状态（api_manager.go 的 groupStatusUpdate 只翻 status、保留成员），
+// 全模块 liveness 检查一律只排除 Disband，禁用群仍是"活着的群"。若这里用白名单，
+// 两人唯一共同群被管理员禁用就会静默丢失互相可见性，正是 PERSON 分级要避免的裂图。
+//
+// 成员侧要求**双方** status=Normal：群黑名单（GroupMemberStatusBlacklist）只置
+// status、保留 is_deleted=0，若不排除，被某群拉黑的人仍能凭该群拿到对方完整资料。
+// 与子区门禁 ExistMemberActive 的口径一致（同一 PR 内两个新谓词不应互相矛盾）。
+// 降级后对方的名字/头像仍可渲染（最小集含 name/logo），不会裂图。
+//
+// SELECT 1 ... LIMIT 1 而非 COUNT(*)：这是存在性判断，且是本端点最热的读路径
+// （每次对无关系 peer 的 channelGet 都会走），让 MySQL 命中首行即停，不必枚举
+// 整个交集。
+func (d *DB) ExistCommonGroup(uidA string, uidB string) (bool, error) {
+	if uidA == "" || uidB == "" {
+		return false, nil
+	}
+	var exists int
+	_, err := d.session.SelectBySql(
+		"SELECT 1 FROM group_member m1 "+
+			"INNER JOIN group_member m2 ON m1.group_no = m2.group_no "+
+			"INNER JOIN `group` g ON g.group_no = m1.group_no "+
+			"WHERE m1.uid = ? AND m2.uid = ? AND m1.is_deleted = 0 AND m2.is_deleted = 0 "+
+			"AND m1.status = ? AND m2.status = ? AND g.status <> ? LIMIT 1",
+		uidA, uidB, common.GroupMemberStatusNormal, common.GroupMemberStatusNormal, GroupStatusDisband,
+	).Load(&exists)
+	return exists > 0, err
+}
+
+func (d *DB) existMembers(groupNos []string, uid string) ([]string, error) {
+	var results []string
+	_, err := d.session.Select("group_no").From("group_member").Where("group_no in ? and uid=? and is_deleted=0", groupNos, uid).Load(&results)
+	return results, err
+}
+
+// existMembersActive 是 existMembers 的白名单（fail closed）批量变体：在 is_deleted=0
+// 之外额外要求 status=GroupMemberStatusNormal，即把被拉黑（status=Blacklist）以及未来
+// 可能新增的非正常状态成员从结果里排除。
+// 与单群的 ExistMemberActive 语义一致，专供「子区(CommunityTopic)读/发门禁」这类绕过
+// IM datasource、直查本地分表的批量校验使用，避免被拉黑用户仍出现在“仍是成员”的集合里
+// 进而越权读子区历史/会话（YUJ-4185 CR 整改）。
+func (d *DB) existMembersActive(groupNos []string, uid string) ([]string, error) {
+	var results []string
+	_, err := d.session.Select("group_no").From("group_member").
+		Where("group_no in ? and uid=? and is_deleted=0 and status=?",
+			groupNos, uid, common.GroupMemberStatusNormal).Load(&results)
+	return results, err
+}
+
+// ExistMemberDelete 存在已删除的群成员数据
+func (d *DB) ExistMemberDelete(uid string, groupNo string) (bool, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("group_member").Where("group_no=? and uid=? and is_deleted=1", groupNo, uid).Load(&count)
+	return count > 0, err
+}
+
+// UpdateMemberTx 更新成员信息
+func (d *DB) UpdateMemberTx(member *MemberModel, tx *dbr.Tx) error {
+	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
+		"remark":     member.Remark,
+		"role":       member.Role,
+		"version":    member.Version,
+		"is_deleted": member.IsDeleted,
+		"invite_uid": member.InviteUID,
+	}).Where("group_no=? and uid=?", member.GroupNo, member.UID).Exec()
+	return err
+}
+
+// recoverMemberTx 恢复成员信息
+//
+// 删除是软删（DeleteMemberTx 只置 is_deleted=1），整行连同各种权限位都留在表里，
+// 所以复活时必须把**群授予的权限**显式重置，否则它们会跨越「离群 → 再入群」存活。
+// role 一直是这么做的（取调用方新建 model 的值，通常是 MemberRoleCommon）；
+// bot_admin 此前漏了 —— 群主给某 bot 授过 bot_admin 后，该 bot 的所有者把它撤走
+// 再拉回来，它就悄悄又是 bot 管理员，全程不需要群主参与。
+// 回到群里的成员一律视作新成员，权限要重新授。
+//
+// 注意：解除拉黑走的是 updateMembersStatus，不经过这里，因此不受影响。
+// 回归见 TestBotOwnerSelfRemoval_BotAdminDoesNotSurviveReAdd。
+func (d *DB) recoverMemberTx(member *MemberModel, tx *dbr.Tx) error {
+	_, err := tx.Update("group_member").SetMap(map[string]interface{}{
+		"remark":          member.Remark,
+		"role":            member.Role,
+		"bot_admin":       0,
+		"version":         member.Version,
+		"is_deleted":      0,
+		"invite_uid":      member.InviteUID,
+		"is_external":     member.IsExternal,
+		"source_space_id": member.SourceSpaceID,
+		"created_at":      dbr.Expr("Now()"),
+	}).Where("group_no=? and uid=?", member.GroupNo, member.UID).Exec()
+	return err
+}
+
+// UpdateMember 更新群成员
+func (d *DB) UpdateMember(member *MemberModel) error {
+	_, err := d.session.Update("group_member").SetMap(map[string]interface{}{
+		"remark":               member.Remark,
+		"role":                 member.Role,
+		"version":              member.Version,
+		"is_deleted":           member.IsDeleted,
+		"invite_uid":           member.InviteUID,
+		"forbidden_expir_time": member.ForbiddenExpirTime,
+	}).Where("group_no=? and uid=?", member.GroupNo, member.UID).Exec()
+	return err
+}
+
+// 修改群成员状态
+func (d *DB) updateMembersStatus(version int64, groupNo string, status int, uids []string) error {
+	_, err := d.session.Update("group_member").SetMap(map[string]interface{}{
+		"status":  status,
+		"version": version,
+	}).Where("group_no=? and uid in ?", groupNo, uids).Exec()
+	return err
+}
+
+// QueryWithGroupNo 根据群编号查询群信息
+func (d *DB) QueryWithGroupNo(groupNo string) (*Model, error) {
+	var model *Model
+	_, err := d.session.Select("*").From("`group`").Where("group_no=?", groupNo).Load(&model)
+	return model, err
+}
+
+// QueryWithGroupNo 根据群编号查询群信息
+func (d *DB) QueryWithGroupNos(groupNos []string) ([]*Model, error) {
+	var models []*Model
+	_, err := d.session.Select("*").From("`group`").Where("group_no in ?", groupNos).Load(&models)
+	return models, err
+}
+
+// queryThreadShortIDsByGroup 返回该群下所有"未删除"子区的 short_id（含归档）。
+// 解散事件用它把每个子区频道也推一遍 disband=1——子区在 WuKongIM 里是独立频道
+// （channel_type=5，channel_id=groupNo____shortId），其 disband 标记与父群相互
+// 独立，只推父群拦不住真人直连子区发送（已实测漏发）。
+//
+// 用裸 SQL 直查 thread 表（同库），而非 import thread 模块：thread 已 import
+// group，反向引用会形成包导入环（见 event.go 注释）。status!=Deleted(3) 与
+// thread 模块语义对齐（归档子区历史仍在、仍需拦发送）。
+func (d *DB) queryThreadShortIDsByGroup(groupNo string) ([]string, error) {
+	var shortIDs []string
+	_, err := d.session.
+		Select("short_id").From("thread").
+		Where("group_no=? AND status!=?", groupNo, 3).
+		Load(&shortIDs)
+	return shortIDs, err
+}
+
+func (d *DB) queryUserSupers(uid string) ([]*Model, error) {
+	var models []*Model
+	_, err := d.session.Select("`group`.*").From("group_member").LeftJoin("group", "group.group_no=group_member.group_no").Where("group.group_type=? and group.status=? and group_member.is_deleted=0 and group_member.uid=?", GroupTypeSuper, GroupStatusNormal, uid).Load(&models)
+	return models, err
+}
+
+// UpdateTx 更新群信息（带事务）
+func (d *DB) UpdateTx(model *Model, tx *dbr.Tx) error {
+	_, err := tx.Update("group").SetMap(map[string]interface{}{
+		"name":      model.Name,
+		"is_named":  model.IsNamed, // 原样回写当前值（改名不再改动 is_named；仅 #500 迁移回填存量老群为 1）
+		"notice":    model.Notice,
+		"creator":   model.Creator,
+		"status":    model.Status,
+		"version":   model.Version,
+		"forbidden": model.Forbidden,
+		"invite":    model.Invite,
+	}).Where("id=?", model.Id).Exec()
+	return err
+}
+
+// UpdateInviteTx 仅更新「进群邀请开关」与群版本（列级写，事务内）。
+// 不能用 UpdateTx 整行回写：groupUpdate 在同一请求里若同时带 name 与 invite，name 分支
+// 已通过 UpdateGroupInfo（独立 fresh load）提交了新 name，而 invite 分支若再用建链时载入
+// 的旧快照经 UpdateTx 全列回写，会把刚提交的 name 用旧值覆盖回去（改名被静默回滚）。
+// 列级写只动 invite/version，与并发的改名互不踩踏，也消除该读改写竞态。
+func (d *DB) UpdateInviteTx(groupNo string, invite int, version int64, tx *dbr.Tx) error {
+	_, err := tx.Update("group").SetMap(map[string]interface{}{
+		"invite":  invite,
+		"version": version,
+	}).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// UpdateStatusTx 仅更新「群状态」与群版本（列级写，事务内）。
+// disband() 不能用 UpdateTx 整行回写：行 183 的 SELECT 无锁，FOR UPDATE 行 233 只读
+// status 不刷新其他列，若并发 groupUpdate（改名/公告/禁言等）在窗口内提交了新值，
+// UpdateTx 全列回写会用旧快照覆盖并发修改（lost-update）。列级写只动 status/version，
+// 与并发的群设置变更互不踩踏，对齐 UpdateInviteTx 的设计。
+func (d *DB) UpdateStatusTx(groupNo string, status int, version int64, tx *dbr.Tx) error {
+	_, err := tx.Update("group").SetMap(map[string]interface{}{
+		"status":  status,
+		"version": version,
+	}).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// Update 更新群信息
+func (d *DB) Update(model *Model) error {
+	_, err := d.session.Update("group").SetMap(map[string]interface{}{
+		"name":                        model.Name,
+		"notice":                      model.Notice,
+		"creator":                     model.Creator,
+		"status":                      model.Status,
+		"version":                     model.Version,
+		"forbidden":                   model.Forbidden,
+		"invite":                      model.Invite,
+		"forbidden_add_friend":        model.ForbiddenAddFriend,
+		"allow_view_history_msg":      model.AllowViewHistoryMsg,
+		"allow_member_pinned_message": model.AllowMemberPinnedMessage,
+		"allow_external":              model.AllowExternal,
+		"allow_no_mention":            model.AllowNoMention,
+	}).Where("id=?", model.Id).Exec()
+	return err
+}
+
+func (d *DB) updateAvatar(avatar string, avatarVersion int64, groupNo string) error {
+	_, err := d.session.Update("group").SetMap(map[string]interface{}{
+		"avatar":           avatar,
+		"avatar_version":   avatarVersion,
+		"is_upload_avatar": 1,
+	}).Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// updateAvatarCustom 更新自定义群头像文字/颜色与群版本：text 非 nil 时写
+// avatar_text（空串表示清除自定义文字），setColor 为 true 时写 avatar_color（*int，
+// nil → NULL 清除自定义色），clearUploadedAvatar 为 true 时同一条 UPDATE 清除上传图
+// 优先级（is_upload_avatar=0）；始终 bump version。
+// 列级更新避免「读-改-写」竞态——并发只改文字 / 只改色不会互相覆盖对方的列。
+func (d *DB) updateAvatarCustom(groupNo string, text *string, setColor bool, color *int, clearUploadedAvatar bool, version int64) (int64, error) {
+	// updated_at 列是 DEFAULT CURRENT_TIMESTAMP 但**无** ON UPDATE，列级 UPDATE 不会自动
+	// 刷新，故显式写入，保证 GroupResp.updated_at 反映本次自定义头像变更。
+	setMap := map[string]interface{}{
+		"version":    version,
+		"updated_at": time.Now(),
+	}
+	if text != nil {
+		setMap["avatar_text"] = *text
+	}
+	if setColor {
+		setMap["avatar_color"] = color
+	}
+	if clearUploadedAvatar {
+		setMap["is_upload_avatar"] = 0
+	}
+	// status 入 WHERE，与服务层读取时的 disband 守卫对称：读到「未解散」之后、写入之前群
+	// 被并发解散时，这里命中 0 行而非把自定义头像写到已解散的死行上（关闭 TOCTOU）。
+	// version 每次都是新 GenSeq 值，匹配行必然变更，故 RowsAffected 反映的是「是否命中未
+	// 解散的群」；调用方据 RowsAffected==0 返回 not-found/disbanded。
+	res, err := d.session.Update("group").SetMap(setMap).
+		Where("group_no=? AND status<>?", groupNo, GroupStatusDisband).Exec()
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// QueryDetailWithGroupNo 查询群详情
+func (d *DB) QueryDetailWithGroupNo(groupNo string, uid string) (*DetailModel, error) {
+	var detailModel *DetailModel
+	_, err := d.session.Select("`group`.*,IFNULL(group_setting.version,0) + `group`.version  version,IFNULL(group_setting.chat_pwd_on,0) chat_pwd_on,IFNULL(group_setting.mute,0) mute,IFNULL(group_setting.top,0) top,IFNULL(group_setting.show_nick,0) show_nick,IFNULL(group_setting.save,0) save,IFNULL(group_setting.revoke_remind,1) revoke_remind,IFNULL(group_setting.join_group_remind,0) join_group_remind,IFNULL(group_setting.screenshot,1) screenshot,IFNULL(group_setting.receipt,1) receipt,IFNULL(group_setting.flame,0) flame,IFNULL(group_setting.flame_second,0) flame_second,IFNULL(group_setting.remark,'') remark").From("`group`").LeftJoin(`group_setting`, "`group`.group_no=group_setting.group_no and group_setting.uid=?").Where("`group`.group_no=?", uid, groupNo).Load(&detailModel)
+	return detailModel, err
+}
+
+// QueryDetailWithGroupNos 查询群集合
+func (d *DB) QueryDetailWithGroupNos(groupNos []string, uid string) ([]*DetailModel, error) {
+	if len(groupNos) <= 0 {
+		return nil, nil
+	}
+	var detailModels []*DetailModel
+	_, err := d.session.Select("`group`.*,IFNULL(group_setting.version,0) + `group`.version  version,IFNULL(group_setting.chat_pwd_on,0) chat_pwd_on,IFNULL(group_setting.mute,0) mute,IFNULL(group_setting.top,0) top,IFNULL(group_setting.show_nick,0) show_nick,IFNULL(group_setting.save,0) save,IFNULL(group_setting.revoke_remind,1) revoke_remind,IFNULL(group_setting.join_group_remind,0) join_group_remind,IFNULL(group_setting.screenshot,1) screenshot,IFNULL(group_setting.receipt,1) receipt,IFNULL(group_setting.flame,0) flame,IFNULL(group_setting.flame_second,0) flame_second,IFNULL(group_setting.remark,'') remark").From("`group`").LeftJoin(`group_setting`, "`group`.group_no=group_setting.group_no and group_setting.uid=?").Where("`group`.group_no in ?", uid, groupNos).Load(&detailModels)
+	return detailModels, err
+}
+
+// QueryGroupsWithGroupNos 通过群ID查询一批群信息
+func (d *DB) QueryGroupsWithGroupNos(groupNos []string) ([]*Model, error) {
+	if len(groupNos) <= 0 {
+		return nil, nil
+	}
+	var models []*Model
+	_, err := d.session.Select("*").From("`group`").Where("group_no in ?", groupNos).Load(&models)
+	return models, err
+}
+
+// QueryMemberWithUID 查询群成员
+func (d *DB) QueryMemberWithUID(uid string, groupNo string) (*MemberModel, error) {
+	var memberModel *MemberModel
+	_, err := d.session.Select("*").From("group_member").Where("uid=? and group_no=? and is_deleted=0", uid, groupNo).Load(&memberModel)
+	return memberModel, err
+}
+
+// QueryMembersWithUids 查询群内的指定成员
+func (d *DB) QueryMembersWithUids(uids []string, groupNo string) ([]*MemberModel, error) {
+	if len(uids) == 0 {
+		return nil, nil
+	}
+	var memberModels []*MemberModel
+	_, err := d.session.Select("*").From("group_member").Where("uid in ? and group_no=? and is_deleted=0", uids, groupNo).Load(&memberModels)
+	return memberModels, err
+}
+
+// QueryMembersWithStatus 通过成员状态查询成员
+func (d *DB) QueryMembersWithStatus(groupNo string, status int) ([]*MemberModel, error) {
+	var memberModels []*MemberModel
+	_, err := d.session.Select("*").From("group_member").Where("group_no=? and status=?", groupNo, status).Load(&memberModels)
+	return memberModels, err
+}
+
+// QueryMemberWithUIDAndGroupNos
+func (d *DB) QueryMemberWithUIDAndGroupNos(uid string, groupNos []string) ([]*MemberModel, error) {
+	var memberModels []*MemberModel
+	_, err := d.session.Select("*").From("group_member").Where("uid=? and group_no in ? and is_deleted=0", uid, groupNos).Load(&memberModels)
+	return memberModels, err
+}
+
+// QueryActiveMemberGroupNosWithUID 返回 uid 作为**活跃**成员所属的全部群编号。
+//
+// 判定口径与 ExistMemberActive 完全一致（is_deleted=0 AND status=Normal），
+// 是白名单式 fail-closed：被拉黑及将来新增的任何非 Normal 状态都不算成员。
+// 用作授权谓词的调用方必须用本方法而不是 QueryMemberWithUIDAndGroupNos —— 后者
+// 只看 is_deleted，会把被拉黑成员当作仍然在群。
+//
+// 只取 group_no 一列：调用方要的是「可见频道集合」，拉整行会在成员数多的账号上
+// 平白搬运一堆用不上的字段。走 group_member_uid 索引。
+func (d *DB) QueryActiveMemberGroupNosWithUID(uid string) ([]string, error) {
+	var groupNos []string
+	_, err := d.session.Select("group_no").From("group_member").
+		Where("uid=? and is_deleted=0 and status=?", uid, common.GroupMemberStatusNormal).
+		Load(&groupNos)
+	return groupNos, err
+}
+
+// SyncMembers 同步群成员
+func (d *DB) SyncMembers(groupNo string, version int64, limit uint64) ([]*MemberDetailModel, error) {
+
+	var details []*MemberDetailModel
+	builder := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,IFNULL(user.username,'') username,group_member.is_deleted,group_member.robot,group_member.version,group_member.invite_uid,group_member.forbidden_expir_time,group_member.bot_admin,group_member.is_external,group_member.source_space_id,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=?", groupNo).OrderDir("group_member.version", true)
+	var err error
+	if version <= 0 {
+		_, err = builder.Limit(limit).Load(&details)
+	} else {
+		_, err = builder.Where("group_member.version > ?", version).Limit(limit).Load(&details)
+	}
+
+	return details, err
+}
+
+// 通过名字关键字查询成员列表
+func (d *DB) queryMembersWithKeyword(groupNo string, loginUID string, keyword string, page uint64, limit uint64) ([]*MemberDetailModel, error) {
+	var details []*MemberDetailModel
+	var builder *dbr.SelectStmt
+	if keyword != "" {
+		builder = d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,IFNULL(user.username,'') username,group_member.is_deleted,group_member.robot,group_member.version,group_member.invite_uid,group_member.forbidden_expir_time,group_member.bot_admin,group_member.is_external,group_member.source_space_id,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").LeftJoin("user_setting", dbr.Expr("user_setting.uid=? and user_setting.to_uid=group_member.uid", loginUID)).Where("group_member.group_no=? and group_member.is_deleted=0 and group_member.status=1 and (group_member.remark like ? or user.name like ? or user_setting.remark like ?)", groupNo, "%"+keyword+"%", "%"+keyword+"%", "%"+keyword+"%").OrderAsc("group_member.created_at")
+	} else {
+		builder = d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,IFNULL(user.username,'') username,group_member.is_deleted,group_member.robot,group_member.version,group_member.invite_uid,group_member.forbidden_expir_time,group_member.bot_admin,group_member.is_external,group_member.source_space_id,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=? and group_member.is_deleted=0 and group_member.status=1", groupNo).OrderDesc(fmt.Sprintf("group_member.role=%d", MemberRoleCreator)).OrderDesc(fmt.Sprintf("group_member.role=%d", MemberRoleManager)).OrderAsc("group_member.created_at")
+	}
+	var err error
+	_, err = builder.Offset((page - 1) * limit).Limit(limit).Load(&details)
+
+	return details, err
+}
+
+func (d *DB) queryManagersWithGroupNos(groupNos []string) ([]*MemberDetailModel, error) {
+	var memberModels []*MemberDetailModel
+	_, err := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,group_member.is_deleted,group_member.version,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no in ? and group_member.is_deleted=0 and group_member.role<>0", groupNos).Load(&memberModels)
+	return memberModels, err
+}
+
+func (d *DB) queryMembersWithGroupNo(groupNo string) ([]*MemberDetailModel, error) {
+	var details []*MemberDetailModel
+	_, err := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,IFNULL(user.name,'') name,group_member.is_deleted,group_member.version,group_member.forbidden_expir_time,group_member.bot_admin,group_member.is_external,group_member.source_space_id,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=? and group_member.is_deleted=0", groupNo).Load(&details)
+	return details, err
+}
+
+func (d *DB) queryMemberWithGroupNoAndUID(groupNo, uid string) (*MemberDetailModel, error) {
+	var detail *MemberDetailModel
+	// group_member.robot 必须在选择列里：memberDetailResp.Robot 既是下发字段，
+	// 也是 fillBotOwnedByMe 的前置判据 —— 漏选会让 bot_owned_by_me 在本端点
+	// 恒为 false（静默失效，不报错）。见 TestMemberGet_ExposesBotOwnedByMe。
+	_, err := d.session.Select("group_member.id,group_member.vercode,group_member.uid,group_member.status,group_member.group_no,group_member.remark,group_member.role,group_member.invite_uid,IFNULL(user.name,'') name,group_member.is_deleted,group_member.version,group_member.forbidden_expir_time,group_member.robot,group_member.bot_admin,group_member.is_external,group_member.source_space_id,group_member.created_at,group_member.updated_at").From("group_member").LeftJoin("user", "group_member.uid=user.uid").Where("group_member.group_no=? and group_member.uid=? and group_member.is_deleted=0", groupNo, uid).Load(&detail)
+	return detail, err
+}
+func (d *DB) queryBlacklistMemberUIDsWithGroupNo(groupNo string) ([]string, error) {
+	var uids []string
+	_, err := d.session.Select("group_member.uid").From("group_member").Where("group_member.group_no=? and group_member.is_deleted=0 and status=?", groupNo, common.GroupMemberStatusBlacklist).Load(&uids)
+	return uids, err
+}
+
+// querySubscribableMemberUIDsWithGroupNo 返回某群「可订阅」成员 uid 集合：
+// is_deleted=0 AND status=GroupMemberStatusNormal，即排除被拉黑（status=blacklist）的成员。
+// 子区(channel_type=CommunityTopic) 实时下发的权威订阅源就读这份列表（thread/1module.go
+// Subscribers 回调），WuKongIM 缓存它做 WebSocket push。被拉黑成员若仍出现在这里，即使
+// 上层主动 IMRemoveSubscriber，下一次 WuKongIM 重载 Subscribers 仍会把他加回去 → 拉黑
+// 不自愈（YUJ-4185 P0-2 根因）。
+//
+// 与 queryMembersWithGroupNo（GetMembers，多处复用、语义是“所有非删除成员”）分开，
+// 不改动既有调用方语义；只有需要“能收实时推送的成员”的订阅数据源走这里。
+func (d *DB) querySubscribableMemberUIDsWithGroupNo(groupNo string) ([]string, error) {
+	var uids []string
+	_, err := d.session.Select("group_member.uid").
+		From("group_member").
+		Where("group_member.group_no=? and group_member.is_deleted=0 and status=?", groupNo, common.GroupMemberStatusNormal).
+		Load(&uids)
+	return uids, err
+}
+
+// 查询在线成员数量
+func (d *DB) queryMemberOnlineCount(groupNo string) (int64, error) {
+	var count int64
+	_, err := d.session.Select("count(DISTINCT user_online.uid)").From("group_member").LeftJoin("user_online", "group_member.uid=user_online.uid").Where("group_no=? and group_member.is_deleted=0 and user_online.online=1", groupNo).Load(&count)
+	return count, err
+}
+
+// QueryMembersFirstNine 查询最先加入群聊的九为群成员
+func (d *DB) QueryMembersFirstNine(groupNo string) ([]*MemberModel, error) {
+	var memberModels []*MemberModel
+	_, err := d.session.Select("*").From("group_member").Where("group_no=? and is_deleted=0", groupNo).OrderDir("created_at", true).Limit(9).Load(&memberModels)
+	return memberModels, err
+}
+
+// QueryMembersFirstNineExclude 查询最先加入群聊的九位群成员 【excludeUIDs】为排除的用户
+func (d *DB) QueryMembersFirstNineExclude(groupNo string, excludeUIDs []string) ([]*MemberModel, error) {
+	if len(excludeUIDs) <= 0 {
+		return d.QueryMembersFirstNine(groupNo)
+	}
+	var memberModels []*MemberModel
+	_, err := d.session.Select("*").From("group_member").Where("group_no=? and is_deleted=0 and uid not in ?", groupNo, excludeUIDs).OrderDir("created_at", true).Limit(9).Load(&memberModels)
+	return memberModels, err
+}
+
+// 成员是否在最先加入的9位成员内
+func (d *DB) membersInFirstNine(groupNo string, uids []string) (bool, error) {
+	if len(uids) == 0 {
+		return false, nil
+	}
+	var count int
+	err := d.session.SelectBySql("select count(*) from (select uid from group_member where group_no=? and is_deleted=0 order by created_at asc limit 9) t where t.uid in ?", groupNo, uids).LoadOne(&count)
+	return count > 0, err
+}
+
+// QueryMemberCount 查询群成员数量
+func (d *DB) QueryMemberCount(groupNo string) (int64, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("group_member").Where("group_no=? and is_deleted=0", groupNo).Load(&count)
+	return count, err
+}
+
+// 查询群总数
+func (d *DB) queryGroupCount() (int64, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("`group`").Load(&count)
+	return count, err
+}
+
+// 查询某天的新建群数量
+func (d *DB) queryCreatedCountWithDate(date string) (int64, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("`group`").Where("date_format(created_at,'%Y-%m-%d')=?", date).Load(&count)
+	return count, err
+}
+
+// querySavedGroups 查询我保存的群
+func (d *DB) querySavedGroups(uid string) ([]*DetailModel, error) {
+	var detailModels []*DetailModel
+	_, err := d.session.Select("`group`.*,IFNULL(group_setting.version,0) + `group`.version  version,IFNULL(group_setting.chat_pwd_on,0) chat_pwd_on,IFNULL(group_setting.mute,0) mute,IFNULL(group_setting.top,0) top,IFNULL(group_setting.show_nick,0) show_nick,IFNULL(group_setting.save,0) save,IFNULL(group_setting.remark,'') remark").From("`group`").LeftJoin(`group_setting`, "`group`.group_no=group_setting.group_no").Where("`group_setting`.save=1 and `group_setting`.uid=?", uid).Load(&detailModels)
+	return detailModels, err
+}
+
+// queryGroupsWithMemberUIDAndSpaceID 查询某用户在某 Space 下加入的所有群
+func (d *DB) queryGroupsWithMemberUIDAndSpaceID(memberUID string, spaceID string) ([]*Model, error) {
+	var models []*Model
+	_, err := d.session.Select("distinct `group`.*").From("`group`").LeftJoin("group_member", "`group`.group_no=group_member.group_no").Where("group_member.uid=? and group_member.is_deleted=0 and `group`.space_id=?", memberUID, spaceID).Load(&models)
+	return models, err
+}
+
+// 查询某个用户参与的所有群
+func (d *DB) queryGroupsWithMemberUID(memberUID string) ([]*Model, error) {
+	var models []*Model
+	_, err := d.session.Select("distinct `group`.*").From("`group`").LeftJoin("group_member", "`group`.group_no=group_member.group_no").Where("group_member.uid=? and group_member.is_deleted=0", memberUID).Load(&models)
+	return models, err
+}
+
+// 查询禁言时长到期成员
+func (d *DB) queryForbiddenExpirationTimeMembers(limit int64) ([]*MemberModel, error) {
+	var models []*MemberModel
+	_, err := d.session.Select("*").From("group_member").Where("forbidden_expir_time <>0 and unix_timestamp(now())-forbidden_expir_time>0").Limit(uint64(limit)).Load(&models)
+	return models, err
+}
+
+// 查询用户当天建群数量
+func (d *DB) querySameDayCreateCountWitUID(uid string, day string) (int, error) {
+	var count int
+	err := d.session.SelectBySql("SELECT COUNT(*) AS count FROM `group` WHERE creator=? AND DATE(created_at)=?", uid, day).LoadOne(&count)
+	return count, err
+}
+
+// ---------- model ----------
+
+// DetailModel 群详情
+type DetailModel struct {
+	Model
+	Mute            int    // 免打扰
+	Top             int    // 置顶
+	ShowNick        int    // 显示昵称
+	Save            int    // 是否保存
+	ChatPwdOn       int    //是否开启聊天密码
+	RevokeRemind    int    //撤回提醒
+	JoinGroupRemind int    // 进群提醒
+	Screenshot      int    //截屏通知
+	Receipt         int    //消息是否回执
+	Flame           int    // 是否开启阅后即焚
+	FlameSecond     int    // 阅后即焚秒数
+	Remark          string // 群备注
+}
+
+// Model 群db model
+type Model struct {
+	GroupNo                  string     // 群编号
+	GroupType                int        // 群类型 0.普通群 1.超大群
+	Name                     string     // 群名称
+	IsNamed                  int        // 1=改版前老群/0=新群；由 #500 迁移回填，新群恒为 0。默认头像取群名文字仅对 1 生效（grandfather 老群），新群一律双人图标
+	Avatar                   string     // 群头像
+	AvatarVersion            int64      // 群头像对象版本，0 表示旧版稳定路径
+	IsUploadAvatar           int        // 群头像是否已经被用户上传
+	AvatarText               string     // 自定义群头像文字；空时按 is_named 回退（老群取群名前2字，新群双人图标）
+	AvatarColor              *int       // 自定义群头像色板下标，nil(NULL) 表示按 group_no 派生
+	Notice                   string     // 群公告
+	Creator                  string     // 创建者uid
+	Status                   int        // 群状态
+	Version                  int64      // 版本号
+	Forbidden                int        // 是否全员禁言
+	Invite                   int        // 是否开启邀请确认 0.否 1.是
+	ForbiddenAddFriend       int        //群内禁止加好友
+	AllowViewHistoryMsg      int        // 是否允许新成员查看历史消息
+	AllowMemberPinnedMessage int        // 是否允许群成员置顶消息
+	Category                 string     // 群分类
+	SpaceID                  string     // Space ID
+	IsExternalGroup          int        // 外部群 0.否 1.是（自动维护）
+	AllowExternal            int        // 是否允许外部成员加入 1.允许(默认) 0.禁止
+	AllowNoMention           int        // 群级是否允许免@生效 1.允许(默认) 0.禁止（bot 在本群必须被@）
+	GroupMd                  *string    // GROUP.md content
+	GroupMdVersion           int64      // GROUP.md version
+	GroupMdUpdatedAt         *time.Time // GROUP.md last update time
+	GroupMdUpdatedBy         string     // GROUP.md last updater UID
+	db.BaseModel
+}
+
+// MemberModel 成员model
+type MemberModel struct {
+	GroupNo            string // 群编号
+	UID                string // 成员uid
+	Remark             string // 成员备注
+	Role               int    // 成员角色 1. 创建者	 2.管理员
+	Version            int64
+	Status             int    // 1.正常 2.黑名单
+	Vercode            string //验证码
+	IsDeleted          int    // 是否删除
+	InviteUID          string // 邀请者
+	Robot              int    // 机器人
+	ForbiddenExpirTime int64  // 禁言时长
+	IsExternal         int    // 外部成员 0.否 1.是
+	SourceSpaceID      string // 来源 Space ID（外部成员使用）
+	db.BaseModel
+}
+
+// MemberDetailModel 成员详情model
+type MemberDetailModel struct {
+	UID                string // 成员uid
+	GroupNo            string // 群编号
+	Name               string // 群成员名称
+	Remark             string // 成员备注
+	Role               int    // 成员角色
+	Version            int64
+	Vercode            string //验证码
+	InviteUID          string // 邀请人
+	IsDeleted          int    // 是否删除
+	Status             int    // 1.正常 2.黑名单
+	Username           string
+	Robot              int    // 机器人标识0.否1.是
+	ForbiddenExpirTime int64  // 禁言时长
+	BotAdmin           int    // Bot管理员 0.否 1.是
+	IsExternal         int    // 外部成员 0.否 1.是
+	SourceSpaceID      string // 来源 Space ID（外部成员使用）
+	db.BaseModel
+}
+
+type MemberGroupDetailModel struct {
+	GroupName string // 群名称
+	MemberModel
+}
+
+// GroupMdResult GROUP.md query result
+type GroupMdResult struct {
+	Content   string     `json:"content"`
+	Version   int64      `json:"version"`
+	UpdatedAt *time.Time `json:"updated_at"`
+	UpdatedBy string     `json:"updated_by"`
+}
+
+// QueryGroupMd queries GROUP.md content for a group
+func (d *DB) QueryGroupMd(groupNo string) (*GroupMdResult, error) {
+	var result *GroupMdResult
+	_, err := d.session.Select("IFNULL(group_md,'') as content, group_md_version as version, group_md_updated_at as updated_at, group_md_updated_by as updated_by").From("`group`").Where("group_no=?", groupNo).Load(&result)
+	return result, err
+}
+
+// UpdateGroupMd updates GROUP.md content and auto-increments version.
+// Uses a transaction to ensure UPDATE and SELECT LAST_INSERT_ID() share the same connection.
+func (d *DB) UpdateGroupMd(groupNo string, content string, updatedBy string) (int64, error) {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	_, err = tx.UpdateBySql(
+		"UPDATE `group` SET group_md=?, group_md_version=LAST_INSERT_ID(group_md_version+1), group_md_updated_at=NOW(), group_md_updated_by=? WHERE group_no=?",
+		content, updatedBy, groupNo,
+	).Exec()
+	if err != nil {
+		return 0, err
+	}
+	var newVersion int64
+	_, err = tx.SelectBySql("SELECT LAST_INSERT_ID()").Load(&newVersion)
+	if err != nil {
+		return 0, err
+	}
+	return newVersion, tx.Commit()
+}
+
+// DeleteGroupMd sets group_md=NULL and increments version.
+// Uses a transaction to ensure UPDATE and SELECT LAST_INSERT_ID() share the same connection.
+func (d *DB) DeleteGroupMd(groupNo string) (int64, error) {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	_, err = tx.UpdateBySql(
+		"UPDATE `group` SET group_md=NULL, group_md_version=LAST_INSERT_ID(group_md_version+1), group_md_updated_at=NOW(), group_md_updated_by='' WHERE group_no=?",
+		groupNo,
+	).Exec()
+	if err != nil {
+		return 0, err
+	}
+	var newVersion int64
+	_, err = tx.SelectBySql("SELECT LAST_INSERT_ID()").Load(&newVersion)
+	if err != nil {
+		return 0, err
+	}
+	return newVersion, tx.Commit()
+}
+
+// QueryIsBotAdmin checks if a member is a bot admin in the group
+func (d *DB) QueryIsBotAdmin(groupNo string, uid string) (bool, error) {
+	var count int64
+	_, err := d.session.Select("count(*)").From("group_member").Where("group_no=? and uid=? and is_deleted=0 and bot_admin=1", groupNo, uid).Load(&count)
+	return count > 0, err
+}
+
+// UpdateBotAdmin sets or unsets bot_admin for a group member
+func (d *DB) UpdateBotAdmin(groupNo string, uid string, isBotAdmin int, version int64) error {
+	_, err := d.session.Update("group_member").Set("bot_admin", isBotAdmin).Set("version", version).Where("group_no=? and uid=? and is_deleted=0", groupNo, uid).Exec()
+	return err
+}
+
+// QueryBotMemberUIDs returns UIDs of robot=1 members in the group
+func (d *DB) QueryBotMemberUIDs(groupNo string) ([]string, error) {
+	var uids []string
+	_, err := d.session.Select("uid").From("group_member").Where("group_no=? and is_deleted=0 and robot=1", groupNo).Load(&uids)
+	return uids, err
+}
+
+// QueryBotsInvitedByUIDTx 事务内查询群里由 inviterUID 所拥有的活跃 bot 成员 UID 列表，带 FOR UPDATE 行锁。
+//
+// D-2 cascade 语义（YUJ-49 / Mininglamp-OSS/octo-server#1186）：
+//   - Bot 进群本质是邀请关系延伸（#1182 已强制 inviter == robot.creator_uid）
+//   - inviter 离群（主动退 / 被踢）时，应同事务级联移除其所有 bot
+//
+// 只返回同时满足以下条件的 bot UID：
+//   - group_member.robot = 1 AND is_deleted = 0（仍在群内的 bot 成员）
+//   - robot.creator_uid = inviterUID AND robot.status = 1（仍活跃、且属于 inviter）
+//
+// 为什么是 INNER JOIN + status=1：与 checkBotOwnership（bot_ownership.go）保持一致，
+// 没有活跃 robot 行的 bot（孤儿 / 禁用）不视为任何人的 bot，不被级联。
+// 群主 / 其他管理员仍可通过常规移除成员接口清理它们。
+func (d *DB) QueryBotsInvitedByUIDTx(groupNo string, inviterUID string, requireCommonRole bool, tx *dbr.Tx) ([]string, error) {
+	if groupNo == "" || inviterUID == "" {
+		return nil, nil
+	}
+	var uids []string
+	// requireCommonRole 决定要不要额外排除被授予群角色的 bot。
+	//
+	// **false（既有三条路径：主动退群 / 被群主管理员移除 / 被拉黑）**：不过滤角色。
+	// #354 是写下来的产品决策 —— 「bot 永远跟随其主人，无角色例外」，连群主退群
+	// （角色已先行转让）都一视同仁。在这里加全局过滤会让「张三被踢 → 他名下的
+	// 管理员 bot 留在群里，而张三已不是成员、自助路径又拒绝角色 bot」，群里凭空
+	// 多出一个谁也管不动的特权 bot，拉黑流程下还带安全含义。
+	//
+	// **true（仅 bot 所有者自助移除）**：排除角色 bot。级联不经过 handler 的角色
+	// 守卫，若不收口，「bot A 拥有 Manager 角色的 bot B」时移除 A 会顺带删掉 B，
+	// 等于普通成员经级联越权移除了一个群管理员。robot.creator_uid 指向另一个 bot
+	// 是构造得出来的：BotFather 的命令链（messagesListen → HandleMessage →
+	// tryCreateBotCore）对「发送者是不是 bot」零过滤，挡在前面的只有
+	// checkSendPermission 的好友门 —— 守卫的强度不该依赖另一个模块的门。
+	// 被排除的角色 bot 不会失控：群主/管理员仍可经常规移除接口处置它们。
+	sql := "SELECT gm.uid FROM group_member gm " +
+		"INNER JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 " +
+		"WHERE gm.group_no = ? AND gm.robot = 1 AND gm.is_deleted = 0 "
+	args := []interface{}{groupNo}
+	if requireCommonRole {
+		sql += "AND gm.role = ? "
+		args = append(args, MemberRoleCommon)
+	}
+	sql += "AND r.creator_uid = ? FOR UPDATE"
+	args = append(args, inviterUID)
+
+	_, err := tx.SelectBySql(sql, args...).Load(&uids)
+	return uids, err
+}
+
+// QueryBotUIDsOwnedByUIDs 查询群内由 ownerUIDs 中任一用户名下（robot.creator_uid）
+// 的未删除 bot 成员 UID 列表。与 QueryBotsInvitedByUIDTx 同口径：只命中
+// group_member.robot=1 AND is_deleted=0 且 robot.status=1 的 bot；孤儿（无 robot 行）
+// 或禁用（status=0）bot 不视为任何人的 bot，不被级联。
+//
+// 非事务、无行锁版本，供拉黑/解除拉黑级联（#354）这类不开事务的路径使用：
+// 被拉黑用户的 bot 若不连带拉黑，用户可经 bot 旁路读群/子区内容，
+// 绕过 ExistMemberActive 加固线（#343/#345）。
+// 故意不过滤 group_member.status：解除拉黑时需要把已是 Blacklist 状态的 bot 一并恢复。
+func (d *DB) QueryBotUIDsOwnedByUIDs(groupNo string, ownerUIDs []string) ([]string, error) {
+	if groupNo == "" || len(ownerUIDs) == 0 {
+		return nil, nil
+	}
+	// 空字符串必须剔除：`creator_uid IN ('')` 会命中 creator_uid='' 的行，而那正是
+	// checkBotOwnership 判定为「无有效归属」的孤儿 bot 哨兵值。HTTP 调用方有鉴权
+	// 兜底不会传空，但 expandBlacklistTargetsWithOwnedBots 会转发请求方给的 uid 列表，
+	// 所以在这里收口，让导出契约与它声称的语义一致（fail closed）。
+	owners := make([]string, 0, len(ownerUIDs))
+	for _, uid := range ownerUIDs {
+		if uid != "" {
+			owners = append(owners, uid)
+		}
+	}
+	if len(owners) == 0 {
+		return nil, nil
+	}
+	ownerUIDs = owners
+	var uids []string
+	_, err := d.session.SelectBySql(
+		"SELECT gm.uid FROM group_member gm "+
+			"INNER JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 "+
+			"WHERE gm.group_no = ? AND gm.robot = 1 AND gm.is_deleted = 0 "+
+			"AND r.creator_uid IN ?",
+		groupNo, ownerUIDs,
+	).Load(&uids)
+	return uids, err
+}
+
+// QuerySecondOldestMemberExcludingBotsOf 选出第二元老成员（群主退群时的新群主人选），
+// 在 QuerySecondOldestMember 的基础上额外排除 leaverUID 名下（robot.creator_uid）的
+// 活跃 bot：#354 起群主退群也会级联带走自己的 bot，这些 bot 在同一事务内即将离群，
+// 不能被选为新群主（否则会出现「新群主刚上任就被级联删除」的孤儿群）。
+// 其他人的 bot 不受影响，保持与旧选主逻辑一致。
+func (d *DB) QuerySecondOldestMemberExcludingBotsOf(groupNo string, leaverUID string) (*MemberModel, error) {
+	var memberModel *MemberModel
+	_, err := d.session.SelectBySql(
+		"SELECT gm.* FROM group_member gm "+
+			"LEFT JOIN robot r ON r.robot_id = gm.uid AND r.status = 1 AND r.creator_uid = ? "+
+			"WHERE gm.group_no = ? AND gm.role <> ? AND gm.is_deleted = 0 "+
+			"AND r.robot_id IS NULL "+
+			"ORDER BY gm.created_at ASC LIMIT 1",
+		leaverUID, groupNo, MemberRoleCreator,
+	).Load(&memberModel)
+	return memberModel, err
+}
+
+// QueryExternalMemberCountTx 事务内查询群内「人类」外部成员数量（FOR UPDATE 行锁防并发）。
+// 排除 robot=1 的 bot 成员：is_external_group 的语义只反映人类外部成员是否存在，
+// bot 的 is_external + source_space_id 字段仅用于能力路由，不影响群的外部属性。
+// 详见 YUJ-48 / Mininglamp-OSS/octo-server#1184。
+func (d *DB) QueryExternalMemberCountTx(groupNo string, tx *dbr.Tx) (int64, error) {
+	var count int64
+	_, err := tx.SelectBySql(
+		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND is_external=1 AND is_deleted=0 AND robot=0 FOR UPDATE",
+		groupNo,
+	).Load(&count)
+	return count, err
+}
+
+// QueryExternalGroupNosForUser 查询用户作为外部成员加入的群列表，返回 groupNo -> sourceSpaceID
+func (d *DB) QueryExternalGroupNosForUser(uid string) (map[string]string, error) {
+	result := make(map[string]string)
+	if uid == "" {
+		return result, nil
+	}
+	var rows []struct {
+		GroupNo       string `db:"group_no"`
+		SourceSpaceID string `db:"source_space_id"`
+	}
+	_, err := d.session.SelectBySql(
+		"SELECT group_no, source_space_id FROM group_member WHERE uid=? AND is_external=1 AND is_deleted=0",
+		uid,
+	).Load(&rows)
+	if err != nil {
+		return result, err
+	}
+	for _, r := range rows {
+		result[r.GroupNo] = r.SourceSpaceID
+	}
+	return result, nil
+}
+
+// UpdateIsExternalGroup 更新群的 is_external_group 标记
+func (d *DB) UpdateIsExternalGroup(groupNo string, value int) error {
+	_, err := d.session.Update("group").
+		Set("is_external_group", value).
+		Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// memberExternalMarkerRow 是 queryMemberExternalMarkers 的内部扁平行结构。
+type memberExternalMarkerRow struct {
+	UID             string `db:"uid"`
+	IsExternal      int    `db:"is_external"`
+	SourceSpaceID   string `db:"source_space_id"`
+	SourceSpaceName string `db:"source_space_name"`
+}
+
+// queryMemberExternalMarkers 一次性拉取群内所有未删除成员的 is_external/source_space_id/source_space_name，
+// 供消息同步热路径 O(1) lookup。使用 LEFT JOIN space 以便即使来源 Space 不存在也不漏成员。
+// source_space_id 透传给上层，用于计算 home_space_id（YUJ-63 / #1208）。
+func (d *DB) queryMemberExternalMarkers(groupNo string) ([]*memberExternalMarkerRow, error) {
+	var rows []*memberExternalMarkerRow
+	_, err := d.session.SelectBySql(
+		"SELECT gm.uid AS uid, gm.is_external AS is_external, "+
+			"IFNULL(gm.source_space_id,'') AS source_space_id, "+
+			"IFNULL(s.name,'') AS source_space_name "+
+			"FROM group_member gm LEFT JOIN space s ON s.space_id = gm.source_space_id "+
+			"WHERE gm.group_no = ? AND gm.is_deleted = 0",
+		groupNo,
+	).Load(&rows)
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// UpdateIsExternalGroupTx 事务内更新群的 is_external_group 标记
+func (d *DB) UpdateIsExternalGroupTx(groupNo string, value int, tx *dbr.Tx) error {
+	_, err := tx.Update("group").
+		Set("is_external_group", value).
+		Where("group_no=?", groupNo).Exec()
+	return err
+}
+
+// QuerySourceSpaceIDForMember 查询某用户作为外部成员在指定群的 source_space_id
+// 非外部成员或不存在时返回空字符串
+func (d *DB) QuerySourceSpaceIDForMember(groupNo, uid string) (string, error) {
+	if groupNo == "" || uid == "" {
+		return "", nil
+	}
+	var sourceSpaceID string
+	err := d.session.SelectBySql(
+		"SELECT source_space_id FROM group_member WHERE group_no=? AND uid=? AND is_external=1 AND is_deleted=0",
+		groupNo, uid,
+	).LoadOne(&sourceSpaceID)
+	if err != nil && err != dbr.ErrNotFound {
+		return "", err
+	}
+	return sourceSpaceID, nil
+}
+
+// queryMemberExternalMarker 单成员版本的 queryMemberExternalMarkers，供 /users/{uid}?group_no
+// 路径使用。返回 nil, nil 表示 uid 不在群内 / 已删除。
+//
+// 单独抽函数而非复用 queryMemberExternalMarkers，因为群成员数可能达到上万，
+// 为单点接口全量拉取代价远高于一条点查；LEFT JOIN 空间换时间完全一致。
+func (d *DB) queryMemberExternalMarker(groupNo, uid string) (*memberExternalMarkerRow, error) {
+	if strings.TrimSpace(groupNo) == "" || strings.TrimSpace(uid) == "" {
+		return nil, nil
+	}
+	var row *memberExternalMarkerRow
+	_, err := d.session.SelectBySql(
+		"SELECT gm.uid AS uid, gm.is_external AS is_external, "+
+			"IFNULL(gm.source_space_id,'') AS source_space_id, "+
+			"IFNULL(s.name,'') AS source_space_name "+
+			"FROM group_member gm LEFT JOIN space s ON s.space_id = gm.source_space_id "+
+			"WHERE gm.group_no = ? AND gm.uid = ? AND gm.is_deleted = 0",
+		groupNo, uid,
+	).Load(&row)
+	if err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+type CategoryRow struct {
+	CategoryID string `db:"category_id"`
+	UID        string `db:"uid"`
+	SpaceID    string `db:"space_id"`
+	Status     int    `db:"status"`
+}
+
+func (d *DB) QueryCategoryByID(categoryID string) (*CategoryRow, error) {
+	var row *CategoryRow
+	_, err := d.session.Select("category_id", "uid", "space_id", "status").
+		From("group_category").Where("category_id=?", categoryID).Load(&row)
+	return row, err
+}
+
+// LockRemovableMemberTx 事务内锁定成员行并确认它现在仍然可被移除
+// （存在、未删除、且角色符合调用方要求）。
+//
+// 存在的理由是 RemoveGroupMembers 的角色过滤读的是事务外快照：目标可能在
+// 快照与删除之间被提升（群主转让接口、管理员任命，或并发的清理工单交接）。
+// DeleteMemberTx 的 WHERE 没有角色守卫，不锁内复核就会把新群主删掉，
+// 留下一个有成员却无群主、也无人重新选主的群。
+//
+// requireCommonRole 决定锁内这道门有多严：
+//   - false（既有语义）：只排除 Creator。管理端踢人、Space 级联等路径用它，
+//     群主/管理员本来就有权移除管理员。
+//   - true：只放行 MemberRoleCommon。bot 所有者自助移除用它 —— 该路径在事务外
+//     已拒绝一切非普通角色目标，锁内必须用同一口径收口，否则窗口内 Common→Manager
+//     的提升会通过重查、行真的被删，而且 removedUIDs 里有它、调用方的集合比对
+//     也发现不了，等于普通成员越权移除了一个群管理员。
+func (d *DB) LockRemovableMemberTx(groupNo string, uid string, requireCommonRole bool, tx *dbr.Tx) (bool, error) {
+	var roles []int
+	_, err := tx.SelectBySql(
+		"SELECT role FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0 FOR UPDATE",
+		groupNo, uid,
+	).Load(&roles)
+	if err != nil {
+		return false, err
+	}
+	if len(roles) == 0 {
+		return false, nil // 已离群
+	}
+	if requireCommonRole {
+		return roles[0] == MemberRoleCommon, nil
+	}
+	return roles[0] != MemberRoleCreator, nil
+}

@@ -1,0 +1,17 @@
+.wk-avatar {
+    display: block;
+    width: 40px;
+    height: 40px;
+    border-radius: var(--wk-avatar-radius, 50%);
+    object-fit: cover;
+    transition: border-radius 150ms ease;
+}
+
+/* Identity classes are kept for metadata hooks; shape stays unified. */
+.wk-avatar.wk-avatar-ai {
+    border-radius: var(--wk-avatar-radius, 50%);
+}
+
+.wk-avatar.wk-avatar-group {
+    border-radius: var(--wk-avatar-radius, 50%);
+}

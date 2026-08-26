@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
+    # converted_to_draft kept: creates "skipped" check entries satisfying required-check rules
+    branches: [main]
+    # paths-ignore intentionally removed — use changes preflight job instead
+    # (workflow-level path filters deadlock required status checks for docs-only PRs)
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".github/ISSUE_TEMPLATE/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@6852f92c20ea7fd3b0c25de3b5112db3a98da050 # v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # Positive patterns only — no negation, no predicate-quantifier needed.
+          # code=true when at least one changed file matches a source pattern.
+          # Docs-only PRs won't match any pattern -> code=false -> jobs skipped.
+          # (skipped jobs count as passing for required-check branch protection).
+          filters: |
+            code:
+              - 'create-openclaw-octo/**'
+              - '.github/workflows/**'
+
+  build:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: Build & Type-check (${{ matrix.package }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't cancel other OS jobs when one fails — we want to see all
+      # platform-specific failures in a single PR check, not have to push
+      # again to surface a Windows error after the macOS error is fixed.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - package: create-openclaw-octo
+            install_cmd: npm ci
+    defaults:
+      run:
+        working-directory: ${{ matrix.package }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: ${{ matrix.install_cmd }}
+
+      - name: Type-check
+        run: npm run type-check
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+  ci-gate:
+    name: CI Gate
+    # Aggregate gate: always runs so the required status check ALWAYS reports,
+    # even when path-filtered/matrix jobs are skipped on docs-only PRs. This is
+    # the robust pattern for required checks over path-filtered or matrix CI
+    # (a skipped matrix job collapses to a single un-suffixed context, so the
+    # per-combo contexts can never be safely required directly). Fails iff a
+    # needed job failed or was cancelled; 'skipped'/'success' count as passing.
+    # Branch protection should require ONLY the "CI Gate" context for this repo.
+    if: ${{ always() }}
+    needs: [changes, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify upstream CI results
+        env:
+          RESULTS: ${{ join(needs.*.result, ',') }}
+        run: |
+          set -euo pipefail
+          echo "needed job results: ${RESULTS}"
+          IFS=',' read -ra items <<< "${RESULTS}"
+          for r in "${items[@]}"; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::CI Gate: a required job concluded '${r}'"
+              exit 1
+            fi
+          done
+          echo "CI Gate: all required jobs passed or were skipped"

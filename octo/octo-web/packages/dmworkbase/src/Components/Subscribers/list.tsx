@@ -1,0 +1,540 @@
+import React, { Component } from "react";
+import Provider from "../../Service/Provider";
+import { SubscriberListVM } from "./list_vm";
+import { IconSearchStroked } from "@douyinfe/semi-icons";
+import "./list.css";
+import WKApp from "../../App";
+import {
+  Channel,
+  ChannelInfo,
+  ChannelInfoListener,
+  ChannelTypePerson,
+  Subscriber,
+} from "wukongimjssdk";
+import WKAvatar, { isBot } from "../WKAvatar";
+import AiBadge from "../AiBadge";
+import BotDetailModal from "../BotDetailModal";
+import { Checkbox } from "@douyinfe/semi-ui/lib/es/checkbox";
+import { Tag, Toast } from "@douyinfe/semi-ui";
+import { GroupRole } from "../../Service/Const";
+import { debounce, throttle } from "../../Utils/rateLimit";
+import { resolveExternalForViewer } from "../../Utils/externalViewer";
+import { isRealnameVerified } from "../../Utils/displayName";
+import { OnlineStatusBadge } from "../ConversationList";
+import RealnameVerifiedBadge from "../RealnameVerifiedBadge";
+import { I18nContext } from "../../i18n";
+import {
+  addCurrentImChannelInfoListener,
+  addCurrentImSubscriberChangeListener,
+  fetchCurrentImChannelInfo,
+  getCurrentImChannelInfo,
+} from "../../im-runtime/currentChannelRuntime";
+import { wkConfirm } from "../WKModal/confirm";
+
+export interface SubscriberListProps {
+  channel: Channel;
+  canSelect?: boolean; // 是否支持多选
+  singleSelect?: boolean; // 选择模式下是否只允许单选
+  disableSelectList?: string[]; // 禁选列表
+  onSelect?: (items: Subscriber[]) => void;
+  filter?: (subscriber: Subscriber) => boolean; // 过滤函数
+  /** 只显示真实人类成员，排除 AI/bot。基于 isBot(uid) 判断。 */
+  humansOnly?: boolean;
+  /** 可选的本地搜索实现；未提供时保持原有服务端搜索。 */
+  localSearch?: (keyword: string) => Subscriber[];
+  removeAction?: {
+    canRemove: (subscriber: Subscriber) => boolean;
+    onRemove: (subscriber: Subscriber) => Promise<void>;
+  };
+}
+
+export interface SubscriberListState {
+  selectedList: Subscriber[];
+  botDetailUid: string;
+  botDetailVisible: boolean;
+  removingUid?: string;
+}
+
+export class SubscriberList extends Component<
+  SubscriberListProps,
+  SubscriberListState
+> {
+  static contextType = I18nContext;
+  declare context: React.ContextType<typeof I18nContext>;
+
+  private channelInfoListener!: ChannelInfoListener;
+  private unsubscribeChannelInfoListener?: () => void;
+  private unsubscribeSubscriberChangeListener?: () => void;
+  // 当前已预取过 channelInfo 的 uid 集合，避免重复发请求
+  private prefetchedUids = new Set<string>();
+  private currentVM?: SubscriberListVM;
+
+  constructor(props: SubscriberListProps) {
+    super(props);
+    this.state = {
+      selectedList: [],
+      botDetailUid: "",
+      botDetailVisible: false,
+      removingUid: undefined,
+    };
+  }
+
+  componentDidMount() {
+    // 只响应当前成员列表内的 channel 变更，避免全局高频重渲
+    this.channelInfoListener = (channelInfo: ChannelInfo) => {
+      if (!channelInfo?.channel) return;
+      const uid = channelInfo.channel.channelID;
+      if (uid && this.prefetchedUids.has(uid)) {
+        this.setState({});
+      }
+    };
+    this.unsubscribeChannelInfoListener = addCurrentImChannelInfoListener(
+      this.channelInfoListener
+    );
+    this.unsubscribeSubscriberChangeListener =
+      addCurrentImSubscriberChangeListener((channel: Channel) => {
+        if (!channel?.isEqual?.(this.props.channel)) return;
+        this.currentVM?.refreshCurrentSearch();
+      });
+  }
+
+  componentWillUnmount() {
+    this.unsubscribeChannelInfoListener?.();
+    this.unsubscribeChannelInfoListener = undefined;
+    this.unsubscribeSubscriberChangeListener?.();
+    this.unsubscribeSubscriberChangeListener = undefined;
+    this.prefetchedUids.clear();
+    this.currentVM = undefined;
+  }
+
+  needShowOnlineStatus(uid: string): boolean {
+    const channelInfo = getCurrentImChannelInfo(
+      new Channel(uid, ChannelTypePerson)
+    );
+    if (!channelInfo) return false;
+    if (channelInfo.online) return true;
+    const btwTime = new Date().getTime() / 1000 - channelInfo.lastOffline;
+    return btwTime > 0 && btwTime < 60 * 60;
+  }
+
+  getOnlineTip(uid: string): string | undefined {
+    const channelInfo = getCurrentImChannelInfo(
+      new Channel(uid, ChannelTypePerson)
+    );
+    if (!channelInfo || channelInfo.online) return undefined;
+    const btwTime = new Date().getTime() / 1000 - channelInfo.lastOffline;
+    if (btwTime < 60) return this.context.t("base.subscribers.justNow");
+    return this.context.t("base.subscribers.minutesAgoShort", {
+      values: { count: (btwTime / 60).toFixed(0) },
+    });
+  }
+
+  // Store debounced search functions per VM instance
+  private debouncedSearchMap = new WeakMap<
+    SubscriberListVM,
+    (v: string) => void
+  >();
+
+  getDebouncedSearch = (vm: SubscriberListVM) => {
+    if (!this.debouncedSearchMap.has(vm)) {
+      this.debouncedSearchMap.set(
+        vm,
+        debounce((v: string) => {
+          vm.search(v);
+        }, 300)
+      );
+    }
+    return this.debouncedSearchMap.get(vm)!;
+  };
+
+  onSearch = (v: string, vm: SubscriberListVM) => {
+    this.getDebouncedSearch(vm)(v);
+  };
+
+  // Store throttled scroll handlers per VM instance
+  private throttledScrollMap = new WeakMap<
+    SubscriberListVM,
+    (e: React.UIEvent<HTMLDivElement>) => void
+  >();
+
+  getThrottledScroll = (vm: SubscriberListVM) => {
+    if (!this.throttledScrollMap.has(vm)) {
+      this.throttledScrollMap.set(
+        vm,
+        throttle((e: React.UIEvent<HTMLDivElement>) => {
+          const target = e.target as HTMLDivElement;
+          const offset = 200;
+          if (
+            target.scrollTop + target.clientHeight + offset >=
+            target.scrollHeight
+          ) {
+            vm.loadMoreSubscribersIfNeed();
+          }
+        }, 100)
+      );
+    }
+    return this.throttledScrollMap.get(vm)!;
+  };
+
+  handleScroll = (e: React.UIEvent<HTMLDivElement>, vm: SubscriberListVM) => {
+    this.getThrottledScroll(vm)(e);
+  };
+
+  // 获取显示名称
+  getShowName = (subscriber: Subscriber) => {
+    // 优先显示个人备注
+    const channelInfo = getCurrentImChannelInfo(
+      new Channel(subscriber.uid, ChannelTypePerson)
+    );
+    if (
+      channelInfo?.orgData?.remark &&
+      channelInfo.orgData.remark.trim() !== ""
+    ) {
+      return channelInfo.orgData.remark;
+    }
+
+    // 其次显示群内备注
+    if (subscriber.remark && subscriber.remark.trim() !== "") {
+      return subscriber.remark;
+    }
+
+    // 最后显示昵称
+    return subscriber.name;
+  };
+
+  onItemClick = (subscriber: Subscriber) => {
+    const { canSelect } = this.props;
+    if (!canSelect) {
+      // #105: Bot 成员点击弹 BotDetailModal 而非 UserInfo
+      if (isBot(subscriber.uid)) {
+        this.setState({ botDetailUid: subscriber.uid, botDetailVisible: true });
+        return;
+      }
+      WKApp.shared.baseContext.showUserInfo(subscriber.uid, this.props.channel);
+      return;
+    }
+    this.checkItem(subscriber);
+  };
+
+  isDisableItem(id: string) {
+    const { disableSelectList } = this.props;
+    if (disableSelectList && disableSelectList.length > 0) {
+      for (const disableSelect of disableSelectList) {
+        if (disableSelect === id) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  isCheckItem(item: Subscriber) {
+    const { selectedList } = this.state;
+    for (const selected of selectedList) {
+      if (selected.uid === item.uid) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  checkItem(item: Subscriber) {
+    const { selectedList } = this.state;
+    const { onSelect, singleSelect } = this.props;
+    const found = selectedList.findIndex(
+      (selected) => selected.uid === item.uid
+    );
+    let newSelectedList;
+    if (found >= 0) {
+      newSelectedList = [
+        ...selectedList.slice(0, found),
+        ...selectedList.slice(found + 1),
+      ];
+    } else if (singleSelect) {
+      newSelectedList = [item];
+    } else {
+      newSelectedList = [item, ...selectedList];
+    }
+
+    this.setState({
+      selectedList: newSelectedList,
+    });
+    if (onSelect) {
+      onSelect(newSelectedList);
+    }
+  }
+
+  onRemoveClick = (
+    event: React.MouseEvent<HTMLButtonElement>,
+    subscriber: Subscriber,
+    vm: SubscriberListVM
+  ) => {
+    event.stopPropagation();
+    const { removeAction } = this.props;
+    if (!removeAction || !removeAction.canRemove(subscriber)) return;
+    const name = this.getShowName(subscriber);
+    // Bot 成员用「移出机器人」措辞（octo-web#1511）：走到这一步的 bot 多半是
+    // 查看者自己的，而通用的「移除成员」读起来像在踢人。
+    const targetIsBot =
+      isBot(subscriber.uid) || subscriber?.orgData?.robot === 1;
+
+    wkConfirm({
+      title: this.context.t(
+        targetIsBot
+          ? "base.subscribers.confirmRemoveBotTitle"
+          : "base.subscribers.confirmRemoveTitle"
+      ),
+      content: this.context.t(
+        targetIsBot
+          ? "base.subscribers.confirmRemoveBotContent"
+          : "base.subscribers.confirmRemoveContent",
+        {
+          values: { name },
+        }
+      ),
+      okText: this.context.t("base.subscribers.remove"),
+      okType: "danger",
+      onOk: async () => {
+        this.setState({ removingUid: subscriber.uid });
+        try {
+          await removeAction.onRemove(subscriber);
+          vm.removeSubscriber(subscriber.uid);
+          Toast.success(this.context.t("base.subscribers.removeSuccess"));
+        } catch (error: unknown) {
+          const message =
+            error &&
+            typeof error === "object" &&
+            "msg" in error &&
+            typeof error.msg === "string"
+              ? error.msg
+              : this.context.t("base.subscribers.removeFailed");
+          Toast.error(message);
+          throw error;
+        } finally {
+          this.setState({ removingUid: undefined });
+        }
+      },
+    });
+  };
+
+  // 批量预取成员 channelInfo（含在线状态），去重避免重复请求
+  prefetchSubscribersChannelInfo = (subscribers: Subscriber[]) => {
+    for (const item of subscribers) {
+      if (this.prefetchedUids.has(item.uid)) continue;
+      this.prefetchedUids.add(item.uid);
+      const ch = new Channel(item.uid, ChannelTypePerson);
+      if (!getCurrentImChannelInfo(ch)) {
+        void fetchCurrentImChannelInfo(ch);
+      }
+    }
+  };
+
+  getRoleName = (item: Subscriber) => {
+    if (item.role === GroupRole.owner) {
+      return this.context.t("base.subscribers.role.owner");
+    } else if (item.role === GroupRole.manager) {
+      return this.context.t("base.subscribers.role.manager");
+    } else {
+      return "";
+    }
+  };
+
+  render() {
+    const { canSelect, removeAction } = this.props;
+    return (
+      <>
+        <Provider
+          create={() => {
+            const vm = new SubscriberListVM(
+              this.props.channel,
+              this.props.humansOnly
+                ? (subscriber: Subscriber) => !isBot(subscriber.uid)
+                : this.props.filter,
+              this.props.localSearch
+            );
+            // 在数据加载完成的回调中触发预取，避免在 render 内产生副作用
+            vm.onSubscribersLoaded = (subscribers) => {
+              this.prefetchSubscribersChannelInfo(subscribers);
+            };
+            this.currentVM = vm;
+            return vm;
+          }}
+          render={(vm: SubscriberListVM) => {
+            this.currentVM = vm;
+            return (
+              <div
+                className="wk-subscrierlist"
+                onScroll={(e) => {
+                  this.handleScroll(e, vm);
+                }}
+              >
+                <div className="wk-indextable-search-box">
+                  <div className="wk-indextable-search-icon">
+                    <IconSearchStroked className="wk-subscrierlist-search-icon" />
+                  </div>
+                  <div className="wk-indextable-search-input">
+                    <input
+                      onChange={(v) => {
+                        this.onSearch(v.target.value, vm);
+                      }}
+                      placeholder={this.context.t(
+                        "base.subscribers.searchPlaceholder"
+                      )}
+                      ref={(rf) => {}}
+                      type="text"
+                    />
+                  </div>
+                </div>
+                <div className="wk-subscrierlist-list">
+                  {vm.subscribers.map((item) => {
+                    const itemIsBot = isBot(item.uid);
+                    const isBotAdmin = item.orgData?.bot_admin === 1;
+                    // 外部 Tag 与来源按当前查看 Space 相对渲染。
+                    // 优先新字段 home_space_id / home_space_name，缺失时回落旧字段。
+                    const {
+                      isExternal: isExternalToViewer,
+                      sourceSpaceName: viewerSourceSpaceName,
+                    } = resolveExternalForViewer({
+                      homeSpaceId: item.orgData?.home_space_id,
+                      homeSpaceName: item.orgData?.home_space_name,
+                      isExternalLegacy: item.orgData?.is_external,
+                      sourceSpaceNameLegacy: item.orgData?.source_space_name,
+                    });
+                    const showOnline = this.needShowOnlineStatus(item.uid);
+                    const onlineTip = this.getOnlineTip(item.uid);
+
+                    return (
+                      <div
+                        className="wk-subscrierlist-list-item"
+                        key={item.uid}
+                        onClick={() => {
+                          this.onItemClick(item);
+                        }}
+                      >
+                        {canSelect ? (
+                          <div className="wk-indextable-checkbox">
+                            <Checkbox
+                              checked={
+                                this.isDisableItem(item.uid) ||
+                                this.isCheckItem(item)
+                              }
+                              disabled={this.isDisableItem(item.uid)}
+                            ></Checkbox>
+                          </div>
+                        ) : undefined}
+                        <div className="wk-subscrierlist-item-avatar">
+                          <WKAvatar src={item.avatar}></WKAvatar>
+                          {showOnline && (
+                            <div className="wk-subscrierlist-item-online-badge">
+                              <OnlineStatusBadge tip={onlineTip} />
+                            </div>
+                          )}
+                        </div>
+                        <div className="wk-subscrierlist-item-content">
+                          <div className="wk-subscrierlist-item-name">
+                            {this.getShowName(item)}
+                            {/* Epic dmwork-web#1169 Phase A: 实名徽章
+                              （icon variant）紧贴姓名右侧，已实名才渲染。
+                              Bot 走同样规则（isRealnameVerified
+                              对非实名 bot 返回 false，不会出现 Bot + 实名 同时显示）。*/}
+                            {isRealnameVerified(item.orgData) && (
+                              <RealnameVerifiedBadge variant="icon" />
+                            )}
+                            {/* 「@SpaceName」后缀（企微风格），按当前查看 Space 相对渲染。
+                              观察者 home_space 与成员 home_space 不同时显示；自己看自己不显示。
+                              Bot 成员走同一规则（resolveExternalForViewer 对 bot 与人类对称）。*/}
+                            {isExternalToViewer && viewerSourceSpaceName && (
+                              <span
+                                className="wk-subscrierlist-item-space"
+                                title={`@${viewerSourceSpaceName}`}
+                              >
+                                @{viewerSourceSpaceName}
+                              </span>
+                            )}
+                            {itemIsBot && <AiBadge />}
+                            {itemIsBot && isBotAdmin && (
+                              <Tag
+                                size="small"
+                                color="green"
+                                style={{ marginLeft: 4 }}
+                              >
+                                {this.context.t("base.subscribers.botAdmin")}
+                              </Tag>
+                            )}
+                          </div>
+                          <div
+                            className={`wk-subscrierlist-item-desc${
+                              item.role === GroupRole.owner
+                                ? " wk-subscrierlist-item-desc-owner"
+                                : item.role === GroupRole.manager
+                                ? " wk-subscrierlist-item-desc-manager"
+                                : ""
+                            }`}
+                          >
+                            {this.getRoleName(item)}
+                          </div>
+                        </div>
+                        {removeAction && removeAction.canRemove(item) ? (
+                          <button
+                            type="button"
+                            className="wk-subscrierlist-item-remove"
+                            aria-label={this.context.t(
+                              "base.subscribers.remove"
+                            )}
+                            disabled={this.state.removingUid === item.uid}
+                            onClick={(event) =>
+                              this.onRemoveClick(event, item, vm)
+                            }
+                          >
+                            <svg
+                              aria-hidden="true"
+                              className="wk-subscrierlist-item-remove-icon"
+                              viewBox="0 0 20 20"
+                            >
+                              <path
+                                d="M9 9.25a3.25 3.25 0 1 0 0-6.5 3.25 3.25 0 0 0 0 6.5Z"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth="1.5"
+                              />
+                              <path
+                                d="M3.5 16.5c.58-2.82 2.63-4.5 5.5-4.5 1.02 0 1.94.22 2.71.64"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth="1.5"
+                              />
+                              <path
+                                d="M13.5 15.25h4"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeLinecap="round"
+                                strokeWidth="1.5"
+                              />
+                            </svg>
+                          </button>
+                        ) : undefined}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          }}
+        ></Provider>
+        <BotDetailModal
+          uid={this.state.botDetailUid}
+          visible={this.state.botDetailVisible}
+          onClose={() => this.setState({ botDetailVisible: false })}
+          onChat={(channel) => {
+            WKApp.endpoints.showConversation(channel);
+            this.setState({ botDetailVisible: false });
+          }}
+        />
+      </>
+    );
+  }
+}

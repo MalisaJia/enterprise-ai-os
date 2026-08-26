@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/contentLayout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/homeColor"
+    android:orientation="vertical">
+
+    <include layout="@layout/wk_title_bar_layout" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginEnd="16dp"
+        android:layout_marginTop="20dp"
+        android:background="@drawable/bg_me_card"
+        android:gravity="center_horizontal"
+        android:orientation="horizontal"
+        android:paddingTop="20dp"
+        android:paddingBottom="20dp">
+
+        <LinearLayout
+            android:id="@+id/systemLayout"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center_horizontal"
+            android:orientation="vertical">
+
+            <androidx.appcompat.widget.AppCompatImageView
+                android:layout_width="80dp"
+                android:layout_height="141dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_appearance_system" />
+
+            <TextView
+                android:id="@+id/systemTv"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/appearance_system"
+                android:textColor="@color/colorDark"
+                android:textSize="13sp" />
+
+            <View
+                android:id="@+id/systemRadio"
+                android:layout_width="18dp"
+                android:layout_height="18dp"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_radio_unselected" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/lightLayout"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center_horizontal"
+            android:orientation="vertical">
+
+            <androidx.appcompat.widget.AppCompatImageView
+                android:layout_width="80dp"
+                android:layout_height="141dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_appearance_light" />
+
+            <TextView
+                android:id="@+id/lightTv"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/appearance_light"
+                android:textColor="@color/colorDark"
+                android:textSize="13sp" />
+
+            <View
+                android:id="@+id/lightRadio"
+                android:layout_width="18dp"
+                android:layout_height="18dp"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_radio_unselected" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/darkLayout"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center_horizontal"
+            android:orientation="vertical">
+
+            <androidx.appcompat.widget.AppCompatImageView
+                android:layout_width="80dp"
+                android:layout_height="141dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_appearance_dark" />
+
+            <TextView
+                android:id="@+id/darkTv"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/appearance_dark"
+                android:textColor="@color/colorDark"
+                android:textSize="13sp" />
+
+            <View
+                android:id="@+id/darkRadio"
+                android:layout_width="18dp"
+                android:layout_height="18dp"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_radio_unselected" />
+        </LinearLayout>
+    </LinearLayout>
+</LinearLayout>

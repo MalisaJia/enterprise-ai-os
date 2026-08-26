@@ -1,0 +1,323 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/homeColor"
+    android:orientation="vertical">
+
+    <include layout="@layout/wk_title_bar_layout" />
+
+    <com.scwang.smart.refresh.layout.SmartRefreshLayout
+        android:id="@+id/refreshLayout"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <androidx.core.widget.NestedScrollView
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:paddingTop="12dp"
+                android:paddingBottom="30dp">
+
+                <!-- Group 1: 实名认证 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:layout_marginEnd="16dp"
+                    android:background="@drawable/bg_me_card"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:id="@+id/realnameLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="52dp"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal"
+                        android:paddingStart="16dp"
+                        android:paddingEnd="16dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/realname_verification"
+                            android:textColor="@color/colorDark"
+                            android:textSize="16sp" />
+
+                        <TextView
+                            android:id="@+id/realnameStatusTv"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginEnd="6dp"
+                            android:textColor="@color/color999"
+                            android:textSize="14sp" />
+
+                        <androidx.appcompat.widget.AppCompatImageView
+                            android:id="@+id/realnameArrowIv"
+                            android:layout_width="7dp"
+                            android:layout_height="12dp"
+                            android:src="@drawable/ic_arrow_right" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <!-- Group 2: 语言 / 存储空间 / 隐私 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:layout_marginEnd="16dp"
+                    android:layout_marginTop="12dp"
+                    android:background="@drawable/bg_me_card"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:id="@+id/languageLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="52dp"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal"
+                        android:paddingStart="16dp"
+                        android:paddingEnd="16dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/language"
+                            android:textColor="@color/colorDark"
+                            android:textSize="16sp" />
+
+                        <TextView
+                            android:id="@+id/languageValueTv"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginEnd="6dp"
+                            android:textColor="@color/color999"
+                            android:textSize="14sp" />
+
+                        <androidx.appcompat.widget.AppCompatImageView
+                            android:layout_width="7dp"
+                            android:layout_height="12dp"
+                            android:src="@drawable/ic_arrow_right" />
+                    </LinearLayout>
+
+                    <View
+                        android:layout_width="match_parent"
+                        android:layout_height="0.5dp"
+                        android:layout_marginStart="16dp"
+                        android:layout_marginEnd="16dp"
+                        android:background="@color/dividerColor" />
+
+                    <LinearLayout
+                        android:id="@+id/clearImgCacheLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="52dp"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal"
+                        android:paddingStart="16dp"
+                        android:paddingEnd="16dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/storage_space"
+                            android:textColor="@color/colorDark"
+                            android:textSize="16sp" />
+
+                        <TextView
+                            android:id="@+id/imageCacheTv"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginEnd="6dp"
+                            android:textColor="@color/color999"
+                            android:textSize="14sp" />
+
+                        <androidx.appcompat.widget.AppCompatImageView
+                            android:layout_width="7dp"
+                            android:layout_height="12dp"
+                            android:src="@drawable/ic_arrow_right" />
+                    </LinearLayout>
+
+                    <View
+                        android:layout_width="match_parent"
+                        android:layout_height="0.5dp"
+                        android:layout_marginStart="16dp"
+                        android:layout_marginEnd="16dp"
+                        android:background="@color/dividerColor" />
+
+                    <LinearLayout
+                        android:id="@+id/thirdShareLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="52dp"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal"
+                        android:paddingStart="16dp"
+                        android:paddingEnd="16dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/privacy"
+                            android:textColor="@color/colorDark"
+                            android:textSize="16sp" />
+
+                        <androidx.appcompat.widget.AppCompatImageView
+                            android:layout_width="7dp"
+                            android:layout_height="12dp"
+                            android:src="@drawable/ic_arrow_right" />
+                    </LinearLayout>
+
+                    <View
+                        android:layout_width="match_parent"
+                        android:layout_height="0.5dp"
+                        android:layout_marginStart="16dp"
+                        android:layout_marginEnd="16dp"
+                        android:background="@color/dividerColor" />
+
+                    <LinearLayout
+                        android:id="@+id/sdkShareLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="52dp"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal"
+                        android:paddingStart="16dp"
+                        android:paddingEnd="16dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/third_party_sharing_list"
+                            android:textColor="@color/colorDark"
+                            android:textSize="16sp" />
+
+                        <androidx.appcompat.widget.AppCompatImageView
+                            android:layout_width="7dp"
+                            android:layout_height="12dp"
+                            android:src="@drawable/ic_arrow_right" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <!-- Group 3: 关于 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:layout_marginEnd="16dp"
+                    android:layout_marginTop="12dp"
+                    android:background="@drawable/bg_me_card"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:id="@+id/aboutLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="52dp"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal"
+                        android:paddingStart="16dp"
+                        android:paddingEnd="16dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/about"
+                            android:textColor="@color/colorDark"
+                            android:textSize="16sp" />
+
+                        <TextView
+                            android:id="@+id/aboutVersionTv"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginEnd="6dp"
+                            android:textColor="@color/color999"
+                            android:textSize="14sp" />
+
+                        <androidx.appcompat.widget.AppCompatImageView
+                            android:id="@+id/newVersionIv"
+                            android:layout_width="30dp"
+                            android:layout_height="20dp"
+                            android:layout_marginEnd="6dp"
+                            android:src="@mipmap/icon_new_version"
+                            android:visibility="invisible" />
+
+                        <androidx.appcompat.widget.AppCompatImageView
+                            android:layout_width="7dp"
+                            android:layout_height="12dp"
+                            android:src="@drawable/ic_arrow_right" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <!-- Group 4: 注销账号 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:layout_marginEnd="16dp"
+                    android:layout_marginTop="12dp"
+                    android:background="@drawable/bg_me_card"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:id="@+id/destroyAccountLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="52dp"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal"
+                        android:paddingStart="16dp"
+                        android:paddingEnd="16dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="@string/destroy_account"
+                            android:textColor="@color/colorDark"
+                            android:textSize="16sp" />
+
+                        <androidx.appcompat.widget.AppCompatImageView
+                            android:layout_width="7dp"
+                            android:layout_height="12dp"
+                            android:src="@drawable/ic_arrow_right" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <!-- Group 5: 退出登录 (red outlined button) -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="16dp"
+                    android:layout_marginEnd="16dp"
+                    android:layout_marginTop="16dp"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:id="@+id/loginOutTv"
+                        android:layout_width="match_parent"
+                        android:layout_height="48dp"
+                        android:background="@drawable/bg_logout_btn"
+                        android:gravity="center"
+                        android:text="@string/login_out"
+                        android:textColor="#F65E58"
+                        android:textSize="16sp" />
+                </LinearLayout>
+
+                <!-- Hidden layouts for compatibility -->
+                <LinearLayout
+                    android:id="@+id/chatBgLayout"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:visibility="gone" />
+            </LinearLayout>
+        </androidx.core.widget.NestedScrollView>
+    </com.scwang.smart.refresh.layout.SmartRefreshLayout>
+</LinearLayout>

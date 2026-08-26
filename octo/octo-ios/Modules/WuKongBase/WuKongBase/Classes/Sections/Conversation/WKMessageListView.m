@@ -1,0 +1,4296 @@
+//
+//  WKConversationView.m
+//  WuKongBase
+//
+//  Created by tt on 2022/5/18.
+//
+
+#import "WKMessageListView.h"
+#import "WKConversationTableView.h"
+#import "WuKongBase.h"
+#import <MJRefresh/MJRefresh.h>
+#import "WKTimeHeaderView.h"
+#import "WKMessageRevokeCell.h"
+#import "WKTextMessageCell.h"
+#import "WKInteractiveCardCell.h"
+#import "WKACardRenderer.h"  // 主线程耗时聚合探针 +perfAccrue:ms:
+#import <WuKongBase/WuKongBase-Swift.h>
+#import "WKHistorySplitTipContent.h"
+#import "WKTypingManager.h"
+#import "WKMessageListView+Position.h"
+#import "WKConversationListVM.h"
+#import <WuKongBase/WuKongBase-Swift.h>
+#import "WKMessageEffectManager.h"
+#import "WKMessageCell.h"
+#import "WKMultipleSelectToHereButton.h"
+#import <SDWebImage/SDWebImage.h>
+
+// ============================================================================
+// 卡顿诊断开关：定位"首次进群滑动期间持续卡顿"问题
+// 排查完置 NO 即可。所有埋点统一前缀 [CellPerf]，且都带阈值过滤，平时安静。
+// ============================================================================
+// 排查完置 NO,合规 CLAUDE.md "调试工具的生命周期" 要求 (合入 release 前关闭)。
+// CADisplayLink fps 监视 + 全部 [CellPerf]/[PullDebug]/[Perf] NSLog 一并失活
+// (NSLog 走全局锁, 在主线程已经被压住的时候打日志会再加塞,反而放大卡顿)。
+static const BOOL WKCellPerfLog = NO;
+#define WK_PERF_LOG(...) do { if (WKCellPerfLog) { NSLog(__VA_ARGS__); } } while (0)
+static const CFTimeInterval kCellPerfHeightMissMs = 4.0;    // heightForRow 缓存miss >4ms 才打
+static const CFTimeInterval kCellPerfRefreshSlowMs = 8.0;   // willDisplay 内 refresh 总耗时 >8ms 才打
+
+// ============================================================================
+// 【不变式 I1 —— 改本文件前必读】
+//
+//   dataProvider 的结构性变更（section 数 / row 数变化）与对应的 tableView 失效
+//   （reloadData / insertSections / insertRows / deleteXxx），必须在**同一个主线程
+//   turn** 内完成。两者之间不允许出现 dispatch_async / await / 任何让出主线程的操作。
+//
+// 为什么: UITableView 内部缓存 section/row 数, 只在 reloadData / insert* / delete*
+// 时更新。一旦"dp 已改、tableView 未知"的状态被主线程 runloop 观察到, 下一次
+// layout pass 就会拿旧的 section 数去问新的数据源:
+//   - 读越界: viewForHeaderInSection: → dateWithSection: → NSRangeException
+//   - 一致性断言: begin/endUpdates / reloadRows / performBatchUpdates 撞
+//     _Bug_Detected_In_Client_Of_UITableView_Invalid_Number_Of_Rows_In_Section
+// 现网 1.0.2(74) 5/5 份 `index 1 beyond bounds [0 .. 0]` 就是这个窗口: 后台线程
+// 当时正停在 precacheHeightForMessage 里 —— 那是 dp 改完之后、reloadData 之前的
+// bg 高度预热。
+//
+// 因此三条 pull 路径都是 prepare/commit 两段式 (见 WKMessageListDataProvider.h):
+//   1) pullXxxPrepared: 只拿 models, dp 一动不动
+//   2) 后台对 models 预热高度 (model 是独立对象, 不需要它已在列表里)
+//   3) 回主线程, 一个 turn 内 commitXxx: + reloadData/insertRows
+//      → commitLoadMessages: / commitPulldownModels: / commitPullupModels:
+//        这三个方法体里标了「原子区」的部分, 不要往中间插 dispatch。
+//
+// 增量插入需要的 "新增了几个 section / 几行" 必须在 commit 那个 turn 里 commit 前后
+// 就地 diff, 不能靠"pull 前记一份、pull 后再记一份"—— 那种写法要求 dp 在预热之前
+// 就被改掉, 正是上面那个窗口。
+//
+// 散落在本文件里的 `drift caught → fallback reloadData` / isTableViewRowCountIn-
+// SyncWithDataProvider 检查, 在两段式之后理论上永不触发。暂时保留作为金丝雀:
+// 它们都带 NSLog, 若线上还能看到就说明仍有路径违反 I1。确认干净后可整批删除。
+// ============================================================================
+
+// 增量 pulldown 开关：YES = 走 insertSections/insertRows + 手动 setContentOffset 路径，
+// NO = 走老的 reloadData + rectForRowAtIndexPath + setContentOffset 路径（跟 git 原版完全一致）。
+// 关掉的原因（历史）：增量路径在并发场景下，pull #1 capture 的 targetCopy 基于 #1 自己的
+// newSectionsAdded，但 ioQueue async 期间 pull #2 已经把 dataProvider 改了，导致 #1 reload
+// 时 targetCopy 指向错误 cell → 视觉"跳到下一页数据顶部"。
+// 注：两段式改造后这个并发前提已不成立（增量参数改为在 commit 同 turn 内就地 diff，
+// 不再跨 async 携带旧快照），可以重新评估打开以省掉整页 reloadData 的开销；
+// 但这属于性能优化，需要单独验证视觉锚点，本次不随崩溃修复一起改。
+static const BOOL kIncrementalPulldown = NO;
+
+// CADisplayLink 用的 weak target wrapper：避免 self ↔ link 循环引用导致 dealloc 永不触发
+@interface WKMessageListPerfWeakProxy : NSProxy
+@property(nonatomic,weak) id target;
++ (instancetype)proxyWithTarget:(id)target;
+@end
+@implementation WKMessageListPerfWeakProxy
++ (instancetype)proxyWithTarget:(id)target {
+    WKMessageListPerfWeakProxy *p = [WKMessageListPerfWeakProxy alloc];
+    p.target = target;
+    return p;
+}
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel {
+    return [self.target methodSignatureForSelector:sel] ?: [NSMethodSignature signatureWithObjCTypes:"v@:"];
+}
+- (void)forwardInvocation:(NSInvocation *)invocation {
+    if (self.target) [invocation invokeWithTarget:self.target];
+}
+@end
+
+@interface WKMessageListView ()<UITableViewDelegate,UITableViewDataSource,WKConversationTableViewDelegate,WKChannelManagerDelegate,WKChatManagerDelegate,WKReactionManagerDelegate,WKConnectionManagerDelegate,WKTypingManagerDelegate,WKReminderManagerDelegate,WKConversationManagerDelegate>
+
+@property(nonatomic,strong) UIViewPropertyAnimator *headerViewsAnimator;
+@property(nonatomic,assign) BOOL didManuallyStoppedTableViewDecelerating;
+
+// -------------------- 历史风格线相关 --------------------
+@property(nonatomic,assign,readonly) BOOL insertedHistorySplit;
+@property(nonatomic,copy) NSString *insertedHistoryClientMsgNo;
+
+@property(nonatomic,assign) BOOL multipleOn;
+@property(nonatomic,strong,nullable) WKMessageModel *lastMessageInner;
+
+// -------------------- 多选区间选择 --------------------
+// 多选模式下 "选到这里" 的起始 anchor，记 clientMsgNo 而非 indexPath（消息插入/删除后仍稳定）
+@property(nonatomic,copy,nullable) NSString *multipleAnchorClientMsgNo;
+@property(nonatomic,strong) WKMultipleSelectToHereButton *selectToHereTopButton;
+@property(nonatomic,strong) WKMultipleSelectToHereButton *selectToHereBottomButton;
+@property(nonatomic,assign) NSTimeInterval lastSelectToHereUpdateAt; // 节流
+// "选到这里"批量后进入连续模式：anchor 位于 visible 边缘，下次只要 anchor 一离开 visible 就显示按钮（不等满 1 屏）
+@property(nonatomic,assign) BOOL multipleAnchorContinuous;
+
+// pulldown 期间串行化新消息，防止并发修改导致布局错乱
+@property(nonatomic,assign) BOOL isPulldownInProgress;
+@property(nonatomic,strong) NSMutableArray<WKMessage*> *pendingRecvMessages;
+
+// rehydrate (重连补齐) 期间也复用 pendingRecvMessages 通道把 live push 缓起来,
+// 等多页 pullup 全部跑完 + reloadData 后再批量回放, 避免在 dp/tableView 漂移期间插行。
+@property(nonatomic,assign) BOOL isRehydrating;
+// rehydrate 进入时的 "在底部" 快照: watchdog 触发的 forceFinish 路径下也要拿得到,
+// 否则 watchdog 走 wasAtBottom:NO 把原本贴底的用户也不滚到底, 体验出现一次性偏移。
+@property(nonatomic,assign) BOOL rehydrateEnteredAtBottom;
+// 后台期 (锁屏 / 切后台 / conversation-sync 直写 DB 等) 是否动过状态。回前台 reconcile
+// 路径专用: 命中时即使 numberOfRows 一致, 也强制再走一次 reloadData, 兜住 "后台
+// reloadData + scrollToBottom 触发离屏 layout 但 willDisplayCell: 没回调, refresh: 永不跑
+// → 回前台 cell 内容空白" 的回归。设置点: handleRecvMessage 后台分支 + onConversationSyncFinished。
+@property(nonatomic,assign) BOOL dirtyAfterBackground;
+// pullBottom-reset-load 后的下一次 pulldown 强制走 reloadData 路径 (不用增量
+// insertSections + insertRowsAtIndexPaths)。原因:
+//   reset-load 把 dp 从「用户读的历史片段 (dp=[msg 13..72])」整块替换成「最新
+//   一页 (dp=[msg 2334..2363])」, 用户接着上滑 pulldown 拿到的是「几周/几月前
+//   的一大批老历史」, 一定跨多个 date section 且大概率跟老首 section 混合 (既
+//   insert 新 section 又给老首 section 补行)。UIKit 增量 insert 路径在这种
+//   「post-batch section shift + row insert into shifted section」形态下时序敏感
+//   ——已知 Bugly #3054 就是这条路径的漂移。iOS 27 把内部时序改得更严, 更容易
+//   在这条形态上让 dp/tv 行数簿记漂移, heightForRow 拿不到 model 返 0.1 →
+//   cell 完全不显示 (无气泡框、无文字, 症状 B)。
+// reloadData 稍慢但强壮, 反正 reset-load 后第一次 pulldown 用户也预期一个
+// 「跳一下」的过渡感, 视觉损失可忽略。
+@property(nonatomic,assign) BOOL wasResetLoadPending;
+// reconcile 防抖: 同一回前台动作会同时派发 UIApplicationWillEnterForeground /
+// UIApplicationDidBecomeActive / UISceneWillEnterForeground / UISceneDidActivate
+// 多条通知, 全部 hook 到本对账方法。500ms 内重复触发跳过, 避免连刷 reloadData
+// 抢主线程导致回前台首帧卡顿。注意: 防抖放在所有 gate 之后, gate 命中而早退
+// 时不更新时间戳, 后到的通知仍能补一次, 不损失对账机会。
+@property(nonatomic,assign) NSTimeInterval reconcileLastTs;
+// pendingReconcile: gate 命中 (isPulldownInProgress / isRehydrating / pullupHasMore)
+// 时, dirtyAfterBackground 不被消费, 同时 pending 置位; gate 清掉的路径 (pulldown
+// 完成 / rehydrate finish) 末尾调 wk_tryConsumePendingReconcile, 异步派发一次
+// reconcile 补刷。
+//
+// 没有这条机制时, 用户在看历史 (pullupHasMore=YES) / 重连补齐期间 (isRehydrating)
+// 锁屏复活就会落入空窗: 回前台时三条通知派发 reconcile, 全被 gate 拒掉, 等
+// gate 自然清掉时已经无人再触发 reconcile, 后台离屏 insert 的 cell 就永久空白
+// 必须退出重进。
+@property(nonatomic,assign) BOOL pendingReconcile;
+// 跟踪上一次连接状态: 只在 (非 Connected → Connected) 跳变时触发 rehydrate,
+// 否则连续 ping/pong 都会重复跑。
+@property(nonatomic,assign) WKConnectStatus prevConnectStatus;
+
+// FPS 监控：CADisplayLink 每帧 +1，每秒结算一次，<50 才打日志。
+// 用于诊断"停留不动也波动"问题。排查完关 WKCellPerfLog 即可。
+@property(nonatomic,strong) CADisplayLink *fpsLink;
+@property(nonatomic,assign) NSInteger fpsFrameCount;
+@property(nonatomic,assign) CFTimeInterval fpsLastSampleAt;
+// HANG 检测：CADisplayLink 应每帧 fire（60Hz=16.7ms）。两次 fire 间隔 > 100ms 说明
+// 主线程被某段同步代码占住了，记录这段卡顿时长 + 当时是否在滚动。用于定位"停留不动 FPS=12"幽灵卡顿。
+@property(nonatomic,assign) CFTimeInterval fpsLastTickTime;
+
+// reminder 跳转的内部入口: 允许在本地 DB 也没命中时走一次服务端 pullAround 兜底,
+// 然后递归回到主入口完成 keepPosition + loadMessages 的滚动定位.
+-(void) locateMessageCellWithOrderSeqForReminder:(uint32_t)orderSeq
+                                   tablePosition:(UITableViewScrollPosition)tablePosition
+                             allowServerFallback:(BOOL)allowServerFallback;
+
+@end
+
+@implementation WKMessageListView
+
+- (instancetype)initWithFrame:(CGRect)frame
+{
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.scrollEnabled  =YES;
+        if (WKCellPerfLog) {
+            [self startFpsMonitor];
+        }
+    }
+    return self;
+}
+
+// FPS 监控：CADisplayLink 每帧 +1，每秒结算一次，仅 fps<50 时打日志（带是否在滚动）。
+-(void) startFpsMonitor {
+    if (_fpsLink) return;
+    _fpsFrameCount = 0;
+    _fpsLastSampleAt = CACurrentMediaTime();
+    // weak proxy 避免循环引用，否则 self ↔ link ↔ runloop 三方持有，dealloc 永不触发
+    _fpsLink = [CADisplayLink displayLinkWithTarget:[WKMessageListPerfWeakProxy proxyWithTarget:self] selector:@selector(_fpsTick:)];
+    [_fpsLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+-(void) stopFpsMonitor {
+    [_fpsLink invalidate];
+    _fpsLink = nil;
+}
+
+-(void) _fpsTick:(CADisplayLink *)link {
+    CFTimeInterval now = link.timestamp;
+    // HANG 检测：两次 tick 间隔 > 100ms 说明主线程被卡 > 100ms。打日志，带是否在滚动。
+    // 跟之前的 FPS=N 互补：FPS=N 是 1s 窗口平均，HANG 是单次具体卡顿事件，带时间戳便于跟其他日志对账
+    if (_fpsLastTickTime > 0) {
+        CFTimeInterval gap = (now - _fpsLastTickTime) * 1000.0;
+        if (gap > 100.0) {
+            BOOL scrolling = self.tableView.isDragging || self.tableView.isDecelerating;
+            NSLog(@"[CellPerf] HANG=%.0fms scrolling=%@", gap, scrolling ? @"YES" : @"NO");
+        }
+    }
+    _fpsLastTickTime = now;
+
+    _fpsFrameCount++;
+    CFTimeInterval elapsed = now - _fpsLastSampleAt;
+    if (elapsed >= 1.0) {
+        CGFloat fps = _fpsFrameCount / elapsed;
+        if (fps < 50.0) {
+            BOOL scrolling = self.tableView.isDragging || self.tableView.isDecelerating;
+            NSLog(@"[CellPerf] FPS=%.0f scrolling=%@", fps, scrolling ? @"YES" : @"NO");
+        }
+        _fpsFrameCount = 0;
+        _fpsLastSampleAt = now;
+    }
+}
+
+-(void) setupUI {
+
+    self.clipsToBounds = YES;
+    [self addSubview:self.tableView];
+    [self initPosition];
+
+    [self setupSelectToHereButtons];
+
+    [self addDelegates];
+
+}
+
+-(void) rebuildForStyleChange {
+    // 保存当前滚动位置
+    [self updatePosition];
+    // 先清空数据源，防止旧 tableView 布局时越界
+    [self.dataProvider clearMessages];
+    [self.tableView reloadData];
+    // 销毁旧 tableView（连同所有 cell 的 WebKit 缓存）
+    [self.tableView removeFromSuperview];
+    _tableView = nil;
+    // 创建全新的 tableView
+    [self addSubview:self.tableView];
+    // 重新加载消息数据
+    [self loadMessages];
+}
+
+- (void)viewDidLoad {
+    [self setupUI];
+    [self loadMessages];
+    
+    // 同步扩展数据
+    [[WKSDK shared].chatManager syncMessageExtra:self.channel complete:nil];
+    
+    // 同步回应数据
+    [[WKSDK shared].reactionManager sync:self.channel];
+}
+
+- (void)viewWillDisappear {
+    [self updatePosition];
+    // 界面退出停止播放
+    [[WKSDK shared].mediaManager stopAudioPlay];
+
+    [self markReminderDoneIfNeed];
+
+    [[WKMessageEffectManager shared] cancelCurrentEffect];
+}
+
+- (void)setScrollEnabled:(BOOL)scrollEnabled {
+    _scrollEnabled = scrollEnabled;
+    self.tableView.scrollEnabled = scrollEnabled;
+}
+
+-(void) addDelegates {
+    [[WKSDK shared].channelManager addDelegate:self]; // 频道数据监听
+    [[WKSDK shared].chatManager addDelegate:self]; // 消息监听
+    [[WKSDK shared].reactionManager addDelegate:self]; // 回应监听
+    [[WKSDK shared].connectionManager addDelegate:self]; // 连接状态监听
+    [[WKSDK shared].conversationManager addDelegate:self]; // conversation-sync 完成监听(后台收消息切回前台补刷)
+    [[WKTypingManager shared] addDelegate:self]; // 正在输入...
+    [[WKReminderManager shared] addDelegate:self]; // 提醒项监听
+    // 外部分享消息发送通知
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onShareExtensionMessageSent:) name:@"WKShareExtensionMessageSent" object:nil];
+    // 多选模式下 cell 圆圈被勾选时刷新 anchor
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onMultipleAnchorDidChange:) name:@"WKMessageMultipleAnchorDidChange" object:nil];
+    // 回前台对账：修后台收消息离屏 insert 致最新消息行空白（见 onAppDidBecomeActiveReconcile:）。
+    //
+    // 监听 4 路通知, 任一触发都跑一次对账, 用 reconcileLastTs 500ms 防抖去重。
+    // 旧实现只挂 UIApplicationDidBecomeActiveNotification, 在 iPadOS 多场景 /
+    // iOS 13+ scene lifecycle 下有些回前台路径根本不派发该通知 (例如多窗口
+    // app 中某个 scene 单独被 resume), 导致对账 hook 永远不响应、cell 内容空白
+    // 必须退出重进才能修。Will* 系列比 Did* 系列早一帧, 让 reloadData 在 UIKit
+    // 真正开始渲染前完成, 视觉上更顺。
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onAppDidBecomeActiveReconcile:) name:UIApplicationDidBecomeActiveNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onAppDidBecomeActiveReconcile:) name:UIApplicationWillEnterForegroundNotification object:nil];
+    if (@available(iOS 13.0, *)) {
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onAppDidBecomeActiveReconcile:) name:UISceneDidActivateNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onAppDidBecomeActiveReconcile:) name:UISceneWillEnterForegroundNotification object:nil];
+    }
+}
+
+-(void) removeDelegates {
+    [[WKSDK shared].channelManager removeDelegate:self];
+    [[WKSDK shared].chatManager removeDelegate:self];
+    [[WKSDK shared].reactionManager removeDelegate:self];
+    [[WKSDK shared].connectionManager  removeDelegate:self];
+    [[WKSDK shared].conversationManager removeDelegate:self];
+    [[WKTypingManager shared] removeDelegate:self];
+    [[WKReminderManager shared] removeDelegate:self];
+    // 取消任何挂在 runloop 上的 rehydrate 触发: 切换 channel / 退出页面后
+    // 不应再让上一次的 0.5s debounce 真的跑起来 (performSelector 持有 self 强引用,
+    // 不取消会延迟 dealloc + 在 detached 视图上做无意义 reload)。watchdog 同理取消。
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(beginRehydrate) object:nil];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(forceFinishRehydrateOnTimeout) object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:@"WKShareExtensionMessageSent" object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:@"WKMessageMultipleAnchorDidChange" object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationDidBecomeActiveNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationWillEnterForegroundNotification object:nil];
+    if (@available(iOS 13.0, *)) {
+        [[NSNotificationCenter defaultCenter] removeObserver:self name:UISceneDidActivateNotification object:nil];
+        [[NSNotificationCenter defaultCenter] removeObserver:self name:UISceneWillEnterForegroundNotification object:nil];
+    }
+}
+
+/// 外部分享的消息发送后，插入消息到当前聊天页面
+-(void) onShareExtensionMessageSent:(NSNotification *)notification {
+    WKChannel *channel = notification.object;
+    NSLog(@"[ShareExt] onShareExtensionMessageSent 收到通知, channel=%@_%d", channel.channelId, channel.channelType);
+    if (!channel) {
+        NSLog(@"[ShareExt] channel 为空，跳过");
+        return;
+    }
+
+    NSArray<WKMessage *> *messages = notification.userInfo[@"messages"];
+    NSLog(@"[ShareExt] 消息数量: %lu", (unsigned long)messages.count);
+    if (!messages || messages.count == 0) return;
+
+    // 检查第一条消息是否属于当前会话
+    WKMessage *firstMsg = messages.firstObject;
+    BOOL canHandle = [self needHandle:firstMsg];
+    NSLog(@"[ShareExt] needHandle=%d, 消息channel=%@_%d, contentType=%ld", canHandle, firstMsg.channel.channelId, firstMsg.channel.channelType, (long)firstMsg.contentType);
+    if (!canHandle) {
+        NSLog(@"[ShareExt] 消息不属于当前会话，跳过");
+        return;
+    }
+
+    NSInteger insertedCount = 0;
+    for (WKMessage *msg in messages) {
+        NSIndexPath *existPath = [self.dataProvider indexPathAtClientMsgNo:msg.clientMsgNo];
+        NSLog(@"[ShareExt] 检查消息 clientMsgNo=%@, existPath=%@", msg.clientMsgNo, existPath);
+        if (existPath) {
+            NSLog(@"[ShareExt] 消息已存在，跳过");
+            continue;
+        }
+
+        WKMessageModel *model = [[WKMessageModel alloc] initWithMessage:msg];
+        NSLog(@"[ShareExt] 插入消息到 UI, contentType=%ld, status=%ld", (long)msg.contentType, (long)msg.status);
+        [self sendMessage:model];
+        insertedCount++;
+    }
+    NSLog(@"[ShareExt] 共插入 %ld 条消息到聊天页面", (long)insertedCount);
+}
+
+
+
+-(void) sendMessage:(WKMessageModel*)message {
+    [self updateLastMsgIfNeed:message];
+
+    // 预缓存高度（触发 markdown AST 解析），避免在 UITableView 布局回调中首次渲染
+    // 当消息含 markdown 表格时，cellForRow 会实例化 WKWebView 加载 HTML 表格，
+    // 在布局回调中会走 WebKit 主线程 spin 嵌套 RunLoop，触发 UITableView 重入校验异常
+    [self precacheHeightForMessage:message];
+
+    // 异源 typing 残留预清理：见 evictStaleTypingForIncomingMessage: 注释
+    [self evictStaleTypingForIncomingMessage:message];
+
+    // Bugly: pulldown/pullup 把新消息写进 dataProvider 但 tableView 还没 reloadData 的窗口里，
+    // 这里如果仍按 dataProvider 旧值算增量，insertRowsAtIndexPaths 的 count 和 tableView 实际行数
+    // 对不上，endUpdates 会抛 _Bug_Detected_In_Client_Of_UITableView_Invalid_Number_Of_Rows_In_Section。
+    // addMessage 前先记录同步状态，漂移时直接 reloadData 兜底。
+    BOOL inSyncBefore = [self isTableViewRowCountInSyncWithDataProvider];
+    BOOL pulldownActive = self.isPulldownInProgress;
+
+    [self.dataProvider addMessage:message];
+
+    // 按序插入之后，新消息不保证落在末尾（并发交错时会中段插入）。下面整段增量计算都
+    // 假设"末尾新增"，前提不成立时算出来的 indexPath 是错的 —— 行数仍对得上所以不抛
+    // 异常，但渲染内容会错位，比乱序更糟。所以中段插入直接 reloadData。
+    // 正常路径（消息就是最新的）恒为纯尾插，这个分支不会走到，行为与改前一致。
+    if (pulldownActive || !inSyncBefore || ![self.dataProvider lastInsertWasPureTailAppend]) {
+        [self.tableView reloadData];
+        [self didAddMessageUI];
+        return;
+    }
+
+    // 无漂移时以 tableView 当前行数为基准做增量（而不是 dataProvider 的旧快照）
+    NSInteger oldSectionCount = [self.tableView numberOfSections];
+    NSInteger oldLastSectionRowCount = (oldSectionCount > 0) ? [self.tableView numberOfRowsInSection:oldSectionCount - 1] : 0;
+    NSInteger newSectionCount = [self.dataProvider dateCount];
+    BOOL newSectionAdded = (newSectionCount > oldSectionCount);
+    NSInteger newLastSectionRowCount = (newSectionCount > 0) ? [self.dataProvider rowCountAtSection:newSectionCount - 1] : 0;
+
+    // Bugly #3054 兜底：校验的窗口 + 双保险 @try/@catch。
+    //   insertRowsAtIndexPaths 内部会触发 heightForRow / cellForRow，对含 markdown 表格的
+    //   消息，cellForRow 会实例化/加载 WKWebView 渲染 HTML 表格 → WebKit 主线程 spin 嵌套 RunLoop。
+    //   期间主队列 pending 的 pulldown 完成 / handleRecvMessage 会批量往 dp 追加数据，导致内部
+    //   校验时 ds.count 和 tv 期望值漂移 → NSInternalInconsistencyException。在 insertRows
+    //   前再精确校一次，不一致直接 reloadData；即便过了二次校验还抛异常（嵌套 RunLoop 在
+    //   insert 内部发生），catch 住同样走 reloadData。
+    //   注：M3 表格改为原生渲染后此嵌套 RunLoop 路径消失，但 try/catch 仍作为廉价保险保留。
+    if (!newSectionAdded && newLastSectionRowCount > oldLastSectionRowCount) {
+        NSInteger intendedDelta = newLastSectionRowCount - oldLastSectionRowCount;
+        NSInteger dsNow = [self.dataProvider rowCountAtSection:newSectionCount - 1];
+        NSInteger tvNow = [self.tableView numberOfRowsInSection:newSectionCount - 1];
+        if (dsNow - tvNow != intendedDelta) {
+            [self.tableView reloadData];
+            [self didAddMessageUI];
+            return;
+        }
+    }
+
+    if (newSectionAdded) {
+        @try {
+            [UIView performWithoutAnimation:^{
+                [self.tableView insertSections:[NSIndexSet indexSetWithIndex:newSectionCount - 1] withRowAnimation:UITableViewRowAnimationNone];
+            }];
+        } @catch (NSException *ex) {
+            NSLog(@"[WKMessageListView] insertSections drift caught: %@, fallback reloadData", ex);
+            [self.tableView reloadData];
+        }
+    } else if (newLastSectionRowCount > oldLastSectionRowCount) {
+        NSMutableArray<NSIndexPath *> *indexPaths = [NSMutableArray array];
+        for (NSInteger row = oldLastSectionRowCount; row < newLastSectionRowCount; row++) {
+            [indexPaths addObject:[NSIndexPath indexPathForRow:row inSection:newSectionCount - 1]];
+        }
+        @try {
+            [UIView performWithoutAnimation:^{
+                [self.tableView insertRowsAtIndexPaths:indexPaths withRowAnimation:UITableViewRowAnimationNone];
+            }];
+        } @catch (NSException *ex) {
+            NSLog(@"[WKMessageListView] insertRows drift caught: %@, fallback reloadData", ex);
+            [self.tableView reloadData];
+        }
+    } else {
+        // typing 替换等场景：刷新最后一行
+        //   reloadRow 同样需要 ds.count == tv.count，否则 UITableView 校验仍会抛异常（Bugly 另一路径同理）。
+        if (newSectionCount > 0 && newLastSectionRowCount > 0) {
+            NSIndexPath *lastPath = [NSIndexPath indexPathForRow:newLastSectionRowCount - 1 inSection:newSectionCount - 1];
+            NSInteger tvSectionsNow = [self.tableView numberOfSections];
+            NSInteger tvRowsNow = (tvSectionsNow == newSectionCount) ? [self.tableView numberOfRowsInSection:newSectionCount - 1] : -1;
+            if (tvRowsNow != newLastSectionRowCount) {
+                [self.tableView reloadData];
+            } else {
+                @try {
+                    [self.tableView reloadRowsAtIndexPaths:@[lastPath] withRowAnimation:UITableViewRowAnimationNone];
+                } @catch (NSException *ex) {
+                    NSLog(@"[WKMessageListView] send reloadRows drift caught: %@, fallback reloadData", ex);
+                    [self.tableView reloadData];
+                }
+            }
+        }
+    }
+
+    [self didAddMessageUI];
+}
+
+-(void) removeMessage:(WKMessageModel*)message {
+    [self.dataProvider removeMessage:message];
+    [self.tableView reloadData];
+}
+
+-(void) didAddMessageUI{
+    // 不再 reloadData，调用方已通过增量 insertRows 更新
+    __weak typeof(self) weakSelf = self;
+    
+    if([self.dataProvider hasTyping]) {
+        [weakSelf scrollToBottom:NO];
+    }else{
+        [self animateMessageWithBlock:^{
+            [weakSelf scrollToBottom:NO];
+            
+        }];
+    }
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+}
+
+
+-(void) markReminderDoneIfNeed {
+    NSArray<WKReminder*> *reminders = self.reminders;
+    if(reminders && reminders.count>0) {
+        NSMutableArray *ids = [NSMutableArray array];
+        for (WKReminder *reminder  in reminders) {
+            if(reminder.isLocate && reminder.done) {
+                [ids addObject:@(reminder.reminderID)];
+            }
+        }
+        [[WKSDK shared].reminderManager done:ids];
+    }
+    
+}
+
+
+- (void)loadMessages {
+    __weak typeof(self) weakSelf = self;
+    [self loadMessages:false firstLoad:YES complete:^{
+        [weakSelf refreshNewMsgCount];
+        // 消息加载完成后检查可见区域的@提醒，标记已读
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            NSArray<WKReminder *> *reminders = weakSelf.reminders;
+            if (reminders && reminders.count > 0) {
+                [weakSelf updatePostionReminders:reminders force:YES];
+            }
+        });
+    }];
+}
+
+-(void) loadMessages:(BOOL)animation firstLoad:(BOOL)firstLoad complete:(void(^)(void))complete{
+    [self loadMessages:animation firstLoad:firstLoad staleRetry:0 complete:complete];
+}
+
+/// prepare→commit 窗口期间 dp 被别的路径写过时，丢弃这批 prepared 重跑的次数上限。
+/// 打满就按原样 commit（退回加此闸门之前的行为），保证一定收敛、不会自我重入。
+static const NSInteger kMaxLoadMessagesStaleRetry = 2;
+
+/// dp 的"结构指纹"：忽略 typing 的末条 clientMsgNo。
+/// 用来判断 prepare→commit 窗口里有没有别的路径往 dp 写过东西（实时收消息 / 本地发送）。
+/// 忽略 typing 是因为它被当成一条消息挂在末尾且变化频繁 —— 拿它当指纹会让"对方正在
+/// 输入"时每次进会话都被逼成重做。跳 typing 取真实末条的做法与 pullupHasMore 一致。
+-(nullable NSString*) dpStructuralTailClientMsgNo {
+    WKMessageModel *tail = [self.dataProvider lastMessage];
+    if (tail && tail.contentType == WK_TYPING) {
+        tail = tail.preMessageModel;
+    }
+    return tail.clientMsgNo;
+}
+
+-(void) loadMessages:(BOOL)animation firstLoad:(BOOL)firstLoad staleRetry:(NSInteger)staleRetry complete:(void(^)(void))complete{
+    __weak typeof(self) weakSelf = self;
+    WKMessageModel *_dpHeadBefore = [self.dataProvider firstMessage];
+    WKMessageModel *_dpTailBefore = [self.dataProvider lastMessage];
+    #if DEBUG
+    NSLog(@"[BubbleBugRepro] loadMessages ENTRY animation=%d firstLoad=%d keepPos=%u dpHead=%u dpTail=%u dpCount=date×%lu",
+          animation, firstLoad,
+          self.keepPosition.orderSeq,
+          _dpHeadBefore.orderSeq, _dpTailBefore.orderSeq,
+          (unsigned long)[self.dataProvider dateCount]);
+    #endif
+    if(self.keepPosition) {
+        [self enablePullup:YES];
+    }else {
+        [self enablePullup:NO];
+    }
+    // 两段式 (见 WKMessageListDataProvider.h): pullFirst 只交出 models, 数据源一动不动。
+    // 高度预热在**写入之前**对 models 做 —— model 是独立对象, 不需要它已经在列表里。
+    // 然后回到主线程, 在同一个 turn 内 commitReplaceAll: + reloadData。
+    // 指纹必须在**发起前**取 (@yujiawei P2-8): prepared 回调是在 DB 读**之后**才跑的,
+    // 在那里取指纹, 读库期间到达的消息已经被算进指纹 → 比不出差异 → commitReplaceAll:
+    // 照样把它擦掉。挪到这里, 整个"读库 + 预热"窗口都被覆盖。
+    NSString *tailAtPrepare = [self dpStructuralTailClientMsgNo];
+    [self.dataProvider pullFirst:self.keepPosition prepared:^(NSArray<WKMessageModel *> *models, BOOL hasMore) {
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] loadMessages pullFirst PREPARED hasMore=%d models=%lu",
+              hasMore, (unsigned long)models.count);
+        #endif
+        if (models.count == 0) {
+            [weakSelf commitLoadMessages:@[] animation:animation firstLoad:firstLoad hasMore:hasMore tailAtPrepare:tailAtPrepare staleRetry:staleRetry complete:complete];
+            return;
+        }
+        // 预热放在 commit 之前: 此刻 dataProvider 与 tableView 仍然是一致的,
+        // 后台跑多久都不会产生"数据源已变 / tableView 未知"的窗口。
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            CFAbsoluteTime _t0 = CFAbsoluteTimeGetCurrent();
+            for (WKMessageModel *msg in models) {
+                [weakSelf precacheHeightForMessage:msg];
+            }
+            CGFloat _ms = (CFAbsoluteTimeGetCurrent() - _t0) * 1000;
+            WK_PERF_LOG(@"[Perf] pullFirst precache: %lu msgs in %.1fms (bg, pre-commit)", (unsigned long)models.count, _ms);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf commitLoadMessages:models animation:animation firstLoad:firstLoad hasMore:hasMore tailAtPrepare:tailAtPrepare staleRetry:staleRetry complete:complete];
+            });
+        });
+    }];
+}
+
+/// pullFirst 的 commit 阶段。**整段必须跑在一个主线程 turn 内**，中间不允许出现任何
+/// dispatch / await —— `commitReplaceAll:` 之后到 `reloadData` 之前，dataProvider 和
+/// tableView 的 section 数是不一致的，一旦让出主线程就会被 layout pass 撞上。
+///
+/// tailAtPrepare / staleRetry 见方法体内的"过期闸门"注释。
+-(void) commitLoadMessages:(NSArray<WKMessageModel *> *)models animation:(BOOL)animation firstLoad:(BOOL)firstLoad hasMore:(BOOL)hasMore tailAtPrepare:(nullable NSString *)tailAtPrepare staleRetry:(NSInteger)staleRetry complete:(void(^)(void))complete {
+    if (![NSThread isMainThread]) {
+        // 兜底: 理论上 prepared/precache 都已 hop 回 main。
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf commitLoadMessages:models animation:animation firstLoad:firstLoad hasMore:hasMore tailAtPrepare:tailAtPrepare staleRetry:staleRetry complete:complete];
+        });
+        return;
+    }
+    if (!self.tableView) return; // 防止 view 已释放后继续操作
+
+    // ---------- 过期闸门: 必须在原子区之前 ----------
+    // prepare→precache 窗口（一页 30 条复杂气泡的高度预热，实测可达几百 ms）期间，
+    // 实时收消息 / 本地发送会经由 addMessage:/sendMessage: 直接写进 dp —— 进会话时
+    // dp 是空的，pullupHasMore 返回 false，所以它们走的是"写 dp + 增量 insert"那条分支。
+    // 紧接着 commitReplaceAll: 用 prepared 快照整片替换，把它们连带擦掉。后果不只是
+    // "这条消息晚显示"：此后 dp 末条 ≠ 会话最新条 → pullupHasMore 恒为真 → 之后**收到**
+    // 的消息都走"只更新 lastMessage、不写 dp"分支，等于这个会话暂时不再显示新消息，
+    // 直到用户上拉或退出重进；onConversationSyncFinished 的对账也会因 pullupHasMore
+    // 为真而只更新预览引用、不重载，补不回来。
+    //
+    // 处理方式：丢弃这批 prepared，重跑一次。pullFirst 每次都从 DB 重新取最新一页，
+    // 是幂等的，重跑必然把窗口期那条一并带上 —— 不存在"游标已经推进 → 漏页"的问题
+    // （这也是 pullup 不能照抄这套做法的原因，见 commitPullupModels: 的注释）。
+    // 不调 complete，交给重跑那一轮调，避免回调放大。
+    // 有限次兜底：打满 kMaxLoadMessagesStaleRetry 就按原样 commit（退回加闸门前的行为），
+    // 保证一定收敛，不会在消息密集时自我重入。
+    // models 为空时不进原子区、不 replace，也就不会擦掉任何东西，无需闸门。
+    if (models.count > 0 && staleRetry < kMaxLoadMessagesStaleRetry) {
+        NSString *tailNow = [self dpStructuralTailClientMsgNo];
+        BOOL tailChanged = !(tailAtPrepare == tailNow || [tailAtPrepare isEqualToString:tailNow]);
+        if (tailChanged) {
+            #if DEBUG
+            NSLog(@"[BubbleBugRepro] commitLoadMessages STALE: dp 末条 %@ → %@ (窗口期被写过), 丢弃重跑 %ld/%ld",
+                  tailAtPrepare ?: @"<nil>", tailNow ?: @"<nil>",
+                  (long)(staleRetry + 1), (long)kMaxLoadMessagesStaleRetry);
+            #endif
+            [self loadMessages:animation firstLoad:firstLoad staleRetry:staleRetry + 1 complete:complete];
+            return;
+        }
+    }
+
+    // ---------- 原子区开始: dp 变更 + tableView 失效, 不得让出主线程 ----------
+    if (models.count > 0) {
+        [self.dataProvider commitReplaceAll:models];
+    }
+    if(!hasMore) {
+        [self pullupFinished];
+        if(!self.keepPosition) {
+            [self pulldownFinished];
+        }
+    }
+    if(![self pullupHasMore]) { // 如果没有下方已到底，则禁用上拉
+        [self pullupFinished];
+    }
+    [self updateOrInsertHistoryMsgSplitIfNeed]; // 插入历史消息风格线
+
+    if(firstLoad) {
+        WKMessage *typingMessage =  [[WKTypingManager shared] getTypingMessage:self.channel];
+         if(typingMessage) {
+             [self.dataProvider addTypingMessageIfNeed:[[WKMessageModel alloc] initWithMessage:typingMessage]];
+         }
+    }
+    {
+        WKMessageModel *_dpHead = [self.dataProvider firstMessage];
+        WKMessageModel *_dpTail = [self.dataProvider lastMessage];
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] commitLoadMessages RELOAD firstLoad=%d keepPos=%u dpHead=%u dpTail=%u dpDates=%lu",
+              firstLoad, self.keepPosition.orderSeq,
+              _dpHead.orderSeq, _dpTail.orderSeq,
+              (unsigned long)[self.dataProvider dateCount]);
+        #endif
+    }
+    [self.tableView reloadData];
+    // ---------- 原子区结束 ----------
+
+    if(!self.keepPosition) {
+        [self scrollToBottom:animation];
+    }else {
+        NSIndexPath *indexPath = [self.dataProvider indexPathAtOrderSeq:self.keepPosition.orderSeq];
+        if(!indexPath) {
+            [self scrollToBottom:animation];
+        } else {
+            CGRect indexRect = [self.tableView rectForRowAtIndexPath:indexPath];
+            [self setContentOffsetYSafely:indexRect.origin.y+self.keepPosition.offset - self.tableView.contentInset.top];
+            if(self.needPositionReminder) {
+                // 不能直接 cellForRowAtIndexPath: 拿 cell —— setContentOffsetYSafely 后还没走 layout pass,
+                // 目标 cell 大概率还没被 dequeue, 返回 nil 时高亮被静默丢掉 (即"首次打开聊天跳转高亮
+                // 时有时无"的根因)。改成与 locateMessageCellWithMessageSeq: 一致的写法: 把 reminder
+                // 标记打到 model 上, reloadRow 触发 cell 的 setMessageModel: 时由 cell 自己消费这个
+                // 标记并启动动画 (WKMessageCell.m:591)。这样无论 cell 是否已 dequeue 都能正常播。
+                WKMessageModel *targetModel = [self.dataProvider messageAtIndexPath:indexPath];
+                if(targetModel) {
+                    targetModel.reminderAnimation = YES;
+                    [self.tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+                }
+                self.needPositionReminder = false;
+            }
+        }
+    }
+    if(complete) {
+        complete();
+    }
+    if(firstLoad) {
+        [self calcPositionAtBottom];
+        [self showScrollToBottomBarIfNeed];
+    }
+}
+
+// 请求到最底部
+-(void) pullBottom {
+    WKMessageModel *_dpHead = [self.dataProvider firstMessage];
+    WKMessageModel *_dpTail = [self.dataProvider lastMessage];
+    #if DEBUG
+    NSLog(@"[BubbleBugRepro] pullBottom ENTRY pullupHasMore=%d positionAtBottom=%d dpHead=%u dpTail=%u lastMsg=%u appState=%ld",
+          [self pullupHasMore], self.positionAtBottom,
+          _dpHead.orderSeq, _dpTail.orderSeq, self.lastMessage.orderSeq,
+          (long)[UIApplication sharedApplication].applicationState);
+    #endif
+    if(![self pullupHasMore]) {
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] pullBottom PATH=scroll-only (already at bottom in dp)");
+        #endif
+        [self pullupFinished];
+        [self.tableView setContentOffset:self.tableView.contentOffset animated:NO]; // 立刻停止滚动
+        [self scrollToBottom:YES];
+        return;
+    }
+    #if DEBUG
+    NSLog(@"[BubbleBugRepro] pullBottom PATH=reset-load (pullupHasMore=YES)");
+    #endif
+    // 标记「下一次 pulldown 强制 reloadData」——见 wasResetLoadPending 属性注释。
+    self.wasResetLoadPending = YES;
+
+    // 关键根因修复: 不能用 pullFirst:nil (走 SDK pullLastMessages(start=0,end=0))。
+    // SDK 的 pullMessages 在 startOrderSeq==0 时**整个 anchor gap 检查块被 skip**
+    // (line 906 `if(startOrderSeq!=0)`), 且当 local DB 返回的 count == limit 时
+    // 「last-page 兜底 sync」也不触发 (line 995 `if(count<limit)`)。
+    // 后果: fresh install → 用户搜到 3 月 → local DB 只有 3 月 30 条 → 点跳底部走
+    // pullFirst:nil → SDK 静默返回 local newest 30 = 3 月尾部 → dp = 3 月, 但用户
+    // 视觉上误以为在最新 (因为 scrollToBottom 到了当前 dp 底部)。之后 pulldown 拉
+    // 更老 3 月, 完全跳过 4/5/6 月, 症状复现。endOrderSeq bound 是拦 pulldown 拿远古
+    // stale 的下界防线, 但 reset-load 本身返 stale 数据它救不了。
+    //
+    // 修法: 用 pullAround(knownLatestOrderSeq) 替代。pullAround 走 pullMessages
+    // (start=derivedFromLatest, end=0, mode=Up), 命中 line 906+ anchor gap 检查,
+    // 强制 calSync 到 server 拉齐真正 latest → local DB 一定含 latest → dp 一定是
+    // latest 附近, 不再 stale。
+    // 视觉一致性: pullAround 后 keepPosition 让 setContentOffset 停在 latest msg 顶部
+    // 而不是 viewport 底, complete 回调里清 keepPosition + scrollToBottom 修正到底。
+    // convlist lastMessage.messageSeq 是 knownLatest 来源, fresh install 打开 app 后
+    // convManager 会同步 convlist, 一般 > 0。极端 case 拿不到时 fallback 原路径 (无解,
+    // 至少不 worse than before)。
+    WKConversationWrapModel *_convModel = [[WKConversationListVM shared] modelAtChannel:self.channel];
+    uint32_t _knownLatestOrderSeq = 0;
+    if (_convModel.lastMessage.messageSeq > 0) {
+        // 在 uint64 里算, 溢出 uint32 时保持 _knownLatestOrderSeq=0 走 pullFirst:nil
+        // 已有 fallback (line 682-684)。SDK 全线 orderSeq 都是 uint32, 单会话
+        // messageSeq > ~4.29M 是 SDK 级天花板 (WKMessageDB / pullAround:orderSeq: /
+        // WKConversationPosition.orderSeq 全 uint32), 这里只保证不给 keepPosition
+        // 留脏值触发 pullAround 定位到错误的老窗口 (PR #64 review OctoBoooot + Jerry-Xin
+        // 独立命中)。
+        uint64_t _computed = (uint64_t)_convModel.lastMessage.messageSeq * (uint64_t)WKOrderSeqFactor;
+        if (_computed > 0 && _computed <= UINT32_MAX) {
+            _knownLatestOrderSeq = (uint32_t)_computed;
+        }
+    }
+    __weak typeof(self) weakSelf = self;
+    if (_knownLatestOrderSeq > 0) {
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] pullBottom SUB=pullAround knownLatestOrderSeq=%u (force server sync)",
+              _knownLatestOrderSeq);
+        #endif
+        self.keepPosition = [WKConversationPosition orderSeq:_knownLatestOrderSeq offset:0];
+        [self loadMessages:true firstLoad:true complete:^{
+            weakSelf.keepPosition = nil;
+            [weakSelf scrollToBottom:YES];
+            #if DEBUG
+            NSLog(@"[BubbleBugRepro] pullBottom SUB=pullAround DONE, scrollToBottom");
+            #endif
+        }];
+    } else {
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] pullBottom SUB=pullFirst:nil FALLBACK (convlist lastMsg not available)");
+        #endif
+        self.keepPosition = nil;
+        [self loadMessages:true firstLoad:true complete:nil];
+    }
+
+}
+
+- (void)suppressScrollOnce {
+    self.suppressNextScrollToBottom = YES;
+}
+
+- (void)scrollToBottom:(BOOL)animation {
+    if (self.suppressNextScrollToBottom) {
+        self.suppressNextScrollToBottom = NO;
+        return;
+    }
+    if(self.tableView.contentSize.height<= [self visiableTableHeight]) {
+        return;
+    }
+    CGFloat adjustOffset = 0.01f; // TODO: 这里默认需要给个0.01f不能给0 要不然滚动条距离顶部有距离，这个不清楚原因
+//    if(firstLoad) {
+//        CGFloat statusHeight = [UIApplication sharedApplication].statusBarFrame.size.height;
+//        adjustOffset = statusHeight; // 调整偏移
+//    }
+   
+    if(animation) {
+        [self animateMessageWithBlock:^{
+            [self.tableView setContentOffset:CGPointMake(0, self.tableView.contentSize.height-self.tableView.lim_height+adjustOffset)];
+        }];
+    }else{
+        [self.tableView setContentOffset:CGPointMake(0, self.tableView.contentSize.height-self.tableView.lim_height+adjustOffset)];
+    }
+}
+
+-(void) setContentOffsetYSafely:(CGFloat)y {
+    [self.tableView setContentOffset:CGPointMake(0, MAX(0, y))];
+}
+
+-(void) animateMessageWithBlock:(void(^)(void)) block completion:(void(^)(BOOL finished))completionBlock{
+    [UIView animateWithDuration:SessionInputAnimateDuration delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
+        block();
+    } completion:completionBlock];
+}
+
+// 检测视图子树里是否有第一响应者（如交互卡片里正在编辑的输入框）
+static BOOL WKListViewContainsFirstResponder(UIView *v) {
+    if (!v) return NO;
+    if (v.isFirstResponder) return YES;
+    for (UIView *s in v.subviews) {
+        if (WKListViewContainsFirstResponder(s)) return YES;
+    }
+    return NO;
+}
+
+- (void)stopScrollingAnimation
+{
+    // 原实现通过 removeFromSuperview + 重新插回停止滚动动量，但 detach 会让 UIKit
+    // 强制 resign 列表内所有第一响应者——交互卡片里刚聚焦的输入框会因此被收键盘。
+    // 若列表内有第一响应者，改用非破坏性方式停止动量（不 detach，保住焦点）。
+    if (WKListViewContainsFirstResponder(self.tableView)) {
+        [self.tableView setContentOffset:self.tableView.contentOffset animated:NO];
+        return;
+    }
+    UIView *superview = self.tableView.superview;
+    NSUInteger index = [self.tableView.superview.subviews indexOfObject:self.tableView];
+    [self.tableView removeFromSuperview];
+    [superview insertSubview:self.tableView atIndex:index];
+}
+-(void) animateMessageWithBlock:(void(^)(void)) block{
+    [self animateMessageWithBlock:block completion:nil];
+}
+
+- (BOOL)insertedHistorySplit {
+    if(self.insertedHistoryClientMsgNo && ![self.insertedHistoryClientMsgNo isEqualToString:@""]) {
+        return true;
+    }
+    return false;
+}
+
+- (void)dealloc {
+    WKLogDebug(@"%s",__func__);
+    [self stopFpsMonitor];
+    [self removeDelegates];
+}
+
+// 插入历史消息风格线
+-(void) updateOrInsertHistoryMsgSplitIfNeed {
+    if(self.browseToOrderSeq == 0) {
+        return;
+    }
+    
+    WKMessageModel *oldHistorySplitMsgModel;
+    if(self.insertedHistorySplit) {
+        NSIndexPath *indexPath = [self.dataProvider indexPathAtClientMsgNo:self.insertedHistoryClientMsgNo];
+        if(indexPath) {
+            oldHistorySplitMsgModel = [self.dataProvider messageAtIndexPath:indexPath];
+        }
+    }
+    
+    if(oldHistorySplitMsgModel) { // 更新分割线
+        [self.dataProvider removeMessage:oldHistorySplitMsgModel];
+        [self insertHistoryMsgSplitUI];
+    }else { // 插入分割线
+        [self insertHistoryMsgSplitUI];
+    }
+}
+
+-(void) insertHistoryMsgSplitUI {
+    NSIndexPath *browseToIndex =  [self.dataProvider indexPathAtOrderSeq:self.browseToOrderSeq];
+     if(browseToIndex) {
+         WKMessageModel *browseMessageModel = [self.dataProvider messageAtIndexPath:browseToIndex];
+         if(browseMessageModel) {
+             if(browseMessageModel.clientSeq != [self.dataProvider lastMessage].clientSeq) {
+                 [self insertHistoryMsgSplitAtIndex:browseToIndex];
+             }
+         }
+     }
+}
+
+-(void) insertHistoryMsgSplitAtIndex:(NSIndexPath*)indexPath {
+    
+//    WKMessageModel *browseToMessageModel = [self.conversationVM messageAtIndex:index];
+    WKMessage *historySplitMessage = [[WKSDK shared].chatManager contentToMessage:WKHistorySplitTipContent.new channel:self.channel fromUid:@""];
+    self.insertedHistoryClientMsgNo = historySplitMessage.clientMsgNo;
+    [self.dataProvider insertMessage:[[WKMessageModel alloc] initWithMessage:historySplitMessage] atIndex:[NSIndexPath indexPathForRow:indexPath.row+1 inSection:indexPath.section]];
+    [self.tableView reloadData];
+}
+
+- (NSArray<WKMessageModel *> *)getSelectedMessages {
+    return [self.dataProvider getSelectedMessages];
+}
+
+-(WKConversationTableView*) tableView {
+    if(!_tableView){
+        _tableView = [[WKConversationTableView alloc] initWithFrame:CGRectMake(0.0f,0.0f,self.lim_width, self.lim_height) style:UITableViewStylePlain];
+        _tableView.dataSource = self;
+        _tableView.delegate = self;
+        _tableView.conversationTableDelegate = self;
+//        _tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        _tableView.estimatedRowHeight = 0;
+        _tableView.estimatedSectionHeaderHeight = 0;
+        _tableView.estimatedSectionFooterHeight = 0;
+        _tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
+        _tableView.backgroundColor = [UIColor clearColor];
+        [_tableView setTableFooterView:[UIView new]];
+        _tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+        [_tableView registerClass:[WKTimeHeaderView class] forHeaderFooterViewReuseIdentifier:[WKTimeHeaderView reuseId]];
+        _tableView.contentInset = UIEdgeInsetsMake(0.01f, 0, 0, 0); // TODO: 这里要整个0.01 要不然scrollIndicatorInsets会偏移顶部，黑人问号❓
+        _tableView.scrollIndicatorInsets = _tableView.contentInset;
+        
+        __weak typeof(self) weakSelf = self;
+        
+       //  MJRefreshNormalHeader
+       MJRefreshNormalHeader *header = [MJRefreshNormalHeader headerWithRefreshingBlock:^{
+               [weakSelf pulldown];
+        }];
+        header.lastUpdatedTimeLabel.hidden = YES;
+        header.stateLabel.hidden = YES;
+        header.arrowView.alpha = 0.0f;
+        header.lim_height = 30.0f;
+        _tableView.mj_header =  header;
+
+        MJRefreshAutoNormalFooter *footer = [MJRefreshAutoNormalFooter footerWithRefreshingBlock:^{
+            [weakSelf pullup];
+        }];
+        footer.refreshingTitleHidden = YES;
+        footer.stateLabel.hidden  = YES;
+        _tableView.mj_footer = footer;
+        _tableView.mj_footer.hidden = YES;
+        
+        
+    }
+    return _tableView;
+}
+-(void) adjustTableWithOffset:(CGFloat)offset {
+    self.tableView.lim_top = -offset;
+//    CGFloat statusHeight = [[UIApplication sharedApplication] statusBarFrame].size.height;
+    
+    self.tableView.contentInset = UIEdgeInsetsMake(offset, 0, 0, 0);
+    self.tableView.scrollIndicatorInsets = self.tableView.contentInset;
+}
+
+-(void) enablePullup:(BOOL) enable {
+    self.tableView.mj_footer.hidden = !enable;
+   // [self adjustTable:false]; // mj_footer.hidden = YES 会导致table下移，这里调用adjustTable调整table
+    [self adjustTableWithOffset:self.tableView.contentInset.top];
+}
+
+-(void) enablePullDown:(BOOL)enable {
+    self.tableView.mj_header.hidden = !enable;
+}
+
+// 上拉完成
+-(void) pullupFinished {
+    [self enablePullup:NO];
+}
+
+// 下拉完成
+-(void) pulldownFinished {
+    [self enablePullDown:NO];
+//    [self.conversationVM insertEndToEndEncryptHitMessageIfNeed];
+}
+
+-(void) pulldown {
+    // 防重入：如果上一次 pulldown 还在跑（ioQueue bg + main 渲染未完成），
+    // 直接静默 return，不调 endRefreshing（否则破坏 MJRefresh 状态机会导致跳顶/视觉抖动）。
+    // MJRefresh 状态由那次"正在跑的 pulldown"负责复位。
+    if (self.isPulldownInProgress) {
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    {
+        WKMessageModel *_dpHead = [self.dataProvider firstMessage];
+        WKMessageModel *_dpTail = [self.dataProvider lastMessage];
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] pulldown ENTRY dpHead=%u dpTail=%u dpDates=%lu positionAtBottom=%d",
+              _dpHead.orderSeq, _dpTail.orderSeq,
+              (unsigned long)[self.dataProvider dateCount], self.positionAtBottom);
+        #endif
+    }
+    WK_PERF_LOG(@"[PullDebug] pulldown START, mj_header.state=%ld, isPulldownInProgress=%d", (long)self.tableView.mj_header.state, self.isPulldownInProgress);
+
+    // 标记 pulldown 进行中，阻止新消息并发修改 tableView
+    self.isPulldownInProgress = YES;
+
+    // 两段式 (见 WKMessageListDataProvider.h): pulldownPrepared 只交出 models,
+    // 数据源一动不动 → 后台预热 models 的高度 → 回主线程一个 turn 内 commit + insert。
+    // 关键区别: "新增了几个 section / 几行" 不能再靠 pull 前后 diff dataProvider 得到
+    // (那要求 dp 在预热之前就被改掉, 正是崩溃根因), 改为在 commit 那个 turn 里
+    // commitPrepend: 前后就地 diff —— 全程不让出主线程, tableView 看不到中间态。
+    [self.dataProvider pulldownPrepared:^(NSArray<WKMessageModel *> *models, BOOL hasMore) {
+        WK_PERF_LOG(@"[PullDebug] pulldown prepared: hasMore=%d models=%lu", hasMore, (unsigned long)models.count);
+        if(!hasMore) {
+            [weakSelf pulldownFinished];
+        }
+
+        if (models.count == 0) {
+            [weakSelf finishPulldownWithPath:@"noModels"];
+            return;
+        }
+
+        // 预热放在 commit 之前: 此刻 dp 与 tableView 仍一致, 后台跑多久都不产生窗口。
+        WK_PERF_LOG(@"[PullDebug] pulldown: dispatching precache for %lu msgs", (unsigned long)models.count);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            CFAbsoluteTime t_precache = CFAbsoluteTimeGetCurrent();
+            for (WKMessageModel *msg in models) {
+                [weakSelf precacheHeightForMessage:msg];
+            }
+            CGFloat precacheMs = (CFAbsoluteTimeGetCurrent() - t_precache) * 1000;
+            WK_PERF_LOG(@"[PullDebug] pulldown: precache done %.1fms, dispatching to main", precacheMs);
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf commitPulldownModels:models precacheMs:precacheMs];
+            });
+        });
+    }];
+
+}
+
+/// pulldown 的 commit 阶段。**整段跑在一个主线程 turn 内**，`commitPrepend:` 与
+/// insert/reloadData 之间不允许让出主线程。
+-(void) commitPulldownModels:(NSArray<WKMessageModel *> *)models precacheMs:(CGFloat)precacheMs {
+    if (!self.tableView) {
+        self.isPulldownInProgress = NO;
+        return;
+    }
+
+    CFAbsoluteTime t_apply = CFAbsoluteTimeGetCurrent();
+
+    // ---------- 原子区开始 ----------
+    // 1) commit 前: 记录 tableView 的可见锚点 + dp 的旧计数
+    NSIndexPath *firstVisible = self.tableView.indexPathsForVisibleRows.firstObject;
+    CGFloat cellOffsetInView = 0;
+    if (firstVisible) {
+        CGRect cellRect = [self.tableView rectForRowAtIndexPath:firstVisible];
+        cellOffsetInView = cellRect.origin.y - self.tableView.contentOffset.y;
+    }
+    NSInteger oldSectionCount = [self.dataProvider dateCount];
+    NSInteger oldFirstSectionRowCount = (oldSectionCount > 0) ? [self.dataProvider rowCountAtSection:0] : 0;
+
+    // 2) commit: 前插历史消息
+    [self.dataProvider commitPrepend:models];
+
+    // 3) commit 后: 就地算出增量
+    NSInteger newSectionCount = [self.dataProvider dateCount];
+    NSInteger newSectionsAdded = newSectionCount - oldSectionCount;
+    NSInteger newRowsInOldFirstSection = 0;
+    if (oldSectionCount > 0 && newSectionsAdded >= 0 && newSectionsAdded < newSectionCount) {
+        NSInteger currentRowCount = [self.dataProvider rowCountAtSection:newSectionsAdded];
+        newRowsInOldFirstSection = currentRowCount - oldFirstSectionRowCount;
+    }
+    BOOL hasInsertions = (newSectionsAdded > 0 || newRowsInOldFirstSection > 0);
+    WK_PERF_LOG(@"[PullDebug] pulldown: hasInsertions=%d newSections=%ld newRows=%ld", hasInsertions, (long)newSectionsAdded, (long)newRowsInOldFirstSection);
+
+    if (!hasInsertions) {
+        // models 全被 dedup 掉了, dp 没变 → tableView 也不需要动, 依然是一致的。
+        [self finishPulldownWithPath:@"allDeduped"];
+        return;
+    }
+
+    NSIndexPath *targetAfterReload = nil;
+    if (firstVisible) {
+        NSInteger newSection = firstVisible.section + newSectionsAdded;
+        NSInteger newRow = firstVisible.row;
+        if (firstVisible.section == 0) {
+            newRow += newRowsInOldFirstSection;
+        }
+        targetAfterReload = [NSIndexPath indexPathForRow:newRow inSection:newSection];
+    }
+
+    // 清除边界消息的高度缓存: 老的第一条现在有了前驱, 气泡位置可能变
+    NSInteger boundarySection = newSectionsAdded;
+    NSArray *boundaryMsgs = (boundarySection < newSectionCount) ? [self.dataProvider messagesAtSection:boundarySection] : @[];
+    if (boundaryMsgs.count > (NSUInteger)newRowsInOldFirstSection) {
+        WKMessageModel *boundaryMsg = boundaryMsgs[newRowsInOldFirstSection];
+        if (boundaryMsg.clientMsgNo.length > 0) {
+            [[WKMessageListView cellHeightCache] removeObjectForKey:boundaryMsg.clientMsgNo];
+        }
+    }
+
+    BOOL didIncremental = NO;
+
+    // 消费「reset-load 后强制 reloadData」标记, 见属性注释。
+    BOOL _forceReloadForResetLoad = self.wasResetLoadPending;
+    self.wasResetLoadPending = NO;
+    if (_forceReloadForResetLoad) {
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] pulldown FORCE reloadData (post-reset-load)");
+        #endif
+    }
+
+    if (kIncrementalPulldown && !_forceReloadForResetLoad) {
+        @try {
+            // 关键修法：跟老 reloadData 路径同源 —— 用 layoutIfNeeded +
+            // rectForRowAtIndexPath:targetAfterReload 拿 anchor 真实新位置，再调 contentOffset。
+            // 之前用 contentSize.height delta 不准：endUpdates 返回时大批量插入下
+            // contentSize 还未稳定（异步），delta 偏小导致 anchor 视觉偏低 200-300pt。
+            // insertSections 跟老 reloadData 的本质区别：不重建 visible cells（reloadData
+            // 会把所有 cell 释放回 reuse pool 强制重新 cellForRow + refresh）。
+            [UIView performWithoutAnimation:^{
+                [CATransaction begin];
+                [CATransaction setDisableActions:YES];
+
+                [self.tableView beginUpdates];
+
+                if (newRowsInOldFirstSection > 0) {
+                    NSMutableArray<NSIndexPath*> *rowPaths = [NSMutableArray array];
+                    for (NSInteger r = 0; r < newRowsInOldFirstSection; r++) {
+                        [rowPaths addObject:[NSIndexPath indexPathForRow:r inSection:newSectionsAdded]];
+                    }
+                    [self.tableView insertRowsAtIndexPaths:rowPaths withRowAnimation:UITableViewRowAnimationNone];
+                }
+                if (newSectionsAdded > 0) {
+                    NSIndexSet *sectionSet = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, newSectionsAdded)];
+                    [self.tableView insertSections:sectionSet withRowAnimation:UITableViewRowAnimationNone];
+                }
+
+                [self.tableView endUpdates];
+                // 强制完成 layout，rectForRowAtIndexPath 才能返回最终坐标
+                [self.tableView layoutIfNeeded];
+
+                // 用 anchor 真实新位置调 contentOffset，跟老 reloadData 路径完全同源
+                if (targetAfterReload) {
+                    CGRect targetRect = [self.tableView rectForRowAtIndexPath:targetAfterReload];
+                    self.tableView.contentOffset = CGPointMake(0, targetRect.origin.y - cellOffsetInView);
+                }
+
+                [CATransaction commit];
+            }];
+
+            didIncremental = YES;
+
+            // 视觉对账：DIFF 现在应该 ~ 0（跟 reloadData 路径同源所以精度也同等）
+            if (targetAfterReload && WKCellPerfLog) {
+                CGRect actualRect = [self.tableView rectForRowAtIndexPath:targetAfterReload];
+                CGFloat actualOffset = actualRect.origin.y - self.tableView.contentOffset.y;
+                CGFloat diff = actualOffset - cellOffsetInView;
+                if (fabs(diff) > 0.5) {
+                    NSLog(@"[CellPerf] pulldown incremental DIFF: %.2fpt (actualOffsetInView=%.1f expected=%.1f)",
+                          diff, actualOffset, cellOffsetInView);
+                }
+            }
+        } @catch (NSException *ex) {
+            // 两段式之后这里不该再被触发 (dp 和 tableView 在同一个 turn 内一起变)。
+            // 保留兜底: 若真被触发, 说明还有别的路径在 insert 期间重入改了 dp, 该栈值得看。
+            NSLog(@"[CellPerf] pulldown incremental FAILED: %@, falling back to reloadData", ex);
+            didIncremental = NO;
+        }
+    }
+
+    if (!didIncremental) {
+        // 老路径：reloadData + setContentOffset 一步到位（贵但稳）
+        [UIView performWithoutAnimation:^{
+            [self.tableView reloadData];
+            [self.tableView layoutIfNeeded];
+        }];
+        if (targetAfterReload) {
+            [UIView performWithoutAnimation:^{
+                CGRect targetRect = [self.tableView rectForRowAtIndexPath:targetAfterReload];
+                self.tableView.contentOffset = CGPointMake(0, targetRect.origin.y - cellOffsetInView);
+            }];
+        }
+    }
+    // ---------- 原子区结束 ----------
+
+    CGFloat applyMs = (CFAbsoluteTimeGetCurrent() - t_apply) * 1000;
+    WK_PERF_LOG(@"[Perf] pulldown: %lu msgs | precache=%.1fms(bg) apply=%.1fms(main) path=%@",
+          (unsigned long)models.count, precacheMs, applyMs,
+          didIncremental ? @"INCREMENTAL" : @"RELOAD");
+
+    [self finishPulldownWithPath:(didIncremental ? @"INCREMENTAL" : @"RELOAD")];
+}
+
+/// pulldown 的统一收尾：复位 MJRefresh / 进行中标记，然后排空 pulldown 期间挂起的工作。
+-(void) finishPulldownWithPath:(NSString *)path {
+    [self.tableView.mj_header endRefreshing];
+    self.isPulldownInProgress = NO;
+    WK_PERF_LOG(@"[PullDebug] pulldown: COMPLETE (%@), mj_header.state=%ld", path, (long)self.tableView.mj_header.state);
+    #if DEBUG
+    {
+        WKMessageModel *_dpHead = [self.dataProvider firstMessage];
+        WKMessageModel *_dpTail = [self.dataProvider lastMessage];
+        NSLog(@"[BubbleBugRepro] pulldown DONE path=%@ dpHead=%u dpTail=%u dpDates=%lu",
+              path, _dpHead.orderSeq, _dpTail.orderSeq,
+              (unsigned long)[self.dataProvider dateCount]);
+    }
+    #endif
+    [self processPendingRecvMessages];
+    [self wk_tryConsumePendingReconcile];
+}
+
+-(void) pullup {
+    [self pullup:nil];
+}
+
+// pullup dedup 重试的硬上限：见下方 dedup-skip 分支注释。
+static const NSInteger kMaxPullupDedupRetry = 3;
+
+-(void) pullup:(void(^)(bool more))complete {
+    [self pullup:complete dedupRetry:0];
+}
+
+-(void) pullup:(void(^)(bool more))complete dedupRetry:(NSInteger)dedupRetry {
+
+    __weak typeof(self) weakSelf = self;
+    WK_PERF_LOG(@"[PullDebug] pullup START, mj_footer.state=%ld", (long)self.tableView.mj_footer.state);
+
+    // 两段式 (见 WKMessageListDataProvider.h): pullupPrepared 只交出 models,
+    // 后台预热 models 高度, 回主线程一个 turn 内 commitAppend: + insertRows/Sections。
+    [self.dataProvider pullupPrepared:^(NSArray<WKMessageModel *> *models, BOOL hasMore) {
+        WK_PERF_LOG(@"[PullDebug] pullup prepared: hasMore=%d models=%lu", hasMore, (unsigned long)models.count);
+        if(!hasMore) {
+            [weakSelf pullupFinished];
+        }else {
+            [weakSelf enablePullup:YES];
+        }
+
+        if (models.count == 0) {
+            [weakSelf finishPullupNoData:hasMore complete:complete dedupRetry:dedupRetry];
+            return;
+        }
+
+        // 预热放在 commit 之前: 此刻 dp 与 tableView 仍一致, 后台跑多久都不产生窗口。
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            CFAbsoluteTime t_precache = CFAbsoluteTimeGetCurrent();
+            for (WKMessageModel *msg in models) {
+                [weakSelf precacheHeightForMessage:msg];
+            }
+            CGFloat precacheMs = (CFAbsoluteTimeGetCurrent() - t_precache) * 1000;
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf commitPullupModels:models
+                                     hasMore:hasMore
+                                  precacheMs:precacheMs
+                                    complete:complete
+                                  dedupRetry:dedupRetry];
+            });
+        });
+    }];
+}
+
+/// pullup 的 commit 阶段。**整段跑在一个主线程 turn 内**，`commitAppend:` 与
+/// insert/reloadData 之间不允许让出主线程。
+///
+/// 关于 prepare→precache 窗口内本地发送导致乱序的那个历史问题：**已在 WKMessageList
+/// 层根治**（按序插入，见 _shouldOrderAfterNoLock:），这里不再需要任何闸门。
+/// 现在的行为是：窗口期发送的消息先进 dp，随后这一页会被**插到它之前**（正确顺序），
+/// 而由于那不是纯尾插，下面会退化成 reloadData 而不是走增量 insert ——
+/// 这是必须的：增量计算假设"末尾新增 N 行"，中段插入时算出来的 indexPath 会错位
+/// （行数仍对得上、不抛异常，但渲染内容错乱）。判据是
+/// dataProvider.lastInsertWasPureTailAppend，契约见 WKMessageList.h。
+-(void) commitPullupModels:(NSArray<WKMessageModel *> *)models
+                   hasMore:(BOOL)hasMore
+                precacheMs:(CGFloat)precacheMs
+                  complete:(void(^)(bool more))complete
+                dedupRetry:(NSInteger)dedupRetry {
+    __weak typeof(self) weakSelf = self;
+    if (!self.tableView) {
+        if (complete) complete(hasMore);
+        return;
+    }
+
+    CFAbsoluteTime t_insert = CFAbsoluteTimeGetCurrent();
+
+    // ---------- 原子区开始 ----------
+    // 1) commit 前: 记录 dp 旧计数（tableView 此刻与之一致）
+    NSInteger oldSectionCount = [self.dataProvider dateCount];
+    NSInteger oldLastSectionRowCount = (oldSectionCount > 0) ? [self.dataProvider rowCountAtSection:oldSectionCount - 1] : 0;
+
+    // 2) commit: 追加新消息
+    [self.dataProvider commitAppend:models];
+
+    // 按序插入之后，这一页不保证全部落在末尾 —— 预热窗口内本地发送过消息时，这一页会被
+    // 插到那条之前（这正是我们要的正确顺序）。但下面的增量计算假设"末尾新增 N 行"，
+    // 前提不成立时 indexPath 会错位（行数对得上不抛异常，但渲染内容错乱）。
+    // 所以中段插入直接 reloadData：顺序已经是对的，只是刷新方式退化，无动画。
+    // 正常路径（这一页确实比 dp 里所有消息都新）恒为纯尾插，走下面原有的增量分支。
+    if (![self.dataProvider lastInsertWasPureTailAppend]) {
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] commitPullup 中段插入 → reloadData（预热窗口内有新消息写入 dp）");
+        #endif
+        [self.tableView reloadData];
+        [self.tableView.mj_footer endRefreshing];
+        if(complete) {
+            complete(hasMore);
+        }
+        if (!hasMore) {
+            [weakSelf wk_tryConsumePendingReconcile];
+        }
+        return;
+    }
+
+    // 3) commit 后: 就地算增量
+    NSInteger newSectionCount = [self.dataProvider dateCount];
+    NSInteger newSectionsAdded = newSectionCount - oldSectionCount;
+    NSInteger oldSectionNewRowCount = (oldSectionCount > 0) ? [self.dataProvider rowCountAtSection:oldSectionCount - 1] : 0;
+    NSInteger rowsAddedInOldLastSection = MAX(0, oldSectionNewRowCount - oldLastSectionRowCount);
+    BOOL hasInsertions = (newSectionsAdded > 0 || rowsAddedInOldLastSection > 0);
+
+    if (!hasInsertions) {
+        // models 全被 dedup 掉了, dp 没变 → tableView 也不需要动。
+        [self finishPullupNoData:hasMore complete:complete dedupRetry:dedupRetry];
+        return;
+    }
+
+    [UIView performWithoutAnimation:^{
+        @try {
+            [self.tableView beginUpdates];
+
+            if (rowsAddedInOldLastSection > 0) {
+                NSMutableArray<NSIndexPath *> *rowPaths = [NSMutableArray array];
+                for (NSInteger r = oldLastSectionRowCount; r < oldSectionNewRowCount; r++) {
+                    [rowPaths addObject:[NSIndexPath indexPathForRow:r inSection:oldSectionCount - 1]];
+                }
+                [self.tableView insertRowsAtIndexPaths:rowPaths withRowAnimation:UITableViewRowAnimationNone];
+            }
+            if (newSectionsAdded > 0) {
+                NSIndexSet *sectionSet = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(oldSectionCount, newSectionsAdded)];
+                [self.tableView insertSections:sectionSet withRowAnimation:UITableViewRowAnimationNone];
+            }
+
+            [self.tableView endUpdates];
+        } @catch (NSException *exception) {
+            // 两段式之后不该再触发 (dp 与 tableView 同 turn 变更)。留兜底并打栈。
+            NSLog(@"[WKMessageListView] pullup insert drift caught: %@, fallback reloadData", exception);
+            [self.tableView reloadData];
+        }
+    }];
+    // ---------- 原子区结束 ----------
+
+    CGFloat insertMs = (CFAbsoluteTimeGetCurrent() - t_insert) * 1000;
+    WK_PERF_LOG(@"[Perf] pullup: %lu msgs | precache=%.1fms(bg) insert=%.1fms(main)", (unsigned long)models.count, precacheMs, insertMs);
+
+    [self.tableView.mj_footer endRefreshing];
+    WK_PERF_LOG(@"[PullDebug] pullup: COMPLETE (hasData path), mj_footer.state=%ld", (long)self.tableView.mj_footer.state);
+    if(complete) {
+        complete(hasMore);
+    }
+    // gate-clear 接力: 用户上滑读历史 + 锁屏复活时 reconcile 被
+    // pullupHasMore 拦下, 这里 pullup 跑完(hasMore=NO 即已到底)再补一次。
+    if (!hasMore) {
+        [weakSelf wk_tryConsumePendingReconcile];
+    }
+}
+
+/// pullup 没有净新增（没数据 / 全被 dedup）时的收尾 + 有限次重试。
+-(void) finishPullupNoData:(BOOL)hasMore
+                  complete:(void(^)(bool more))complete
+                dedupRetry:(NSInteger)dedupRetry {
+    __weak typeof(self) weakSelf = self;
+    [self.tableView.mj_footer endRefreshing];
+    WK_PERF_LOG(@"[PullDebug] pullup: COMPLETE (noData path), hasMore=%d, mj_footer.state=%ld", hasMore, (long)self.tableView.mj_footer.state);
+
+    // 去重跳过后重试：仅在有限次数内重试。
+    // 进到本方法就意味着"净新增 0 行"（SDK 没返数据，或返回的全被 clientMsgNo dedup 掉）。
+    // baseOrderSeq = dataProvider 尾部 orderSeq；净新增为 0 时尾部未推进，
+    // 下次拉取游标不变 → SDK 返回同一页 → 若不封顶就是主队列无界自我重入，
+    // 打满 CPU 触发 iOS 热降频(全局 15fps + 发热)、主线程饥饿致气泡空白。
+    // 唯一可能推进的是并发 recv 改了尾部，故保留 kMaxPullupDedupRetry 次容忍后停止；
+    // 到顶后用户继续滚动会重新触发 footer pullup(深度归 0)，不丢分页功能。
+    if(hasMore) {
+        if (dedupRetry < kMaxPullupDedupRetry) {
+            WK_PERF_LOG(@"[PullDebug] pullup: retrying (dedup skip) %ld/%ld", (long)(dedupRetry + 1), (long)kMaxPullupDedupRetry);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf pullup:complete dedupRetry:dedupRetry + 1];
+            });
+            return;
+        }
+        WK_PERF_LOG(@"[PullDebug] pullup: dedup-skip retry capped at %ld, stop", (long)kMaxPullupDedupRetry);
+        if(complete) {
+            complete(hasMore);
+        }
+        return;
+    }
+
+    if(complete) {
+        complete(hasMore);
+    }
+}
+
+// 上拉是否还有更多
+-(BOOL) pullupHasMore {
+    if(!self.lastMessage) {
+        return false;
+    }
+    WKMessageModel *currentLastMsgModel = [self.dataProvider lastMessage];
+    NSString *currentLastClientMsgNo = @"";
+    if(currentLastMsgModel) {
+        if(currentLastMsgModel.contentType == WK_TYPING) {
+            if(currentLastMsgModel.preMessageModel) {
+                currentLastClientMsgNo = currentLastMsgModel.preMessageModel.clientMsgNo;
+            } else {
+                return false;
+            }
+        }else {
+            currentLastClientMsgNo = currentLastMsgModel.clientMsgNo;
+        }
+       
+    } else {
+        return false;
+    }
+    if(![self.lastMessage.clientMsgNo isEqualToString:currentLastClientMsgNo]) {
+        // 末条 ≠ 会话最新条。正常语义是"下面还有没加载进来的消息"，返回 YES。
+        //
+        // 但还有一种**异常态**：最新那条其实**已经在 dp 里了，只是不在末尾**。目前已知的
+        // 成因是 pullup 预热窗口内本地发送导致的乱序（见 commitPullupModels: 注释 / #72）：
+        // dp 变成 1..30,61,31..60，末条退回 60，而 lastMessage 是 61。
+        // 这种状态下如果仍返回 YES，会连锁出一个远比"顺序错"严重的后果：
+        //   - handleRecvMessage 一直走"只更新 lastMessage、不写 dp"分支 → 该会话**不再显示
+        //     任何新收到的消息**；
+        //   - 而 pullup 的游标取自 dp 末条(60) 的 orderSeq，拉不到那条待发消息
+        //     （它的 orderSeq 是本地 max+1，比 31..60 还小），零新增 → hasMore=NO →
+        //     **footer 也被隐藏**；
+        //   - onConversationSyncFinished / 回前台 reconcile 同样被这个 gate 拦住。
+        // 结果是用户没有任何恢复入口，只能退出重进 —— 这是必须掐掉的那一半。
+        //
+        // 所以补一次"在不在"的判定：最新条只要已经在 dp 里，就当已加载完（返回 NO）。
+        // 这是把谓词从「末条 == 最新条」放宽成「最新条已存在」，**只在上述异常态下与原
+        // 语义不同**：正常情况下若最新条在 dp 里，它必然就在末尾（typing 已在上面跳过），
+        // 所以正常路径行为逐字节不变。放宽之后，那些 reconcile / sync-finished 路径反而
+        // 能跑起来做一次重载，顺带把顺序修正回来。
+        // 顺序本身的根治仍在 #72（按序插入 + pending 置尾 + ack 后重定位），这里只封症状。
+        if([self.dataProvider messageAtClientMsgNo:self.lastMessage.clientMsgNo]) {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+
+// 更新已读消息的orderSeq
+-(void) updateBrowseToOrderSeq {
+    if(self.browseToOrderSeq == 0) {
+        return;
+    }
+    BOOL change = false;
+    NSIndexPath *lastVisibleIndexPath =  [self lastVisibleIndexPath];
+    if(lastVisibleIndexPath) {
+        WKMessageModel *lastVisibleMessageModel = [self.dataProvider messageAtIndexPath:lastVisibleIndexPath];
+        if(lastVisibleMessageModel && lastVisibleMessageModel.orderSeq>self.browseToOrderSeq) {
+            self.browseToOrderSeq = lastVisibleMessageModel.orderSeq;
+            change = true;
+        }
+    }
+    if(change) {
+        [self refreshNewMsgCount];
+    }
+}
+
+// 更新位置
+-(void) updatePosition {
+    
+    if([self.dataProvider messageCount] == 0) {
+        self.keepPosition = nil;
+        return;
+    }
+    
+    if(self.lastMessage && [self messageIsVisible:self.lastMessage.clientMsgNo]) { // 最后一条消息可见 说明到底了
+        self.keepPosition = nil;
+        return;
+    }
+    
+    NSIndexPath *firstIndexPath = [self firstVisibleIndexPath];
+    if(!firstIndexPath) {
+        return;
+    }
+    WKMessageModel *firstMessageModel = [self.dataProvider messageAtIndexPath:firstIndexPath];
+    if(firstMessageModel.messageSeq == 1) { // 等于1表示阅读到最后一条消息了 下次进来滚到到底部
+        self.keepPosition = nil;
+        return;
+    }
+    
+    CGRect firstRect = [self.tableView rectForRowAtIndexPath:firstIndexPath];
+    uint32_t firstVisibleOrderSeq = [self.dataProvider messageAtIndexPath:firstIndexPath].orderSeq;
+
+    CGFloat offset =  self.tableView.contentOffset.y  - firstRect.origin.y;
+    
+    self.keepPosition = [WKConversationPosition orderSeq:firstVisibleOrderSeq offset:offset];
+}
+
+
+-(CGFloat) statusOffsetY {
+    
+    return [UIApplication sharedApplication].statusBarFrame.size.height;
+}
+// 消息是否可见
+-(BOOL) messageIsVisible:(NSString*)clientMsgNo {
+    NSArray<NSIndexPath*> *visibleRows = [self.tableView indexPathsForVisibleRows];
+    if(visibleRows && visibleRows.count>0) {
+        for (NSIndexPath *indexPath in visibleRows) {
+           WKMessageModel *visibleMessage = [self.dataProvider messageAtIndexPath:indexPath];
+            if([clientMsgNo isEqualToString:visibleMessage.clientMsgNo]) {
+                return [self cellIsVisible: [self.tableView rectForRowAtIndexPath:indexPath]];
+            }
+        }
+    }
+    return  false;
+}
+
+-(void) refreshNewMsgCount {
+    NSInteger oldMsgCount = self.newMsgCount;
+    if(self.browseToOrderSeq == 0) {
+        self.newMsgCount = 0;
+    }else if(!self.lastMessage) { // 没有给定最新的消息 没办法算未读数量
+        self.newMsgCount = 0;
+    }else if(self.lastMessage.isSend) { // 如果最后一条消息是自己发的 则新消息数量为0
+        self.browseToOrderSeq = self.lastMessage.orderSeq;
+        self.newMsgCount = 0;
+    }else if(self.lastMessage.orderSeq<=self.browseToOrderSeq) { // 如果最新消息的序号小于或等于预览到的 则最新消息为0
+        self.newMsgCount = 0;
+    }else {
+        uint32_t lastMessageSeq = self.lastMessage.messageSeq;
+        uint32_t browseToMessageSeq = [[WKSDK shared].chatManager getOrNearbyMessageSeq:self.browseToOrderSeq];
+         
+        if(lastMessageSeq>browseToMessageSeq) {
+            self.newMsgCount = lastMessageSeq - browseToMessageSeq;
+        }
+    }
+    [self handleNewMsgCountChange];
+    if(oldMsgCount!=self.newMsgCount){
+        [self refreshConversationListNewCount];
+    }
+   
+}
+
+// 刷新最近会话的新消息数量
+-(void) refreshConversationListNewCount {
+   WKConversationWrapModel *model = [[WKConversationListVM shared] modelAtChannel:self.channel];
+    if(model) {
+        model.unreadCount = self.newMsgCount;
+        [[WKSDK shared].conversationManager callOnConversationUpdateDelegate:[model getConversation]];
+    }
+    uint32_t messageSeq = self.lastMessage ? self.lastMessage.messageSeq : 0;
+    if (self.newMsgCount == 0) {
+        // 读完: 走 store, 保留 e32cb1d 引入的好处:
+        //   - 入 ack 队列重试上报 (治"子区 server unread 永远=1": A 类 bug)
+        //   - 写 lastReadSeq + lastLocalReadAt → reconcile 表 branch 1/3 防止
+        //     锁屏后 sync 把 0 拉回 >0 (治"锁屏后红点复活": B 类 bug)
+        [[WKUnreadStore shared] markLocalRead:self.channel readSeq:messageSeq];
+    } else {
+        // 部分读 (e.g. 5 条只读了 2 条, newMsgCount=3): build 62 老路径直接 PUT +
+        // 写本地 DB。e32cb1d 把这一支砍了, 退出聊天后 list VC 走 loadConversationList
+        // 从 DB 重读会把 in-memory 的 partial(3) 覆盖回原始 unreadCount(5),
+        // 表现就是用户报告的「滚动看了一部分,退出后 badge 又回到 5」。
+        //
+        // 为什么 PUT + DB 写不走 store?
+        //   - store 的 markLocalRead 设计是「读到这里就清 0」的语义,不支持 partial。
+        //   - server 协议是 conversationSetUnread(unread:任意值), 用 build 62 写法
+        //     直接 PUT 当前 newMsgCount, 跟 SDK markLocalRead 走的是同一 server 端口。
+        //   - 唯一回归: partial PUT 失败不入队重试 (build 62 也是这样, fire-and-forget),
+        //     server 端可能短期不收敛, 下次「读完」时 markLocalRead 会把 lastReadSeq
+        //     带上, server 端会被对齐, 可接受。
+        [[WKMessageManager shared] conversationSetUnread:self.channel unread:self.newMsgCount messageSeq:messageSeq complete:nil];
+        [[WKSDK shared].conversationManager setConversationUnreadCount:self.channel unread:self.newMsgCount];
+    }
+}
+
+-(void) forceMarkAllAsRead {
+    // 把 browseToOrderSeq 推到最新，避免后续 refreshNewMsgCount 又把 newMsgCount 算回非 0
+    if (self.lastMessage) {
+        self.browseToOrderSeq = self.lastMessage.orderSeq;
+    }
+    self.newMsgCount = 0;
+    [self refreshConversationListNewCount]; // 内部已经做 server + 本地 DB 双写
+}
+
+
+// 第一条可见的cell indexPath
+-(NSIndexPath*) firstVisibleIndexPath {
+    NSArray *indexPaths  = self.tableView.indexPathsForVisibleRows;
+    if(indexPaths && indexPaths.count>0) {
+        for (NSIndexPath *indexPath in indexPaths) {
+            CGRect rect = [self.tableView rectForRowAtIndexPath:indexPath];
+            if([self cellIsVisible:rect]) {
+                return indexPath;
+            }
+        }
+    }
+    return nil;
+}
+// 最后一条可见的cell indexPath
+-(NSIndexPath*) lastVisibleIndexPath {
+    NSArray *indexPaths  = self.tableView.indexPathsForVisibleRows;
+    if(indexPaths && indexPaths.count>0) {
+        for (NSInteger i=indexPaths.count-1; i>=0; i--) {
+            NSIndexPath *indexPath = indexPaths[i];
+            CGRect rect = [self.tableView rectForRowAtIndexPath:indexPath];
+            if([self cellIsVisible:rect]) {
+                return indexPath;
+            }
+        }
+    }
+    return nil;
+    
+}
+
+// 获取消息cell的class
+-(Class) getMessageCellClass:(WKMessageModel*) messageModel {
+    if(messageModel.revoke) {
+        return WKMessageRevokeCell.class;
+    }
+    Class  messageCellClass =  [[WKApp shared].messageRegitry getMessageCell:messageModel.contentType];
+    
+    return messageCellClass;
+}
+
+- (void)didReadedAndViewed {
+    NSArray<NSIndexPath*> *visibleRows = [self.tableView indexPathsForVisibleRows];
+    if(visibleRows && visibleRows.count>0) {
+        NSMutableArray<WKMessageModel*> *messagesOfReaded = [NSMutableArray array];
+        NSMutableArray<WKMessage*> *messagesOfViewed = [NSMutableArray array];
+        for (NSIndexPath *indexPath in visibleRows) {
+            CGRect rect = [self.tableView rectForRowAtIndexPath:indexPath];
+            if([self cellIsVisible:rect]) {
+                WKMessageModel *messageModel = [self.dataProvider messageAtIndexPath:indexPath];
+                 if(messageModel.messageId != 0 && !messageModel.isSend && !messageModel.readed && messageModel.message.setting.receiptEnabled) {
+                     [messagesOfReaded addObject:messageModel];
+                 }
+                if(messageModel.content.flame && messageModel.content.viewedOfVisible && !messageModel.viewed) {
+                    [messagesOfViewed addObject:messageModel.message];
+                }
+            }
+        }
+        if(messagesOfReaded.count>0) {
+            [self.dataProvider didReaded:messagesOfReaded];
+        }
+        if(messagesOfViewed.count>0) {
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                [WKSDK.shared.flameManager didViewed:messagesOfViewed];
+            });
+           
+        }
+    }
+}
+
+
+// cell是否在可见范围内
+-(BOOL) cellIsVisible:(CGRect)cellRect {
+    CGFloat offset = cellRect.origin.y - (self.tableView.contentOffset.y + self.tableView.contentInset.top);
+    if(offset<[self visiableTableHeight] && offset > -cellRect.size.height) {
+        return  true;
+    }
+    return false;
+}
+
+// table的可视区域
+-(CGFloat) visiableTableHeight {
+    return self.tableView.lim_height-self.tableView.contentInset.top - self.tableView.contentInset.bottom;
+    
+}
+
+
+-(void) locateMessageCellWithOrderSeqForReminder:(uint32_t)orderSeq tablePosition:(UITableViewScrollPosition)tablePosition{
+    [self locateMessageCellWithOrderSeqForReminder:orderSeq tablePosition:tablePosition allowServerFallback:YES];
+}
+
+-(void) locateMessageCellWithOrderSeqForReminder:(uint32_t)orderSeq tablePosition:(UITableViewScrollPosition)tablePosition allowServerFallback:(BOOL)allowServerFallback{
+    if(orderSeq == 0) {
+        return;
+    }
+    NSIndexPath *locatMessagePath; // 定位到的消息下表
+    locatMessagePath = [self.dataProvider indexPathAtOrderSeq:orderSeq];
+    WKMessageModel *locatMessageModel; // 定位到的消息对象
+    if(locatMessagePath) {
+        locatMessageModel = [self.dataProvider messageAtIndexPath:locatMessagePath];
+    }
+    [self startReminderAnimation];
+    if(locatMessageModel) { // 说明本地有这条消息,滚动到这条消息即可
+        [self scrollToIndex:locatMessagePath animated:YES atScrollPosition:tablePosition];
+        return;
+    }
+
+    // 本地窗口没加载到目标消息: 必须先确认它在本地 DB 是否存在, 缺失就走一次服务端
+    // pullAround 兜底再递归. 与 locateMessageCellWithMessageSeq: 保持一致.
+    //
+    // 旧实现直接 setKeepPosition + loadMessages, 走 pullFirst 内部的
+    // pullAround(aroundOrderSeq=target, maxMessageSeq=本地最新) 这一支. 当 reminder
+    // 指向一条"上翻很多页才能看到"的老 @ 消息、且本地 DB 还没缓存它时,
+    // getChannelAroundFirstMessageSeq 取不到 baseMessageSeq, 选窗口逻辑会落到
+    // 错误的一页, 表现就是按钮点击后视图静默重载/落不到目标——也就是当前 bug.
+    // 改成: 先 [WKMessageDB getMessage:] 判 DB; DB 缺失 → 显式
+    // pullAround(orderSeq=0, maxMessageSeq=target) 让 SDK 以 target 为锚去服务端
+    // 拉一窗口并写本地 DB, 然后递归 (allowServerFallback=NO) 走到 keepPosition
+    // + loadMessages 的正常滚动定位分支.
+    uint32_t messageSeq = [[WKSDK shared].chatManager getMessageSeq:orderSeq];
+    if(messageSeq == 0) {
+        return;
+    }
+    WKMessage *targetMsg = [[WKMessageDB shared] getMessage:self.channel messageSeq:messageSeq];
+    if(targetMsg && (targetMsg.isDeleted || targetMsg.remoteExtra.revoke)) {
+        [self.tableView showMsg:LLang(@"原消息不存在")];
+        return;
+    }
+    if(!targetMsg) {
+        if(!allowServerFallback) {
+            [self.tableView showMsg:LLang(@"原消息不存在")];
+            return;
+        }
+        __weak typeof(self) weakSelf = self;
+        [[WKSDK shared].chatManager pullAround:self.channel
+                                       orderSeq:0
+                                  maxMessageSeq:messageSeq
+                                          limit:[WKApp shared].config.eachPageMsgLimit
+                                       complete:^(NSArray<WKMessage *> * _Nonnull messages, NSError * _Nonnull error) {
+            void(^next)(void) = ^{
+                [weakSelf locateMessageCellWithOrderSeqForReminder:orderSeq tablePosition:tablePosition allowServerFallback:NO];
+            };
+            if (![NSThread isMainThread]) {
+                dispatch_async(dispatch_get_main_queue(), next);
+            } else {
+                next();
+            }
+        }];
+        return;
+    }
+
+    [[WKConversationPositionManager shared] removePositions:self.channel type:WKConversationPositionTypeUnreadFirst];
+    [[WKConversationPositionManager shared] channel:self.channel position:[WKConversationPosition orderSeq:orderSeq offset:0]];
+
+    self.keepPosition = [WKConversationPosition orderSeq:orderSeq offset:0];
+
+    __weak typeof(self) weakSelf = self;
+    [self loadMessages:true firstLoad:false complete:^{
+        [weakSelf startReminderAnimation];
+        NSIndexPath *browseToIndex =  [weakSelf.dataProvider indexPathAtOrderSeq:orderSeq];
+        if(browseToIndex) {
+            [weakSelf scrollToIndex:browseToIndex animated:YES atScrollPosition:tablePosition];
+        }
+    }];
+}
+
+
+-(void) startReminderAnimation {
+    // 历史实现把整段包在 [tableView performBatchUpdates:] 里, 但 block 内既没有
+    // insert/delete/move, 也没有 reload (原本那行 reloadRowsAtIndexPaths 已注释掉),
+    // 属于一个"空 batch"。UITableView 对空 batch 会在 block 前后各查一次
+    // numberOfRowsInSection 做一致性校验; 而本方法的入口
+    // (locateMessageCellWithOrderSeqForReminder: → pullAround → loadMessages
+    //  → completion) 是跨 runloop 的异步链, 中间任何一个通知路径 (新消息到达 /
+    // 分页 loadMore) 若已改动 dataProvider 但 tableView 还没被 insertRows 通知,
+    // 空 batch 就会撞上假 delta:
+    //   NSInternalInconsistencyException "invalid number of rows in section 0.
+    //   after update (60) must be equal to before update (30) plus 0 inserted..."
+    // (Bugly #24037 类同款堆栈: onTap → updateReminders → initPosition →
+    //  locateMessageCellWithOrderSeqForReminder → startReminderAnimation →
+    //  _performBatchUpdates)
+    //
+    // 修复: 拿掉 performBatchUpdates 外壳 —— 这段代码本来就没有 batch 语义要维护,
+    // 唯一的实际工作是 0.5s 后拿到 cell 触发 per-cell 的 startReminderAnimation,
+    // 与批量更新完全无关。行为等价, 消除崩溃面。
+    NSArray<WKReminder*> *reminders = self.reminders;
+    if(!reminders || reminders.count == 0) {
+        return;
+    }
+    NSMutableArray<NSIndexPath *> *indexPaths = [NSMutableArray array];
+    for (WKReminder *reminder in reminders) {
+        if(reminder.isLocate && !reminder.done) {
+            uint32_t orderSeq = [[WKSDK shared].chatManager getOrderSeq:reminder.messageSeq];
+            NSIndexPath *indexPath = [self.dataProvider indexPathAtOrderSeq:orderSeq];
+            if(indexPath) {
+                [indexPaths addObject:indexPath];
+            }
+        }
+    }
+    if(indexPaths.count == 0) {
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        for (NSIndexPath *indexPath in indexPaths) {
+            WKMessageBaseCell *cell = (WKMessageBaseCell*) [weakSelf.tableView cellForRowAtIndexPath:indexPath];
+            if(cell && [cell isKindOfClass:[WKMessageCell class]]) {
+                [(WKMessageCell*)cell startReminderAnimation];
+            }
+        }
+    });
+}
+
+-(void) scrollToIndex:(NSIndexPath*)indexPath {
+    [self scrollToIndex:indexPath animated:NO];
+}
+
+
+-(void) scrollToIndex:(NSIndexPath*)indexPath animated:(BOOL)animated{
+    if (indexPath) {
+        [self scrollToIndex:indexPath animated:animated atScrollPosition:UITableViewScrollPositionTop];
+   }
+}
+-(void) scrollToIndex:(NSIndexPath*)indexPath animated:(BOOL)animated atScrollPosition:(UITableViewScrollPosition)atScrollPosition{
+    if (!indexPath) return;
+    // dataProvider 的 orderSeq→indexPath 索引和 UITableView dataSource 在
+    // 增量更新窗口里会短暂不一致：indexPathAtOrderSeq 已能定位到刚 append
+    // 的行，但 tableView 还没拿到 numberOfRows 的新值；此时直接
+    // scrollToRowAtIndexPath 会抛 NSRangeException
+    // ("Attempted to scroll to out-of-bounds row N when there are only N rows").
+    // 这里用 tableView 当下真实尺寸做边界检查，越界就静默丢弃这次滚动 ——
+    // 真正"定位到刚到达的消息"的需求由 keepPosition / browseToOrderSeq
+    // 配合 reloadData 之后的二次 scroll 兜底，不会丢交互。
+    NSInteger sectionCount = [self.tableView numberOfSections];
+    if (indexPath.section < 0 || indexPath.section >= sectionCount) return;
+    NSInteger rowCount = [self.tableView numberOfRowsInSection:indexPath.section];
+    if (indexPath.row < 0 || indexPath.row >= rowCount) return;
+    [self.tableView beginUpdates];
+    [self.tableView scrollToRowAtIndexPath:indexPath atScrollPosition:atScrollPosition animated:animated];
+    [self.tableView endUpdates];
+}
+
+
+-(void) setFloatingHeaderViewsHidden:(BOOL)hidden animated:(BOOL)animated delay:(NSTimeInterval)delay {
+    if(self.headerViewsAnimator) {
+        [self.headerViewsAnimator stopAnimation:YES];
+        if (@available(iOS 10.0, *)) {
+            [self.headerViewsAnimator finishAnimationAtPosition:UIViewAnimatingPositionCurrent];
+        } else {
+            // Fallback on earlier versions
+        }
+    }
+    __weak typeof(self) weakSelf = self;
+    if(animated) {
+        if (@available(iOS 10.0, *)) {
+            self.headerViewsAnimator = [[UIViewPropertyAnimator alloc] initWithDuration:0.3 curve:UIViewAnimationCurveLinear animations:^{
+                [weakSelf setFloatingHeaderViewsHidden:hidden];
+            }];
+            [self.headerViewsAnimator startAnimationAfterDelay:delay];
+        } else {
+            // Fallback on earlier versions
+        }
+       
+    }else{
+       
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            [weakSelf setFloatingHeaderViewsHidden:hidden];
+        });
+    }
+}
+
+
+-(void) setFloatingHeaderViewsHidden:(BOOL)hidden {
+    NSMutableArray<NSNumber*> *visibleSections = [self indicesForVisibleSectionHeaders];
+    NSInteger firstVisibleSection = -1;
+    if(hidden) {
+        
+        UITableViewHeaderFooterView *firstVisibleHeaderView;
+        for (NSNumber *visibleSection in visibleSections) {
+           UITableViewHeaderFooterView *headerView= [self.tableView headerViewForSection:visibleSection.integerValue];
+            if(headerView.frame.origin.y + headerView.lim_height>=self.tableView.contentOffset.y+self.tableView.contentInset.top) {
+                firstVisibleSection  = visibleSection.integerValue;
+                firstVisibleHeaderView = headerView;
+                break;
+            }
+        }
+        if(firstVisibleHeaderView) {
+            CGRect fixedRect = [self.tableView rectForHeaderInSection:firstVisibleSection];
+            CGRect actualRect = firstVisibleHeaderView.frame;
+            if(ABS(fixedRect.origin.y - actualRect.origin.y)>1) {
+                firstVisibleHeaderView.alpha = 0;
+            }
+        }
+    }
+    for (NSNumber *section in visibleSections) {
+        if(section.integerValue == firstVisibleSection) {
+            continue;
+        }
+        UITableViewHeaderFooterView *header = [self.tableView headerViewForSection:section.integerValue];
+        header.alpha = 1.0f;
+    }
+}
+// 获取可见的header的index
+-(NSMutableArray<NSNumber*>*) indicesForVisibleSectionHeaders {
+    NSArray<NSIndexPath*> *indexPaths= [self.tableView indexPathsForVisibleRows];
+    NSMutableSet *sets = [[NSMutableSet alloc] init];
+    if(indexPaths.count>0) {
+        for (NSIndexPath *indexPath in indexPaths) {
+            [sets addObject:@(indexPath.section)];
+        }
+    }
+    NSMutableArray<NSNumber*> *items = [NSMutableArray array];
+    for (NSNumber *number in sets) {
+        [items addObject:number];
+    }
+    [items sortUsingComparator:^NSComparisonResult(NSNumber   *obj1, NSNumber  *obj2) {
+        return obj1.intValue>obj2.intValue;
+    }];
+    return items;
+    
+}
+
+// 结束滚动
+-(void) endScroll:(UIScrollView*)scrollView {
+    self.scrolling = false;
+    // [perf] 滚动停下：补做交互卡片(type17)在滚动中被跳过的实测高度校准，避免快滑掉帧。
+    for (UITableViewCell *c in self.tableView.visibleCells) {
+        if ([c respondsToSelector:@selector(wk_calibrateLiveHeightIfPending)]) {
+            [(id)c wk_calibrateLiveHeightIfPending];
+        }
+    }
+}
+
+- (void)reloadData {
+    [self.tableView reloadData];
+
+}
+
+// 设置多选模式
+-(void) setMultipleOn:(BOOL)multiple selectedMessage:(WKMessageModel * _Nullable)messageModel {
+    self.multipleOn = multiple;
+    // 先取消所有选中的
+    [self cancelAllSelected];
+
+    __weak typeof(self) weakSelf = self;
+    if(multiple) {
+        if(messageModel && messageModel.contentType != WK_TYPING) {
+            messageModel.checked = YES;
+        }
+        // 区间选择 anchor 起点
+        self.multipleAnchorClientMsgNo = (messageModel && messageModel.clientMsgNo.length > 0) ? [messageModel.clientMsgNo copy] : nil;
+        self.multipleAnchorContinuous = NO;
+    } else {
+        self.multipleAnchorClientMsgNo = nil;
+        self.multipleAnchorContinuous = NO;
+        [self.selectToHereTopButton hideAnimated:NO];
+        [self.selectToHereBottomButton hideAnimated:NO];
+    }
+
+    // checkBox动画
+    [self visiableCellAnimatioCheckBoxShow:multiple];
+    // checBox动画后才reloadData 如果不这样动画会被盖掉
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [weakSelf reloadData];
+    });
+}
+
+
+// 取消所有被选中的
+-(void) cancelAllSelected {
+    [self.dataProvider cancelSelectedMessages];
+    NSArray *visibleCells =  [self visibleCells];
+    if(visibleCells) {
+        for (WKMessageBaseCell *baseCell in visibleCells) {
+            if([baseCell isKindOfClass:[WKMessageCell class]]) {
+                WKMessageCell *messageCell = (WKMessageCell*)baseCell;
+                [messageCell.checkBox setOn:NO];
+            }
+        }
+    }
+}
+-(void) visiableCellAnimatioCheckBoxShow:(BOOL)show {
+    NSArray *visibleCells =  [self visibleCells];
+    if(visibleCells) {
+        for (WKMessageBaseCell *baseCell in visibleCells) {
+            if([baseCell isKindOfClass:[WKMessageCell class]]) {
+                WKMessageCell *messageCell = (WKMessageCell*)baseCell;
+                messageCell.showCheckBox = show;
+                [messageCell animationCheckBox:show];
+            }
+        }
+    }
+}
+
+#pragma mark - 多选区间选择 ("选到这里" 浮层按钮)
+
+-(void) setupSelectToHereButtons {
+    self.selectToHereTopButton = [[WKMultipleSelectToHereButton alloc] initWithPosition:WKMultipleSelectToHerePositionTop];
+    [self.selectToHereTopButton addTarget:self action:@selector(selectToHereTopTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:self.selectToHereTopButton];
+
+    self.selectToHereBottomButton = [[WKMultipleSelectToHereButton alloc] initWithPosition:WKMultipleSelectToHerePositionBottom];
+    [self.selectToHereBottomButton addTarget:self action:@selector(selectToHereBottomTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:self.selectToHereBottomButton];
+}
+
+// cell 圆圈被勾选时（来自通知）刷新 anchor
+-(void) onMultipleAnchorDidChange:(NSNotification *)notification {
+    if (!self.multipleOn) return;
+    NSString *clientMsgNo = notification.userInfo[@"clientMsgNo"];
+    if (clientMsgNo.length > 0) {
+        self.multipleAnchorClientMsgNo = [clientMsgNo copy];
+        // 用户手动选了某条 cell（不是通过"选到这里"批量），脱离连续模式，恢复 1 屏阈值
+        self.multipleAnchorContinuous = NO;
+        [self updateSelectToHereButtonsVisibility];
+    }
+}
+
+-(void) updateSelectToHereButtonsThrottled {
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - self.lastSelectToHereUpdateAt < 0.08) return;
+    self.lastSelectToHereUpdateAt = now;
+    [self updateSelectToHereButtonsVisibility];
+}
+
+-(void) updateSelectToHereButtonsVisibility {
+    if (!self.multipleOn || self.multipleAnchorClientMsgNo.length == 0) {
+        if (self.selectToHereTopButton.isShowing)    [self.selectToHereTopButton hideAnimated:YES];
+        if (self.selectToHereBottomButton.isShowing) [self.selectToHereBottomButton hideAnimated:YES];
+        return;
+    }
+
+    NSIndexPath *anchorPath = [self.dataProvider indexPathAtClientMsgNo:self.multipleAnchorClientMsgNo];
+    if (!anchorPath) {
+        return;
+    }
+
+    NSArray<NSIndexPath *> *visibleRows = [self.tableView indexPathsForVisibleRows];
+    if (visibleRows.count == 0) {
+        if (self.selectToHereTopButton.isShowing)    [self.selectToHereTopButton hideAnimated:YES];
+        if (self.selectToHereBottomButton.isShowing) [self.selectToHereBottomButton hideAnimated:YES];
+        return;
+    }
+
+    // visibleRows 不一定升序，显式取 min/max
+    NSIndexPath *firstVisible = visibleRows.firstObject;
+    NSIndexPath *lastVisible  = visibleRows.firstObject;
+    BOOL anchorVisible = NO;
+    for (NSIndexPath *p in visibleRows) {
+        if ([p compare:firstVisible] == NSOrderedAscending) firstVisible = p;
+        if ([p compare:lastVisible]  == NSOrderedDescending) lastVisible  = p;
+        if (p.section == anchorPath.section && p.row == anchorPath.row) {
+            anchorVisible = YES;
+        }
+    }
+
+    if (anchorVisible) {
+        if (self.selectToHereTopButton.isShowing)    [self.selectToHereTopButton hideAnimated:YES];
+        if (self.selectToHereBottomButton.isShowing) [self.selectToHereBottomButton hideAnimated:YES];
+        return;
+    }
+
+    BOOL anchorAbove = ([anchorPath compare:firstVisible] == NSOrderedAscending);
+    BOOL anchorBelow = ([anchorPath compare:lastVisible]  == NSOrderedDescending);
+
+    BOOL shouldShowTop = NO;
+    BOOL shouldShowBottom = NO;
+    if (anchorAbove) {
+        // anchor 在 visible 上方（更老）→ 朝下选 → 底部按钮
+        shouldShowBottom = YES;
+    } else if (anchorBelow) {
+        // anchor 在 visible 下方（更新）→ 朝上选 → 顶部按钮
+        shouldShowTop = YES;
+    }
+
+    if (shouldShowTop) {
+        [self layoutSelectToHereButton:self.selectToHereTopButton];
+        if (!self.selectToHereTopButton.isShowing) [self.selectToHereTopButton showAnimated:YES];
+    } else {
+        if (self.selectToHereTopButton.isShowing) [self.selectToHereTopButton hideAnimated:YES];
+    }
+    if (shouldShowBottom) {
+        [self layoutSelectToHereButton:self.selectToHereBottomButton];
+        if (!self.selectToHereBottomButton.isShowing) [self.selectToHereBottomButton showAnimated:YES];
+    } else {
+        if (self.selectToHereBottomButton.isShowing) [self.selectToHereBottomButton hideAnimated:YES];
+    }
+}
+
+-(void) layoutSelectToHereButton:(WKMultipleSelectToHereButton *)button {
+    if (!button) return;
+    CGFloat left = 16.0f; // 贴齐 cell 左侧圆圈
+
+    // 聊天页 tableView 通过 adjustTableWithOffset 设置 lim_top = -offset 给 multiplePanel/input 让位，
+    // 所以 tableView.frame 在 listView 坐标系里是 (0, -offset, w, h)，
+    // 它的"视觉可见区域"是 [max(frame.y, 0), min(maxY(frame), self.bounds.height)]。
+    // 顶部按钮贴视觉顶 + 8pt，底部按钮贴视觉底（tableView 真正能看见的最底，即 multiplePanel 顶）- 8pt。
+    CGFloat visualTop    = MAX(self.tableView.frame.origin.y, 0.0f);
+    CGFloat visualBottom = MIN(CGRectGetMaxY(self.tableView.frame), self.bounds.size.height);
+
+    CGFloat top;
+    if (button.position == WKMultipleSelectToHerePositionTop) {
+        top = visualTop + 8.0f;
+    } else {
+        top = visualBottom - button.bounds.size.height - 8.0f;
+    }
+    CGRect frame = button.frame;
+    frame.origin.x = left;
+    frame.origin.y = top;
+    button.frame = frame;
+}
+
+-(void) selectToHereTopTapped {
+    [self performSelectToHereForPosition:WKMultipleSelectToHerePositionTop];
+}
+
+-(void) selectToHereBottomTapped {
+    [self performSelectToHereForPosition:WKMultipleSelectToHerePositionBottom];
+}
+
+-(void) performSelectToHereForPosition:(WKMultipleSelectToHerePosition)position {
+    if (!self.multipleOn || self.multipleAnchorClientMsgNo.length == 0) return;
+    NSIndexPath *anchorPath = [self.dataProvider indexPathAtClientMsgNo:self.multipleAnchorClientMsgNo];
+    if (!anchorPath) return;
+    WKMessageModel *anchorModel = [self.dataProvider messageAtIndexPath:anchorPath];
+    if (!anchorModel || anchorModel.orderSeq == 0) return;
+
+    NSArray<NSIndexPath *> *visibleRows = [self.tableView indexPathsForVisibleRows];
+    if (visibleRows.count == 0) return;
+    NSIndexPath *targetPath = (position == WKMultipleSelectToHerePositionTop) ? visibleRows.firstObject : visibleRows.lastObject;
+    WKMessageModel *targetModel = [self.dataProvider messageAtIndexPath:targetPath];
+    if (!targetModel || targetModel.orderSeq == 0) return;
+
+    [self.dataProvider selectMessagesFromOrderSeq:anchorModel.orderSeq toOrderSeq:targetModel.orderSeq];
+
+    if (targetModel.clientMsgNo.length > 0) {
+        self.multipleAnchorClientMsgNo = [targetModel.clientMsgNo copy];
+    }
+    // 进入连续模式：新 anchor 紧贴 visible 边缘，下次离开 visible 立刻显示按钮
+    self.multipleAnchorContinuous = YES;
+
+    // 刷新可见 cell 的圆圈勾选 UI
+    NSArray *visibleCells = [self visibleCells];
+    for (UITableViewCell *cell in visibleCells) {
+        if ([cell isKindOfClass:[WKMessageCell class]]) {
+            WKMessageCell *messageCell = (WKMessageCell *)cell;
+            if (messageCell.messageModel) {
+                [messageCell.checkBox setOn:messageCell.messageModel.checked];
+            }
+        }
+    }
+
+    [self updateSelectToHereButtonsVisibility];
+    // 批量勾选了一段区间，通知外层刷新"已选 N 条"
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"WKMessageMultipleSelectionDidChange" object:nil];
+}
+
+-(NSArray<WKMessageModel*>*) getMessagesWithContentType:(NSInteger)contentType {
+    return [self.dataProvider getMessagesWithContentType:contentType];
+}
+
+- (NSArray<NSString *> *)dates {
+    return [self.dataProvider dates];
+}
+
+-(NSArray<WKMessageModel*>*) messagesAtDate:(NSString*)date {
+    return [self.dataProvider messagesAtDate:date];
+}
+
+/**
+ 获取可见的指定下标的cell
+
+ */
+-(UITableViewCell*) cellForRowAtIndex:(NSIndexPath*)indexPath {
+    return [self.tableView cellForRowAtIndexPath:indexPath];
+}
+
+
+-(void) refreshCell:(WKMessageModel*) messageModel {
+
+    NSIndexPath *indexPath =  [self.dataProvider replaceMessage:messageModel atClientMsgNo:messageModel.message.clientMsgNo];
+    if(indexPath) {
+        WKMessageBaseCell *cell = (WKMessageBaseCell *)[self.tableView cellForRowAtIndexPath:indexPath];
+        [cell refresh:messageModel];
+        // TODO: 应该不需要执行 reloadRowsAtIndexPaths 音频消息播放的时候会大量执行reloadRowsAtIndexPaths导致卡顿
+//        [self.tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+    }else {
+        [self.dataProvider addMessage:messageModel];
+        [self.tableView reloadData];
+        [self animateMessageWithBlock:^{
+            [self scrollToBottom:NO];
+        }];
+    }
+}
+
+-(void) locateMessageCellWithMessageSeq:(uint32_t )messageSeq {
+    [self locateMessageCellWithMessageSeq:messageSeq allowServerFallback:YES];
+}
+
+-(void) locateMessageCellWithMessageSeq:(uint32_t )messageSeq allowServerFallback:(BOOL)allowServerFallback {
+
+
+    BOOL visible = false; // 消息是否在可见
+    NSIndexPath *locatMessagePath; // 定位到的消息下表
+    WKMessageModel *locatMessageModel; // 定位到的消息对象
+
+    locatMessagePath = [self.dataProvider indexPathAtOrderSeq:[WKSDK.shared.chatManager getOrderSeq:messageSeq]];
+    if(locatMessagePath) {
+        locatMessageModel = [self.dataProvider messageAtIndexPath:locatMessagePath];
+    }
+    if(locatMessageModel!=nil) {
+        visible = [self cellIsVisible:[self.tableView rectForRowAtIndexPath:locatMessagePath]];
+    }
+
+    if(visible) { // 如果消息在可见范围内 则直接播提醒动画
+        locatMessageModel.reminderAnimation = YES;
+        [self.tableView reloadRowsAtIndexPaths:@[locatMessagePath] withRowAnimation:UITableViewRowAnimationNone];
+        return;
+    }
+
+    if(locatMessageModel) {
+        __weak typeof(self) weakSelf = self;
+        [self scrollToIndex:locatMessagePath animated:YES atScrollPosition:UITableViewScrollPositionMiddle];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            locatMessageModel.reminderAnimation = YES;
+            [weakSelf.tableView beginUpdates];
+            [weakSelf.tableView reloadRowsAtIndexPaths:@[locatMessagePath] withRowAnimation:UITableViewRowAnimationNone];
+            [weakSelf.tableView endUpdates];
+        });
+
+        return;
+    }
+
+    // 查DB确认消息是否存在且可用（未删除、未撤回），不可用则直接提示
+    WKMessage *targetMsg = [[WKMessageDB shared] getMessage:self.channel messageSeq:messageSeq];
+    if(targetMsg && (targetMsg.isDeleted || targetMsg.remoteExtra.revoke)) {
+        [self.tableView showMsg:LLang(@"原消息不存在")];
+        return;
+    }
+    if(!targetMsg) {
+        // 本地 DB 没有命中：常见于"推送 APNs 先于 socket 消息到达"——服务端先把通知推到 APNs,
+        // 但 IM 通道的 onRecvMessages 还没把消息落到本地 DB。此时直接报"原消息不存在"是误报。
+        // 允许 fallback 时先走服务端 pullAround 拉一窗口(SDK 会写本地 DB),拿到后递归再走一遍定位;
+        // 仍然没有(allowServerFallback=NO)才真正提示。
+        if(!allowServerFallback) {
+            [self.tableView showMsg:LLang(@"原消息不存在")];
+            return;
+        }
+        __weak typeof(self) weakSelf = self;
+        [[WKSDK shared].chatManager pullAround:self.channel
+                                       orderSeq:0
+                                  maxMessageSeq:messageSeq
+                                          limit:[WKApp shared].config.eachPageMsgLimit
+                                       complete:^(NSArray<WKMessage *> * _Nonnull messages, NSError * _Nonnull error) {
+            void(^next)(void) = ^{
+                [weakSelf locateMessageCellWithMessageSeq:messageSeq allowServerFallback:NO];
+            };
+            if (![NSThread isMainThread]) {
+                dispatch_async(dispatch_get_main_queue(), next);
+            } else {
+                next();
+            }
+        }];
+        return;
+    }
+
+    self.keepPosition = [WKConversationPosition orderSeq:[[WKSDK shared].chatManager getOrderSeq:messageSeq] offset:0];
+
+    __weak typeof(self) weakSelf = self;
+    [self loadMessages:true firstLoad:false complete:^{
+        NSIndexPath *browseToIndex = [weakSelf.dataProvider indexPathAtOrderSeq:[WKSDK.shared.chatManager getOrderSeq:messageSeq]];
+        if(browseToIndex) {
+             WKMessageModel *messageModel = [weakSelf.dataProvider messageAtIndexPath:browseToIndex];
+            [weakSelf scrollToIndex:browseToIndex animated:YES atScrollPosition:UITableViewScrollPositionMiddle];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                messageModel.reminderAnimation = YES;
+                [weakSelf.tableView beginUpdates];
+                [weakSelf.tableView reloadRowsAtIndexPaths:@[browseToIndex] withRowAnimation:UITableViewRowAnimationNone];
+                [weakSelf.tableView endUpdates];
+            });
+        }
+    }];
+    
+ //    [self.conversationVM clearMessages];
+ //    __weak typeof(self) weakSelf = self;
+ //    [self.conversationVM pullAtLocation:destMessage.orderSeq complete:^(bool hasMore) {
+ //        if(!hasMore) {
+ //            weakSelf.tableView.mj_header.hidden = YES;
+ //        }
+ //
+ //        [weakSelf.tableView reloadData];
+ //        [weakSelf.tableView.mj_header endRefreshing];
+ //
+ //
+ //
+ //        // 判断是否启用pullup
+ //        WKMessageModel *lastMessageModel = [self.conversationVM lastMessageModel];
+ //        if(lastMessageModel && weakSelf.conversationVM.conversation.lastMessage && lastMessageModel.clientSeq == weakSelf.conversationVM.conversation.lastMessage.clientSeq) {
+ //            [self enablePullup:NO];
+ //        }else{
+ //            [self enablePullup:YES];
+ //        }
+ //    }];
+}
+
+// 定位到指定消息
+-(void) locateMessageCell:(uint32_t)messageSeq{
+    if(messageSeq == 0) {
+        return;
+    }
+    [self locateMessageCellWithMessageSeq:messageSeq];
+}
+
+// 是否需要处理消息
+-(BOOL) needHandle:(WKMessage*)message {
+    if(![message.channel isEqual:self.channel]) {
+        return false;
+    }
+    if(message.contentType == WK_CMD) { // 命令类消息不处理
+        return false;
+    }
+    if(message.contentType == WK_VIDEOCALL_DATA) { // 音视频数据传输类的消息不处理
+        return false;
+    }
+   
+    return true;
+}
+
+// 判断消息是否应在当前空间显示（所有个人聊天在多空间模式下按space_id过滤）
+-(BOOL) shouldShowMessageInCurrentSpace:(WKMessage*)message {
+    if(self.channel.channelType != WK_PERSON) {
+        return YES;
+    }
+    NSString *currentSpaceId = [[NSUserDefaults standardUserDefaults] objectForKey:@"currentSpaceId"];
+    if(!currentSpaceId || currentSpaceId.length == 0) {
+        return YES;
+    }
+    NSString *msgSpaceId = message.content.contentDict[@"space_id"];
+    BOOL hasSpaceId = msgSpaceId
+        && ![msgSpaceId isKindOfClass:[NSNull class]]
+        && ([msgSpaceId isKindOfClass:[NSString class]] && msgSpaceId.length > 0);
+    if(!hasSpaceId) {
+        // : 系统bot(botfather/u_10000/fileHelper 等 appconfig.system_bot_uids)
+        // 的无 space_id 消息在空间模式下隐藏；普通个人聊天保持向前兼容（可见）。
+        NSArray<NSString*> *systemBotUIDs = [WKApp shared].config.systemBotUIDs;
+        NSString *channelId = self.channel.channelId;
+        BOOL isSystemBot = channelId.length > 0
+            && systemBotUIDs.count > 0
+            && [systemBotUIDs containsObject:channelId];
+        if(isSystemBot) {
+            return NO;
+        }
+        return YES; // 无space_id的历史消息，非系统bot的所有空间可见
+    }
+    return [msgSpaceId isEqualToString:currentSpaceId];
+}
+
+// 异源 typing 残留预清理：多 bot 同时 typing 时,WKTypingManager 字典按 channel 单坑覆盖,
+// UI 端的 typing model 仍是首个 bot 的(因为后续 typing 不触发 typingAdd 回调)。
+// 此时若另一 bot 发来真实消息：
+//   - WKMessageList.addMessage 检测到末尾是 typing 但 fromUid 不同 → 走 `_insertMessage at row=count-1`
+//     把真实消息插到 typing 之前,typing 仍占末尾。
+//   - 但 handleRecvMessage/sendMessage 的增量 UI 更新假设新行追加到末尾,
+//     `insertRowsAtIndexPaths` 落在末尾索引上,tableView 取到的是 typing model(数据末尾仍是 typing),
+//     真实消息的行(在中间)从未被 tableView 感知 → 现象就是"页面卡住不刷新,真实消息隐形"。
+// 修复：在 addMessage 之前,若末尾 typing 与新消息 fromUid 不同,先把 UI 端 typing 删掉,
+// 再统一走"追加到末尾"路径。同时清掉 WKTypingManager 字典,让下一次 typing keepalive
+// 能重新走 typingAdd 把 typing 加回来(不影响后续 typing 动画)。
+-(void) evictStaleTypingForIncomingMessage:(WKMessageModel*)newMessageModel {
+    if (!newMessageModel || newMessageModel.contentType == WK_TYPING) {
+        return;
+    }
+    WKMessageModel *lastMsg = [self.dataProvider lastMessage];
+    if (!lastMsg || lastMsg.contentType != WK_TYPING) {
+        return;
+    }
+    // 同源会被 WKMessageList.replaceMessageLast 干净替换,不需要预清理
+    if ([lastMsg.fromUid isEqualToString:newMessageModel.fromUid]) {
+        return;
+    }
+    // 删除 UI 端 typing(deleteMessageUI 用 clientMsgNo 查 indexPath,内部已有越界保护)
+    if (lastMsg.message) {
+        [self deleteMessageUI:lastMsg.message];
+    }
+    // 同步清掉 manager 字典,让下次 typing 重新走 typingAdd 加回 UI(否则字典残留会让 typingAdd 静默)
+    if ([[WKTypingManager shared] hasTyping:self.channel]) {
+        [[WKTypingManager shared] removeTypingByChannel:self.channel newMessage:nil];
+    }
+}
+
+-(void) handleRecvMessage:(WKMessage*) message  {
+    if(message.isDeleted) { // 已删除的消息不处理
+        return;
+    }
+
+    // pulldown / rehydrate 进行中，暂存新消息避免并发修改 tableView 导致布局错乱。
+    // pulldown 跑完会在 endPulldown 路径里 drain; rehydrate 跑完在 finishRehydrate
+    // 里 drain。两条路径共用同一个 pendingRecvMessages 缓冲区, 不会冲突。
+    if(self.isPulldownInProgress || self.isRehydrating) {
+        if(!self.pendingRecvMessages) {
+            self.pendingRecvMessages = [NSMutableArray array];
+        }
+        [self.pendingRecvMessages addObject:message];
+        return;
+    }
+
+    if(![message isSend]) {
+        self.hasRecvMsg = true;
+    }
+    WKMessageModel *messageModel = [[WKMessageModel alloc] initWithMessage:message];
+    {
+        WKMessageModel *_dpTail = [self.dataProvider lastMessage];
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] handleRecvMessage ENTRY msgNo=%@ msgOrderSeq=%u dpTail=%u lastMsg=%u pullupHasMore=%d positionAtBottom=%d appState=%ld",
+              message.clientMsgNo, messageModel.orderSeq,
+              _dpTail.orderSeq, self.lastMessage.orderSeq,
+              [self pullupHasMore], self.positionAtBottom,
+              (long)[UIApplication sharedApplication].applicationState);
+        #endif
+    }
+    if([self pullupHasMore]) { // 消息没有完全加载完成
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] handleRecvMessage PATH=pullupHasMore (only updateLastMsgIfNeed) — NEW MSG DROPPED FROM DP");
+        #endif
+        [self updateLastMsgIfNeed:messageModel];
+        if( [message isSend]) {
+            [self  pullBottom];
+        }
+    } else {
+        [self updateLastMsgIfNeed:messageModel];
+
+        // 预缓存高度（触发 markdown 渲染），避免在 UITableView 布局回调中首次渲染
+        [self precacheHeightForMessage:messageModel];
+
+        // 异源 typing 残留预清理：见 evictStaleTypingForIncomingMessage: 注释
+        [self evictStaleTypingForIncomingMessage:messageModel];
+
+        // 后台收消息走 reloadData，不走离屏增量 insert（回归修复）：
+        //   App 在后台/锁屏时 tableView 不在可见 window，insertRowsAtIndexPaths 只更新
+        //   行簿记和 contentSize（precache 已写入高度缓存），但 UIKit 不会回调 willDisplayCell:，
+        //   cell 内容填充(refresh:)永不执行；回前台后 UIKit 认为这些行"已布局"，不再重渲染，
+        //   表现为"最新消息行空白、下滑是空区域"。同时 updateLastMsgIfNeed 已把 self.lastMessage
+        //   推进到这条新消息，导致 onConversationSyncFinished / onConnectStatus 的 last-message
+        //   相等判断提前 return，永远不会补一次 reloadData。reloadData 是惰性的，回前台下次
+        //   layout 会重查 numberOfRows 并重新 willDisplayCell:，自愈（对齐 git-init 的原行为）。
+        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+            #if DEBUG
+            NSLog(@"[BubbleBugRepro] handleRecvMessage PATH=background msgOrderSeq=%u dpTail=%u (no gap-fill in bg branch)",
+                  messageModel.orderSeq, [self.dataProvider lastMessage].orderSeq);
+            #endif
+            // R4 fix: 标记 "回前台 reconcile 时即使 numberOfRows 一致也要强制 reloadData 一次",
+            // 治后台 reloadData + scrollToBottom 触发离屏 layout 但 willDisplayCell: 没回调,
+            // 回前台 UIKit 误判 "已布局" 不重渲染、cell 内容空白的回归。消费点:
+            // onAppDidBecomeActiveReconcile:。
+            self.dirtyAfterBackground = YES;
+            [self.dataProvider addMessage:messageModel];
+            [self.tableView reloadData];
+            if (self.positionAtBottom) { [self scrollToBottom:NO]; }
+            else if ([message isSend]) { [self scrollToBottom:NO]; }
+            return;
+        }
+
+        // R4 fix (sync gap): conversation-sync 期间会把若干 backlog 消息直写 DB (绕过
+        // onRecvMessages, 见 onConversationSyncFinished 注释), 同时 IM stream 也可能
+        // 抢先派发一条新 live message。这条 live message 的 orderSeq 比 dp 末尾跳了 >1,
+        // 简单 dp.addMessage 会留洞 → 用户上滑/对账永远看不到中间消息, 而后续
+        // self.lastMessage == dbLastMsg 早退路径再也救不回来 (现有 beginRehydrate 的
+        // pullup baseOrderSeq = dp.lastMessage.orderSeq, 加完 live 后 pullup 返回 0)。
+        // 用 SDK pullUp endOrderSeq 变体把 [dpLast.orderSeq, live.orderSeq] 之间的 DB
+        // 消息一次拉回, 含这条 live 一并 dp.addMessage, 一次 reloadData 收敛。
+        // dp 不重置, 用户上滑读到的 history 仍在。
+        WKMessageModel *dpLastBefore = [self.dataProvider lastMessage];
+        if (dpLastBefore && dpLastBefore.orderSeq > 0 &&
+            messageModel.orderSeq > dpLastBefore.orderSeq + 1 &&
+            !self.isRehydrating) {
+#if DEBUG
+            NSLog(@"[GapFill] orderSeq jump detected: dpLast=%u live=%u gap=%u msgNo=%@",
+                  dpLastBefore.orderSeq, messageModel.orderSeq,
+                  messageModel.orderSeq - dpLastBefore.orderSeq - 1,
+                  messageModel.clientMsgNo);
+#endif
+            [self fillOrderSeqGapAndInsert:messageModel previousLast:dpLastBefore];
+            return;
+        }
+
+        // Bugly #3054 兜底（另一路径 crash：before=31/after=32/inserted=0/deleted=0）：
+        //   handleRecvMessage 可能在 dp 已经和 tv 漂移的状态下被调用（前一次 insert 抛异常被吞掉、
+        //   或前序 send/recv 因嵌套 RunLoop 留下漂移）。进入增量更新前做一次一致性检查，不一致
+        //   就直接 addMessage + reloadData 收敛，不走后面的增量路径。
+        BOOL inSyncBefore = [self isTableViewRowCountInSyncWithDataProvider];
+        if (!inSyncBefore) {
+            [self.dataProvider addMessage:messageModel];
+            [self.tableView reloadData];
+            if(self.positionAtBottom) { [self scrollToBottom:YES]; }
+            else if ([message isSend]) { [self scrollToBottom:YES]; }
+            return;
+        }
+
+        // 快照 addMessage 前后的 section/row 数量，按实际变化增量更新
+        NSInteger oldSectionCount = [self.dataProvider dateCount];
+        NSInteger oldLastSectionRowCount = 0;
+        if (oldSectionCount > 0) {
+            oldLastSectionRowCount = [self.dataProvider rowCountAtSection:oldSectionCount - 1];
+        }
+
+        [self.dataProvider addMessage:messageModel];
+
+        // 与 sendMessage: 同一份契约（WKMessageList.h）：按序插入之后新消息不保证落在末尾，
+        // 而下面整段增量计算假设"末尾新增 N 行"。中段插入时算出来的 indexPath 是错的 ——
+        // 行数仍对得上所以不抛异常，但 row N-1 会继续渲染旧 model、新绑定的 row N 渲染原末条，
+        // 结果是**这条新消息看不见、上一条末尾显示两遍**，比乱序更糟。
+        // 这是四个增量调用方里最忙的一个，之前漏了（@yujiawei P1-1）。
+        // 注意：这里**不能**直接 return —— 本方法末尾的 positionAtBottom 滚动是收尾的一
+        // 部分（P2-5 同类问题）。所以只跳过增量计算，用 skipIncremental 走到下面的滚动。
+        BOOL skipIncremental = ![self.dataProvider lastInsertWasPureTailAppend];
+        if (skipIncremental) {
+            [self.tableView reloadData];
+        }
+
+        NSInteger newSectionCount = [self.dataProvider dateCount];
+        BOOL newSectionAdded = (newSectionCount > oldSectionCount);
+        NSInteger newLastSectionRowCount = (newSectionCount > 0) ? [self.dataProvider rowCountAtSection:newSectionCount - 1] : 0;
+
+        // Bugly #3054 兜底：见 sendMessage: 同处注释。insertRows 内嵌套 RunLoop 会让主队列
+        // pending 的 pulldown/其他 recv 在 insert 期间追加 dp，校验漂移 → NSInternalInconsistencyException。
+        if (skipIncremental) {
+            // 已经 reloadData 过了，整段增量计算跳过（它的前提"末尾新增"不成立）
+        } else if (!newSectionAdded && newLastSectionRowCount > oldLastSectionRowCount) {
+            NSInteger intendedDelta = newLastSectionRowCount - oldLastSectionRowCount;
+            NSInteger tvSectionsNow = [self.tableView numberOfSections];
+            NSInteger dsNow = [self.dataProvider rowCountAtSection:newSectionCount - 1];
+            NSInteger tvNow = (tvSectionsNow == newSectionCount) ? [self.tableView numberOfRowsInSection:newSectionCount - 1] : -1;
+            if (tvNow < 0 || dsNow - tvNow != intendedDelta) {
+                [self.tableView reloadData];
+                if(self.positionAtBottom) { [self scrollToBottom:YES]; }
+                else if ([message isSend]) { [self scrollToBottom:YES]; }
+                return;
+            }
+        }
+
+        // ⚠️ 这条才是真正**改 tableView** 的链（上面那条只是 Bugly #3054 的计数漂移检查）。
+        // skipIncremental 的守卫必须同时加在这里：@yujiawei P1-A 指出我上一版只守了上面
+        // 那条，于是 skipIncremental 为真时先 reloadData、又落到这里 insertRows ——
+        // 此刻 tableView 的行数已经是 reload 后的新值，再声称"新增 N 行"必然对不上，
+        // 靠下面的 @try 兜住不崩，但每次都白抛一次异常再 reloadData 一遍。
+        if (skipIncremental) {
+            // 已经 reloadData 过了，绝不能再动 tableView
+        } else if (newSectionAdded) {
+            // 新日期分组：插入整个 section
+            @try {
+                [UIView performWithoutAnimation:^{
+                    [self.tableView insertSections:[NSIndexSet indexSetWithIndex:newSectionCount - 1] withRowAnimation:UITableViewRowAnimationNone];
+                }];
+            } @catch (NSException *ex) {
+                NSLog(@"[WKMessageListView] recv insertSections drift caught: %@, fallback reloadData", ex);
+                [self.tableView reloadData];
+            }
+        } else if (!newSectionAdded && newLastSectionRowCount > oldLastSectionRowCount) {
+            // 同日期且行数增加：在末尾插入新行
+            NSMutableArray<NSIndexPath *> *indexPaths = [NSMutableArray array];
+            for (NSInteger row = oldLastSectionRowCount; row < newLastSectionRowCount; row++) {
+                [indexPaths addObject:[NSIndexPath indexPathForRow:row inSection:newSectionCount - 1]];
+            }
+            @try {
+                [UIView performWithoutAnimation:^{
+                    [self.tableView insertRowsAtIndexPaths:indexPaths withRowAnimation:UITableViewRowAnimationNone];
+                }];
+            } @catch (NSException *ex) {
+                NSLog(@"[WKMessageListView] recv insertRows drift caught: %@, fallback reloadData", ex);
+                [self.tableView reloadData];
+            }
+        } else {
+            // typing 替换/丢弃等场景：行数不变，刷新最后一行即可
+            //   reloadRow 同样需要 ds.count == tv.count，否则 UITableView 校验仍会抛异常（Bugly 另一路径）。
+            if (newSectionCount > 0 && newLastSectionRowCount > 0) {
+                NSIndexPath *lastPath = [NSIndexPath indexPathForRow:newLastSectionRowCount - 1 inSection:newSectionCount - 1];
+                NSInteger tvSectionsNow = [self.tableView numberOfSections];
+                NSInteger tvRowsNow = (tvSectionsNow == newSectionCount) ? [self.tableView numberOfRowsInSection:newSectionCount - 1] : -1;
+                if (tvRowsNow != newLastSectionRowCount) {
+                    [self.tableView reloadData];
+                } else {
+                    @try {
+                        [self.tableView reloadRowsAtIndexPaths:@[lastPath] withRowAnimation:UITableViewRowAnimationNone];
+                    } @catch (NSException *ex) {
+                        NSLog(@"[WKMessageListView] recv reloadRows drift caught: %@, fallback reloadData", ex);
+                        [self.tableView reloadData];
+                    }
+                }
+            }
+        }
+
+        if(self.positionAtBottom) {
+            [self scrollToBottom:YES];
+        }else{
+            if( [message isSend]) {
+                [self scrollToBottom:YES];
+            }
+        }
+
+    }
+}
+
+// pulldown 完成后，统一处理暂存的新消息
+-(void) processPendingRecvMessages {
+    if(!self.pendingRecvMessages || self.pendingRecvMessages.count == 0) {
+        return;
+    }
+    NSArray<WKMessage*> *pending = [self.pendingRecvMessages copy];
+    [self.pendingRecvMessages removeAllObjects];
+    for(WKMessage *msg in pending) {
+        [self handleRecvMessage:msg];
+    }
+}
+
+//通过删除然后插入的方式更新cell
+-(void) refreshCellForDeleteAndInsert:(WKMessageModel*) messageModel {
+
+    NSIndexPath *indexPath =  [self.dataProvider replaceMessage:messageModel atClientMsgNo:messageModel.clientMsgNo];
+    if(indexPath) {
+        WKMessageBaseCell *cell = (WKMessageBaseCell *)[self.tableView cellForRowAtIndexPath:indexPath];
+        [cell refresh:messageModel];
+        if (@available(iOS 11.0, *)) {
+            // Bugly 兜底：dp/tv 漂移时 performBatchUpdates 内部 delete+insert 同 path 会触发
+            // NSInternalInconsistencyException。漂移直接 reloadData 收敛；正常时 @try 兜底。
+            if (![self isTableViewRowCountInSyncWithDataProvider]) {
+                [self.tableView reloadData];
+            } else {
+                @try {
+                    [self.tableView performBatchUpdates:^{
+                        [self.tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationFade];
+                        [self.tableView insertRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationFade];
+                    } completion:nil];
+                } @catch (NSException *ex) {
+                    NSLog(@"[WKMessageListView] refreshCellForDeleteAndInsert drift caught: %@, fallback reloadData", ex);
+                    [self.tableView reloadData];
+                }
+            }
+        }
+
+    }else {
+        [self.dataProvider addMessage:messageModel];
+        [self.tableView reloadData];
+        [self animateMessageWithBlock:^{
+            [self scrollToBottom:NO];
+        }];
+    }
+}
+
+- (void)setLastMessage:(WKMessageModel *)lastMessage {
+    [self updateLastMsgIfNeed:lastMessage];
+}
+
+- (WKMessageModel *)lastMessage {
+    return self.lastMessageInner;
+}
+
+-(BOOL) updateLastMsgIfNeed:(WKMessageModel*)messageModel {
+    bool change = false;
+    if(!self.lastMessageInner) {
+        self.lastMessageInner = messageModel;
+        change = true;
+    }else if(self.lastMessageInner.orderSeq<messageModel.orderSeq){
+        self.lastMessageInner = messageModel;
+        change = true;
+    }
+    if(change) {
+        [self refreshNewMsgCount];
+        return true;
+    }
+    return false;
+}
+
+
+-(NSArray<UITableViewCell*>*) visibleCells {
+    return [self.tableView visibleCells];
+}
+
+# pragma mark -- 列表委托 UITableViewDataSource && UITableViewDelegate
+
+- (void)tableView:(UITableView *)tableView touchesTime:(NSTimeInterval)timestamp {
+    // 交互卡片(type17)输入框聚焦期间，触摸卡片不收键盘——否则点输入框聚焦的同一次触摸
+    // 会冒泡到列表 touchesEnded 把键盘收掉（光标闪一下就消失）。手动滑动仍由
+    // keyboardDismissMode=OnDrag 正常收起。
+    for (UITableViewCell *c in self.tableView.visibleCells) {
+        if ([c respondsToSelector:@selector(wk_hasFocusedCardInput)] &&
+            [(id)c wk_hasFocusedCardInput]) {
+            return;
+        }
+    }
+    // 短按点击或长按都收起键盘
+    if(self.onContentViewClick) {
+        self.onContentViewClick();
+    }else {
+        [[UIApplication sharedApplication] sendAction:@selector(resignFirstResponder) to:nil from:nil forEvent:nil];
+    }
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath{
+
+    WKMessageModel *messageModel = [self.dataProvider messageAtIndexPath:indexPath];
+    Class messageCellClass =  [self getMessageCellClass:messageModel];
+
+    NSString *identifier = NSStringFromClass(messageCellClass);
+    // 含表格的文本消息：用 messageId 做唯一 reuseIdentifier，不参与复用池
+    if (messageCellClass == WKTextMessageCell.class && messageModel.contentType == WK_TEXT) {
+        id contentObj = [messageModel content];
+        if ([contentObj isKindOfClass:[WKTextContent class]]) {
+            NSString *rawText = ((WKTextContent*)contentObj).content;
+            if ([rawText isKindOfClass:[NSString class]] && [WKMarkdownRenderer containsTable:rawText]) {
+                identifier = [NSString stringWithFormat:@"%@_table_%llu", identifier, messageModel.messageId];
+            }
+        }
+    }
+    WKMessageBaseCell *cell = [self.tableView dequeueReusableCellWithIdentifier:identifier];
+    // 复用池中的 cell 类型可能与当前消息不匹配（reloadData 期间数据源变化），重新创建
+    BOOL didAlloc = NO;
+    if(!cell || ![cell isKindOfClass:messageCellClass]) {
+        cell = [[messageCellClass alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
+        didAlloc = YES;
+    }
+    if (WKCellPerfLog && didAlloc) {
+        // ALLOC = 没复用上。table 含表格的 cell 每条都唯一 identifier，alloc 一次是预期；
+        // 但如果某个普通 identifier 反复 ALLOC，说明 dequeue 一直拿不到旧的，可能是 cell 类型混用 / reuse pool 失效
+        NSLog(@"[CellPerf] cellForRow ALLOC: id=%@ msgNo=%@ section=%ld row=%ld",
+              identifier, messageModel.clientMsgNo, (long)indexPath.section, (long)indexPath.row);
+    }
+    return cell;
+}
+
+// 增量 pulldown 路径用：从 cellHeightCache 取已缓存高度，miss 时同步算（理论上 pulldown
+// 之前 bg 已经 precache 全了，这里不应该 miss；miss 了打 warn 但仍返回正确值，保证算出来的
+// insertedHeight 不会偏）。
+-(CGFloat) _cachedHeightForMessage:(WKMessageModel *)msg {
+    if (!msg || msg.clientMsgNo.length == 0) return 0;
+    @try {
+        Class cellClass = [self getMessageCellClass:msg];
+        NSInteger bubblePos = 0;
+        if ([cellClass respondsToSelector:@selector(bubblePosition:)]) {
+            bubblePos = [cellClass bubblePosition:msg];
+        }
+        NSString *heightKey = [NSString stringWithFormat:@"%@-bp%ld", msg.clientMsgNo, (long)bubblePos];
+        if (msg.remoteExtra.contentEdit) {
+            heightKey = [NSString stringWithFormat:@"%@-e%lu", heightKey, (unsigned long)msg.remoteExtra.editedAt];
+        }
+        NSNumber *cached = [[WKMessageListView cellHeightCache] objectForKey:heightKey];
+        if (cached) return cached.floatValue;
+        if (WKCellPerfLog) {
+            NSLog(@"[CellPerf] _cachedHeightForMessage MISS key=%@ — will compute on main", heightKey);
+        }
+        CGSize size = [cellClass sizeForMessage:msg];
+        CGFloat h = MAX(size.height, 0.1f);
+        // 拒绝写入病态小值 (< 15pt), 见 heightForRowAtIndexPath 里同款注释。
+        if (h > 15.0f) {
+            [[WKMessageListView cellHeightCache] setObject:@(h) forKey:heightKey];
+        } else {
+            #if DEBUG
+            NSLog(@"[BubbleBugRepro] _cachedHeight REJECT pathological h=%.1f msgNo=%@",
+                  h, msg.clientMsgNo);
+            #endif
+            h = 44.0f;
+        }
+        return h;
+    } @catch (NSException *ex) {
+        NSLog(@"[CellPerf] _cachedHeightForMessage exception: %@", ex);
+        return 44.0; // fallback，跟 heightForRowAtIndexPath 默认值一致
+    }
+}
+
+// 预计算消息高度并写入 cellHeightCache，确保 reloadData 时高度正确
+-(void) precacheHeightForMessage:(WKMessageModel *)msg {
+    if (!msg) return;
+    BOOL isStreaming = msg.streamOn && msg.streamFlag != WKStreamFlagEnd;
+    if (isStreaming) return;
+
+    if (!msg.clientMsgNo || msg.clientMsgNo.length == 0) return;
+
+    @try {
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+        Class cellClass = [self getMessageCellClass:msg];
+        NSInteger bubblePos = 0;
+        if ([cellClass respondsToSelector:@selector(bubblePosition:)]) {
+            bubblePos = [cellClass bubblePosition:msg];
+        }
+        NSString *heightKey = [NSString stringWithFormat:@"%@-bp%ld", msg.clientMsgNo, (long)bubblePos];
+        if (msg.remoteExtra.contentEdit) {
+            heightKey = [NSString stringWithFormat:@"%@-e%lu", heightKey, (unsigned long)msg.remoteExtra.editedAt];
+        }
+        if ([[WKMessageListView cellHeightCache] objectForKey:heightKey]) return;
+        CFTimeInterval __probe0 = CACurrentMediaTime();
+        CGSize size = [cellClass sizeForMessage:msg];
+        // 探针：precache 测高耗时按 cell 类聚合。卡片类此调用内部 dispatch_sync 回主线程，会阻塞主线程。
+        [WKACardRenderer perfAccrue:[NSString stringWithFormat:@"P.size.%@", NSStringFromClass(cellClass)]
+                                 ms:(CACurrentMediaTime() - __probe0) * 1000.0];
+        CGFloat height = MAX(size.height, 0.1f);
+        // 拒绝写入病态小值 (< 15pt), 见 heightForRowAtIndexPath 里同款注释:
+        // measure race 拿到 0 时如果写进 cache 就永久污染, cell 永远 0.1px 空白。
+        // 不写让下次调用重试, 直到拿到正常值。
+        if (height > 15.0f) {
+            [[WKMessageListView cellHeightCache] setObject:@(height) forKey:heightKey];
+        } else {
+            #if DEBUG
+            NSLog(@"[BubbleBugRepro] precache REJECT pathological height=%.1f msgNo=%@",
+                  height, msg.clientMsgNo);
+            #endif
+        }
+        CGFloat ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000;
+        if (ms > 10) {
+            NSString *preview = @"";
+            if (msg.contentType == 1 && [msg.content isKindOfClass:NSClassFromString(@"WKTextContent")]) {
+                NSString *text = [(id)msg.content content];
+                if ([text isKindOfClass:[NSString class]]) {
+                    preview = text.length > 60 ? [text substringToIndex:60] : text;
+                    preview = [preview stringByReplacingOccurrencesOfString:@"\n" withString:@"↵"];
+                }
+            }
+            WK_PERF_LOG(@"[Perf] precache SLOW: %.1fms type=%ld len=%lu key=%@ content=[%@]",
+                  ms, (long)msg.contentType,
+                  (unsigned long)(msg.contentType == 1 ? [(NSString*)[(id)msg.content content] length] : 0),
+                  heightKey, preview);
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[HeightCache] precache exception for %@: %@", msg.clientMsgNo, exception);
+    }
+}
+
+// 高度缓存：避免重复触发 markdown AST 解析与高度测量
+// 使用 NSCache 替代 NSMutableDictionary：
+//   1. countLimit=2000 防止跨会话无限积累（原方案无上限，活跃用户可达数万条）
+//   2. 系统内存压力时自动淘汰，无需手动清理
+//   3. NSCache 本身线程安全，无需外部加锁 (但 _cellHeightCache 这个静态指针的 lazy init
+//      不是, 必须 dispatch_once —— 主线程 heightForRowAtIndexPath 与 bg precache
+//      路径并发调用过这里, review 提示)
+static NSCache<NSString*, NSNumber*> *_cellHeightCache;
++(NSCache<NSString*, NSNumber*>*) cellHeightCache {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        _cellHeightCache = [[NSCache alloc] init];
+        _cellHeightCache.countLimit = 2000;
+        _cellHeightCache.name = @"WKMessageListViewCellHeightCache";
+    });
+    return _cellHeightCache;
+}
+
+// 统一 heightCache key 计算 + 移除。
+// cellHeightCache 的 key 语义 = clientMsgNo + bubblePos[+editTimestamp], 依赖:
+//   1) 消息本身内容 (clientMsgNo 变则 key 变)
+//   2) bubble 位置 (First/Middle/Last/Alone, 群聊连发气泡合并样式)
+//   3) 编辑时间戳 (contentEdit 后重算)
+// 但实际测出来的高度还依赖多个「异步到达」输入 (sender 昵称 / bot 标识 /
+// 表格 WebView 实测高度 等)。这些数据后到时必须显式 invalidate 对应 msg 的
+// heightCache, 否则 cache 命中的是「旧数据下算的高度」→ 气泡框高度不匹配
+// 新内容 (Bug 1) / bot AI 标识 frame 计算基于旧宽度 (Bug 3) 等。
+// 用法: 数据变化路径 (channelInfoUpdate / WebView didFinish / member 更新 等) 里
+// 调用本方法 + reload/refresh 让 UITableView 重新问高度。
+- (void)wk_invalidateHeightCacheForMessage:(WKMessageModel*)msg {
+    if (!msg || msg.clientMsgNo.length == 0) return;
+    Class cellClass = [self getMessageCellClass:msg];
+    NSInteger bubblePos = 0;
+    if ([cellClass respondsToSelector:@selector(bubblePosition:)]) {
+        bubblePos = [cellClass bubblePosition:msg];
+    }
+    NSString *heightKey = [NSString stringWithFormat:@"%@-bp%ld", msg.clientMsgNo, (long)bubblePos];
+    if (msg.remoteExtra.contentEdit) {
+        heightKey = [NSString stringWithFormat:@"%@-e%lu", heightKey, (unsigned long)msg.remoteExtra.editedAt];
+    }
+    [[WKMessageListView cellHeightCache] removeObjectForKey:heightKey];
+}
+
+// [octo] 卡片实测高度变化(ToggleVisibility 展开/收起、异步图片落定)后，由 WKInteractiveCardCell
+// 委托列表安全重排。**绝不允许 cell 自己 begin/endUpdates** —— 必须走与本类其它路径
+// (channelInfoUpdate @3264 / addMessage @365) 完全一致的漂移守卫，否则在下拉翻页
+// (isPulldownInProgress) 或行数漂移窗口内触发 begin/endUpdates 会抛
+// _Bug_Detected_In_Client_Of_UITableView，撞坏 UITableView 内部簿记 → 翻页白屏 +
+// 退出后在别处触发野指针崩溃(_NSInlineData _fallbackTraitCollection zombie)。
+- (void)wk_reflowHeightForMessage:(WKMessageModel *)msg {
+    if (!msg) return;
+    // 无论能否立刻重排，先失效行高缓存：cell 已写入 liveHeightOverride，下次 heightForRow 取新值。
+    [self wk_invalidateHeightCacheForMessage:msg];
+    // 翻页 / 重灌注进行中：只失效缓存、不强制批量更新。高度会在 pulldown 的 insertRows
+    // 或用户下次滚动 heightForRow 时自然收敛，不会永久错高度，也不会撞坏 tableView。
+    if (self.isPulldownInProgress || self.isRehydrating) return;
+    // 行数漂移窗口：dp 已改而 tableView 内部行数未同步 → 此刻 begin/endUpdates 必崩，跳过。
+    if (![self isTableViewRowCountInSyncWithDataProvider]) return;
+    @try {
+        [UIView performWithoutAnimation:^{
+            [self.tableView beginUpdates];
+            [self.tableView endUpdates];
+        }];
+    } @catch (NSException *ex) {
+        // 二次保险：校验后被别的 main-queue block 重入改 dp 的极端 case 兜底不 crash。
+        NSLog(@"[WKMessageListView] wk_reflowHeightForMessage drift caught: %@", ex);
+    }
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath{
+    WKMessageModel *messageModel = [self.dataProvider messageAtIndexPath:indexPath];
+    if (!messageModel) {
+        // dp/tv 漂移检测: UITableView 询问的 indexPath 在 dp 里查不到 model → 说明
+        // numberOfRowsInSection 计算和实际 dp 内容不一致, 大概率是 insertRows /
+        // insertSections 增量路径在跨 section + row shift 混合形态下让 UIKit
+        // 内部行数簿记漂移。返 0.1 → cell 完全不可见 (症状 B「无气泡框」)。
+        // 打日志, 复现时可 grep [BubbleBugRepro] dp/tv drift 直接定位到具体 indexPath。
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] dp/tv drift: heightForRow section=%ld row=%ld returned nil model (dpSections=%lu)",
+              (long)indexPath.section, (long)indexPath.row,
+              (unsigned long)[self.dataProvider dateCount]);
+        #endif
+        return 0.1f;
+    }
+
+    // 流式消息不缓存高度（内容还在变化）
+    BOOL isStreaming = messageModel.streamOn && messageModel.streamFlag != WKStreamFlagEnd;
+    NSString *heightKey = nil;
+    if (!isStreaming && messageModel.clientMsgNo.length > 0) {
+        Class cellClass = [self getMessageCellClass:messageModel];
+        NSInteger bubblePos = 0;
+        if ([cellClass respondsToSelector:@selector(bubblePosition:)]) {
+            bubblePos = [cellClass bubblePosition:messageModel];
+        }
+        heightKey = [NSString stringWithFormat:@"%@-bp%ld", messageModel.clientMsgNo, (long)bubblePos];
+        if (messageModel.remoteExtra.contentEdit) {
+            heightKey = [NSString stringWithFormat:@"%@-e%lu", heightKey, (unsigned long)messageModel.remoteExtra.editedAt];
+        }
+        NSNumber *cachedHeight = [[WKMessageListView cellHeightCache] objectForKey:heightKey];
+        if (cachedHeight) {
+            return cachedHeight.floatValue;
+        }
+    }
+
+    CGFloat height = 44.0f; // 默认高度兜底
+    CFAbsoluteTime _heightT0 = WKCellPerfLog ? CFAbsoluteTimeGetCurrent() : 0;
+    @try {
+        Class messageCellClass = [self getMessageCellClass:messageModel];
+        CFTimeInterval __probe0 = CACurrentMediaTime();
+        CGSize cellSize = [messageCellClass sizeForMessage:messageModel];
+        // 探针：heightForRow 在主线程同步测高的耗时(cache MISS 时)，按 cell 类聚合。快滑首见卡片的主要卡顿源。
+        [WKACardRenderer perfAccrue:[NSString stringWithFormat:@"H.size.%@", NSStringFromClass(messageCellClass)]
+                                 ms:(CACurrentMediaTime() - __probe0) * 1000.0];
+        height = MAX(cellSize.height, 0.1f);
+    } @catch (NSException *exception) {
+        NSLog(@"[HeightCache] heightForRow exception at %@: %@", indexPath, exception);
+    }
+
+    // heightCache 只写「合理值」, 拒绝写入病态小值。原因:
+    //   iOS 27 主线程 UITextView 首帧 measure 存在时序 race 会返 0
+    //   (TK2→TK1 fallback 尚未完成时 sizeThatFits 拿不到 glyph)。
+    //   老实现 `MAX(cellSize.height, 0.1f)` 拿到 0 会写 0.1 进 cache, 后续
+    //   heightForRow 全部命中 0.1 → cell 永久 0.1px 高 → 全空白, 且**没有自愈**
+    //   (cache 命中就 return 不再走 measure)。fresh install (cache 全空,
+    //   一定走 measure) 才会大规模复现。
+    //   阈值 15pt: 空文本气泡最小也 >20pt (avatar+padding), 15pt 以下一定不合理。
+    //   不合理时不写 cache, 让下一次 heightForRow 重试 measure, 直到拿到正常值。
+    // 副作用: 病态窗口内 UITableView 拿到本次 return 的 44/0.1 短暂错位一帧,
+    // 下一次 layout 立刻自愈。远好于永久空白。
+    if (heightKey && height > 15.0f) {
+        [[WKMessageListView cellHeightCache] setObject:@(height) forKey:heightKey];
+    } else if (heightKey) {
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] heightCache REJECT pathological height=%.1f msgNo=%@ (measure race, will retry)",
+              height, messageModel.clientMsgNo);
+        #endif
+        // measure race 时返回 44 兜底而不是 0.1, 让本帧至少能看到 cell 存在
+        if (height < 15.0f) height = 44.0f;
+    }
+
+    if (WKCellPerfLog) {
+        CGFloat _heightMs = (CFAbsoluteTimeGetCurrent() - _heightT0) * 1000;
+        if (_heightMs > kCellPerfHeightMissMs) {
+            // 关注点：同一个 msgNo 反复出现 = cache key 算错或者 NSCache 在反复淘汰
+            NSString *_typeName = NSStringFromClass([self getMessageCellClass:messageModel]);
+            NSInteger _contentLen = 0;
+            if (messageModel.contentType == WK_TEXT && [messageModel.content respondsToSelector:@selector(content)]) {
+                NSString *_t = [(id)messageModel.content content];
+                if ([_t isKindOfClass:[NSString class]]) _contentLen = _t.length;
+            }
+            NSLog(@"[CellPerf] height MISS: %.1fms type=%@ contentType=%ld len=%ld msgNo=%@ key=%@",
+                  _heightMs, _typeName, (long)messageModel.contentType, (long)_contentLen,
+                  messageModel.clientMsgNo, heightKey ?: @"(nil)");
+        }
+    }
+
+    return height;
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    WKMessageModel *messageModel = [self.dataProvider messageAtIndexPath:indexPath];
+    if (!messageModel) return;
+    WKMessageBaseCell *baseCell = (WKMessageBaseCell*)cell;
+    baseCell.conversationContext = [self.dataProvider conversationContext];
+    messageModel.checkboxOn =self.multipleOn;
+    if([baseCell isKindOfClass:[WKMessageCell class]]) {
+        ((WKMessageCell*)baseCell).showNavigateToMessage = self.showNavigateToMessage;
+    }
+    @try {
+        CFAbsoluteTime _refreshT0 = WKCellPerfLog ? CFAbsoluteTimeGetCurrent() : 0;
+        CFTimeInterval __probe0 = CACurrentMediaTime();
+        [baseCell refresh:messageModel];
+        // 探针：willDisplay 内 refresh(含 ACR 显示渲染) 耗时，按 cell 类聚合(主线程)。
+        [WKACardRenderer perfAccrue:[NSString stringWithFormat:@"disp.%@", NSStringFromClass([baseCell class])]
+                                 ms:(CACurrentMediaTime() - __probe0) * 1000.0];
+        if (WKCellPerfLog) {
+            CGFloat _refreshMs = (CFAbsoluteTimeGetCurrent() - _refreshT0) * 1000;
+            if (_refreshMs > kCellPerfRefreshSlowMs) {
+                // 关注点：refresh 慢 = textAttrCache miss / WKWebView 创建 / markdown 分段重建 等
+                NSInteger _contentLen = 0;
+                if (messageModel.contentType == WK_TEXT && [messageModel.content respondsToSelector:@selector(content)]) {
+                    NSString *_t = [(id)messageModel.content content];
+                    if ([_t isKindOfClass:[NSString class]]) _contentLen = _t.length;
+                }
+                NSLog(@"[CellPerf] refresh SLOW: %.1fms cls=%@ contentType=%ld len=%ld msgNo=%@",
+                      _refreshMs, NSStringFromClass([baseCell class]),
+                      (long)messageModel.contentType, (long)_contentLen, messageModel.clientMsgNo);
+            }
+        }
+    } @catch (NSException *exception) {
+        // 竞态下 cell class 与消息 content 类型不匹配时不崩溃
+        NSLog(@"[MessageList] refresh exception at %@: %@", indexPath, exception);
+    }
+    [baseCell onWillDisplay];
+
+    // 在标记已读之前先检查是否需要触发未读消息的表情特效（否则状态会被改变）
+    [self checkFirstViewEffectForMessage:messageModel];
+
+    [self didReadedAndViewed]; // 将消息放入已读和已查看
+
+    if(messageModel.orderSeq>self.browseToOrderSeq) {
+        [self updateBrowseToOrderSeq];
+    }
+}
+
+- (void)tableView:(UITableView *)tableView didEndDisplayingCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    WKMessageBaseCell *baseCell = (WKMessageBaseCell*)cell;
+    [baseCell onEndDisplay];
+}
+
+//
+//- (UIContextMenuConfiguration *)tableView:(UITableView *)tableView contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point {
+//
+//    return [UIContextMenuConfiguration configurationWithIdentifier:nil previewProvider:nil actionProvider:^UIMenu * _Nullable(NSArray<UIMenuElement *> * _Nonnull suggestedActions) {
+//        UIAction *action = [UIAction actionWithTitle:@"复制" image:nil identifier:nil handler:^(__kindof UIAction * _Nonnull action) {
+//
+//        }];
+//
+//        return [UIMenu menuWithChildren:@[action]];
+//    }];
+//}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return [self.dataProvider dateCount];
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    // 走 rowCountAtSection: 而不是 messagesAtSection:.count —— 后者会为每个 section
+    // 拷一份不可变快照数组, 而本方法是每帧每 section 都会被调的热路径。
+    return [self.dataProvider rowCountAtSection:section];
+}
+
+
+- (UIView *)tableView:(UITableView *)tableView viewForHeaderInSection:(NSInteger)section {
+   WKTimeHeaderView *headerView = [tableView dequeueReusableHeaderFooterViewWithIdentifier:[WKTimeHeaderView reuseId]];
+    static NSDateFormatter *sectionDateFormatter;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sectionDateFormatter = [[NSDateFormatter alloc] init];
+        [sectionDateFormatter setDateFormat:@"yyyy-MM-dd"];
+    });
+    NSString *dateStr = [self.dataProvider dateWithSection:section];
+    if (dateStr.length > 0) {
+        NSDate *date = [sectionDateFormatter dateFromString:dateStr];
+        headerView.dateLbl.text = [WKTimeTool formatDateStyle1:date];
+    } else {
+        // section 越界(数据与 tableView 缓存瞬时不一致)时 dateStr 为 nil,
+        // 不把 nil 喂进 formatDateStyle1: 的 NSCalendar 链, 给空 header 兜底。
+        headerView.dateLbl.text = @"";
+    }
+//    [headerView.dateLbl sizeToFit];
+    return headerView;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
+    return [WKTimeHeaderView height];
+}
+
+
+#pragma mark -- scollViewDelegate
+
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView {
+    self.scrolling = true;
+    [self updateBrowseToOrderSeq];
+    [self scrollViewDidScrollOfPosition:scrollView];
+    [self updateSelectToHereButtonsThrottled];
+
+    // 滚到顶部自动触发 MJRefresh 加载历史消息（显示菊花）
+    CGFloat offsetY = scrollView.contentOffset.y + scrollView.contentInset.top;
+    if (offsetY <= -1 && !self.isPulldownInProgress && !self.tableView.mj_header.hidden
+        && self.tableView.mj_header.state != MJRefreshStateRefreshing) {
+        [self.tableView.mj_header beginRefreshing];
+    }
+}
+
+
+- (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
+    [UIView animateWithDuration:0.3f animations:^{
+        self.didManuallyStoppedTableViewDecelerating = false;
+        [self setFloatingHeaderViewsHidden:false animated:false delay:0.0f];
+    } completion:nil];
+}
+
+- (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
+    if(!decelerate) {
+        self.didManuallyStoppedTableViewDecelerating = true;
+        [self setFloatingHeaderViewsHidden:true animated:true delay:0.5f];
+        [self endScroll:scrollView];
+    }
+}
+- (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
+    if (!self.didManuallyStoppedTableViewDecelerating) {
+        [self setFloatingHeaderViewsHidden:true animated:true delay:0.5f];
+    }
+    [self endScroll:scrollView];
+}
+
+- (void)scrollViewWillEndDragging:(UIScrollView *)scrollView withVelocity:(CGPoint)velocity targetContentOffset:(inout CGPoint *)targetContentOffset {
+}
+- (void)scrollViewDidEndScrollingAnimation:(UIScrollView *)scrollView {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self setFloatingHeaderViewsHidden:true animated:true delay:1.0f];
+    });
+}
+
+#pragma mark - WKChatManagerDelegate
+
+// 收取消息 left表示剩余消息数量 TODO: 这里有优化的余地 优化到最后一条此会话的消息才刷新
+- (void)onRecvMessages:(WKMessage*)message left:(NSInteger)left {
+    // [DEBUG] 打印收到消息在UI层的处理
+    NSLog(@"[BOT-DEBUG] UI层收到消息: contentType=%ld, contentClass=%@, streamOn=%d, streamNo=%@, streamFlag=%ld, status=%ld, isSend=%d, fromUid=%@",
+          (long)message.contentType,
+          NSStringFromClass([message.content class]),
+          message.streamOn,
+          message.streamNo ?: @"(nil)",
+          (long)message.streamFlag,
+          (long)message.status,
+          message.isSend,
+          message.fromUid);
+    if(![self needHandle:message]) {
+        return;
+    }
+    // 系统Bot（如BotFather）消息按space_id过滤，实现会话隔离
+    if(![self shouldShowMessageInCurrentSpace:message]) {
+        return;
+    }
+    NSIndexPath *indexPath = [self.dataProvider indexPathAtClientMsgNo:message.clientMsgNo];
+    if(indexPath) { // 存在的消息不再添加
+        return;
+    }
+    [self handleRecvMessage:message];
+}
+
+
+// 检查 tableView 当前记住的 section/行数是否与 dataProvider 一致。
+// 不一致说明正处于 pulldown/pullup 改完数据源但尚未 insertRows 的间隙，
+// 此时调用 reloadRows/performBatchUpdates 会触发 UITableView 行数断言崩溃。
+-(BOOL) isTableViewRowCountInSyncWithDataProvider {
+    NSInteger tvSectionCount = [self.tableView numberOfSections];
+    NSInteger dsSectionCount = [self.dataProvider dateCount];
+    if (tvSectionCount != dsSectionCount) {
+        return NO;
+    }
+    for (NSInteger s = 0; s < tvSectionCount; s++) {
+        NSInteger tvRows = [self.tableView numberOfRowsInSection:s];
+        NSInteger dsRows = [self.dataProvider rowCountAtSection:s];
+        if (tvRows != dsRows) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+// 消息更新
+-(void) onMessageUpdate:(WKMessage*) message left:(NSInteger)left total:(NSInteger)total{
+    WKLogDebug(@"onMessageUpdate-->%u",message.messageSeq);
+
+    if(![self needHandle:message]) {
+        return;
+    }
+    BOOL needRelodData = false;
+    if(left == 0) {
+        needRelodData = true;
+    }
+    NSIndexPath *indexPath = [self.dataProvider indexPathAtClientMsgNo:message.clientMsgNo];
+    if(indexPath) {
+//        WKMessageModel *newMessageModel = [[WKMessageModel alloc]  initWithMessage:message];
+        WKMessageModel *newMessageModel = [self.dataProvider messageAtIndexPath:indexPath];
+        if(!newMessageModel) {
+            newMessageModel =  [[WKMessageModel alloc]  initWithMessage:message];
+        }
+        newMessageModel.message = message;
+        [self.dataProvider replaceMessage:newMessageModel atClientMsgNo:message.clientMsgNo];
+       
+        if(message.remoteExtra.revoke|| message.isDeleted ) {
+//            if(total == 1) { // 如果只有一条消息，这里做了单独的cell刷新，则不需要再[self.tableView reloadData]了
+//                needRelodData = false;
+//            }
+//            [self refreshCellForDeleteAndInsert:newMessageModel];
+            needRelodData =true;
+            if(message.remoteExtra.revoke) {
+               NSArray<WKMessageModel*> *containReplyMessages = [self.dataProvider messagesAtMessageReply:message.messageId];
+                if(containReplyMessages&&containReplyMessages.count>0) {
+                    for (WKMessageModel *model in containReplyMessages) {
+                        if(model.content.reply) {
+                            model.content.reply.revoke = true;
+                        }
+                    }
+                }
+            }
+            
+        }else if(total == 1) {
+            needRelodData = false;
+            WKMessageBaseCell *cell = (WKMessageBaseCell *)[self.tableView cellForRowAtIndexPath:indexPath];
+
+            [self animateMessageWithBlock:^{
+                [cell refresh:newMessageModel];
+                [cell layoutSubviews];
+            }];
+            // Bugly #9388: pulldown/pullup 在"dataProvider 已加行但尚未 insertRows"的间隙会让出主线程，
+            // 此时 tableView 记住的行数与 dataProvider 不一致，直接 reloadRows 会抛 NSInternalInconsistencyException。
+            // 漂移时跳过 reloadRows —— cell 内容已在上面 refresh，pulldown/pullup 自身的 insertRows 完成后会恢复一致。
+            if ([self isTableViewRowCountInSyncWithDataProvider]) {
+                [self.tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+            } else {
+                WKLogDebug(@"onMessageUpdate skip reloadRows: tableView/dataProvider row-count drift");
+            }
+        }
+        
+        if(self.lastMessage) {
+            if(message.isSend && message.orderSeq>self.lastMessage.orderSeq) {
+                [self updateLastMsgIfNeed:newMessageModel];
+            }
+            if(message.isDeleted && [self.lastMessage.clientMsgNo isEqualToString:message.clientMsgNo]) {
+                [self  updateLastMsgIfNeed:[self.dataProvider lastMessage]];
+            }
+        }
+        
+    }
+    if(needRelodData) {
+        // Bugly 兜底：极少情况下 onMessageUpdate 处于外层嵌套 batchUpdates / 嵌套 RunLoop 中，
+        // 裸 reloadData 也可能命中 UITableView 内部一致性断言。包 @try 收敛成无害。
+        @try {
+            [self.tableView reloadData];
+        } @catch (NSException *ex) {
+            NSLog(@"[WKMessageListView] onMessageUpdate trailing reloadData caught: %@", ex);
+        }
+    }
+}
+
+- (void)onMessageStream:(WKStream *)stream {
+    NSIndexPath *indexPath = [self.dataProvider indexPathAtStreamNo:stream.streamNo];
+    if(indexPath) {
+        WKMessageBaseCell *cell = (WKMessageBaseCell *)[self.tableView cellForRowAtIndexPath:indexPath];
+        WKMessageModel *messageModel = [self.dataProvider messageAtIndexPath:indexPath];
+        [messageModel.streams addObject:stream];
+        
+        CGRect cellRect = [self.tableView rectForRowAtIndexPath:indexPath];
+        
+        CGFloat cellOffsetTop = cellRect.origin.y - (self.tableView.contentOffset.y + self.tableView.contentInset.top);// cell顶部偏移量
+        
+        
+        [self animateMessageWithBlock:^{
+            [cell refresh:messageModel];
+            [cell layoutSubviews];
+        } completion:^(BOOL finished) {
+            [self.tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+            [self ajustTableViewByStreams];
+            if(self.positionAtBottom) {
+                if(cellOffsetTop + cellRect.size.height > [self visiableTableHeight]) { // cell底部被table挡住了，滚动到最底部
+                    [self scrollToBottom:YES];
+                }
+            }
+        }];
+    }
+}
+
+-(void) ajustTableViewByStreams {
+    
+    NSArray<UITableViewCell*> *visibleCells =  [self visibleCells];
+    CGFloat tableOffset = 0.0f;
+     if(visibleCells && visibleCells.count>0) {
+         for (UITableViewCell *tableCell in visibleCells) {
+             if([tableCell isKindOfClass:WKMessageCell.class]) {
+                 WKMessageCell *messageCell = (WKMessageCell*)tableCell;
+                 WKMessageModel *messageModel = messageCell.messageModel;
+                 if(messageModel.streamOn) {
+                     if(messageModel.preCellHeight > 0) {
+                         tableOffset += (messageModel.preCellHeight - tableCell.frame.size.height);
+                     }
+                     messageModel.preCellHeight = tableCell.frame.size.height;
+                 }
+             }
+         }
+     }
+    if(tableOffset!=0) {
+        CGFloat offsetY = self.tableView.contentOffset.y - tableOffset;// 离底部的距离
+        [self.tableView setContentOffset:CGPointMake(0, offsetY)];
+    }
+}
+
+
+// 消息已删除
+-(void) onMessageDeleted:(WKMessage *)message {
+    if(![self needHandle:message]) {
+        return;
+    }
+   
+    [self deleteMessageUI:message];
+}
+
+
+-(void) deleteMessageUI:(WKMessage*)message {
+    NSIndexPath *indexPath  = [self.dataProvider indexPathAtClientMsgNo:message.clientMsgNo];
+    if(indexPath) {
+        WKMessageModel *deleteMessageModel = [self.dataProvider messageAtIndexPath:indexPath];
+        if(deleteMessageModel) {
+            NSString *preClientMsgNo;
+            NSString *nextClientMsgNo;
+            if(deleteMessageModel.preMessageModel && deleteMessageModel.preMessageModel.clientMsgNo && ![deleteMessageModel.preMessageModel.clientMsgNo isEqualToString:@""]) {
+                preClientMsgNo = deleteMessageModel.preMessageModel.clientMsgNo;
+            }
+            if(deleteMessageModel.nextMessageModel && deleteMessageModel.nextMessageModel.clientMsgNo && ![deleteMessageModel.nextMessageModel.clientMsgNo isEqualToString:@""]) {
+                nextClientMsgNo = deleteMessageModel.nextMessageModel.clientMsgNo;
+            }
+            BOOL sectionRemove = false;
+            [self.dataProvider removeMessage:deleteMessageModel sectionRemove:&sectionRemove];
+            
+            if(self.lastMessage && [deleteMessageModel.clientMsgNo isEqualToString:self.lastMessage.clientMsgNo]) {
+                self.lastMessageInner = nil;
+                [self updateLastMsgIfNeed:[self.dataProvider lastMessage]];
+                
+            }
+            
+            NSMutableArray *reloadIndexPaths = [NSMutableArray array];
+            if(preClientMsgNo) {
+               NSIndexPath *preIndexPath =  [self.dataProvider indexPathAtClientMsgNo:preClientMsgNo];
+                if(preIndexPath) {
+                    [reloadIndexPaths addObject:preIndexPath];
+                }
+            }
+            if(nextClientMsgNo) {
+               NSIndexPath *nextIndexPath =  [self.dataProvider indexPathAtClientMsgNo:nextClientMsgNo];
+                if(nextIndexPath) {
+                    [reloadIndexPaths addObject:nextIndexPath];
+                }
+            }
+        
+           
+            @try {
+                if(sectionRemove) {
+                    [self.tableView deleteSections:[NSIndexSet indexSetWithIndex:indexPath.section] withRowAnimation:UITableViewRowAnimationFade];
+                }else {
+                    [self.tableView deleteRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationFade];
+                }
+            } @catch (NSException *exception) {
+                NSLog(@"deleteMessageUI-exception->%@",exception);
+                [self.tableView reloadData];
+            }
+           
+            if(reloadIndexPaths.count>0) {
+                [self.tableView reloadRowsAtIndexPaths:reloadIndexPaths withRowAnimation:UITableViewRowAnimationFade];
+            }
+            
+        }
+       
+    }
+}
+// 清除所有消息
+- (void)onMessageCleared:(WKChannel *)channel {
+    if(![channel isEqual:self.channel]) {
+        return;
+    }
+    [self.dataProvider clearMessages];
+    [self.tableView reloadData];
+}
+
+#pragma mark - WKChannelManagerDelegate
+// 频道信息更新
+-(void) channelInfoUpdate:(WKChannelInfo*)channelInfo {
+    if([self.channel isEqual:channelInfo.channel]) { // 更新的当前会话的信息
+        self.channelInfo = channelInfo;
+        // 群聊场景:收到 channelInfo 后预加载群头像到 SDImageCache,
+        // 这样用户第一次发 [使命必达] 特效时舷窗能直接显示群头像(否则首次必然 MISS)。
+        if (channelInfo.channel.channelType != WK_PERSON) {
+            NSString *groupAvatarURL = [WKAvatarUtil getGroupAvatar:channelInfo.channel.channelId
+                                                           cacheKey:channelInfo.avatarCacheKey ?: @""];
+            if (groupAvatarURL.length > 0 &&
+                ![[SDImageCache sharedImageCache] imageFromCacheForKey:groupAvatarURL]) {
+                [[SDWebImageManager sharedManager] loadImageWithURL:[NSURL URLWithString:groupAvatarURL]
+                                                            options:SDWebImageRetryFailed
+                                                           progress:nil
+                                                          completed:^(UIImage * _Nullable image,
+                                                                      NSData * _Nullable data,
+                                                                      NSError * _Nullable error,
+                                                                      SDImageCacheType cacheType,
+                                                                      BOOL finished,
+                                                                      NSURL * _Nullable imageURL) {
+#if DEBUG
+                    NSLog(@"[RocketAvatar] prefetch 群头像(channelInfoUpdate) | url=%@ got=%@",
+                          imageURL, image ? @"YES" : @"NO");
+#endif
+                }];
+            }
+        }
+    }else { // 更新的当前聊里页面的发送者的信息
+        if(channelInfo.channel.channelType != WK_PERSON) {
+            return;
+        }
+        // 关键: sender/bot info 异步到达后, 必须做三件事:
+        //   1) 全 dp iterate: 找出所有 fromUid 匹配的 msg (不止 visible cells,
+        //      非 visible 也要处理, 否则用户滚过去时看到 stale 状态)
+        //   2) 每条匹配 msg: 清 model.from (让 refresh 重读缓存) + 失效 heightCache
+        //      (heightCache 的高度是基于旧的空 name 算的, 保留会让 tableView 复用
+        //      错误高度 → Bug 1「气泡高度错」; refresh 后 layoutSubviews 会用新
+        //      name 宽度重算 nameLbl / botBadge frame → 修 Bug 3「AI 标识错位」)
+        //   3) 对 visible cells 主动 refresh + begin/endUpdates 让 UITableView
+        //      重新问高度 (heightCache 已被失效, 这次问会走 measure 拿新值)
+        // 非 visible 匹配 msg 不主动 reload, 依靠 heightCache 失效, 下次进入 visible
+        // 走 heightForRowAtIndexPath → measure MISS → 拿新高度, 自然收敛。
+        NSString *targetFromUid = channelInfo.channel.channelId;
+        NSMutableSet<NSString*> *affectedClientMsgNos = [NSMutableSet set];
+        for (NSInteger section = 0; section < [self.dataProvider dateCount]; section++) {
+            NSArray<WKMessageModel*> *msgs = [self.dataProvider messagesAtSection:section];
+            for (WKMessageModel *msg in msgs) {
+                if (msg.fromUid.length > 0 && [msg.fromUid isEqualToString:targetFromUid]) {
+                    msg.from = nil; // 让下次 refresh 重读 sender 缓存
+                    [self wk_invalidateHeightCacheForMessage:msg];
+                    if (msg.clientMsgNo.length > 0) {
+                        [affectedClientMsgNos addObject:msg.clientMsgNo];
+                    }
+                }
+            }
+        }
+        if (affectedClientMsgNos.count == 0) return;
+
+        NSArray<UITableViewCell*> *visibleCells = self.tableView.visibleCells;
+        BOOL anyVisibleAffected = NO;
+        for (UITableViewCell *tableCell in visibleCells) {
+            if (![tableCell isKindOfClass:WKMessageCell.class]) continue;
+            WKMessageCell *messageCell = (WKMessageCell*)tableCell;
+            WKMessageModel *messageModel = messageCell.messageModel;
+            if (messageModel && [affectedClientMsgNos containsObject:messageModel.clientMsgNo]) {
+                [messageCell refresh:messageModel];
+                anyVisibleAffected = YES;
+            }
+        }
+        // begin/endUpdates 空块强制 UITableView 重新 query 可见行高度; heightCache
+        // 已被上面失效, 这次会走 measure 拿到基于新 sender info 的正确高度, 气泡
+        // 框自动调整到匹配内容。performWithoutAnimation 避免视觉跳动。
+        //
+        // Bugly 同款崩溃防护 (TestFlight Dv1hfifowmpA1QbEzBWBFn, 5 份同栈):
+        //   channelInfoUpdate: 走主队列, 但 pullup:_block_invoke 的完成回调是在
+        //   ioQueue 里改完 dataProvider 后, 再 dispatch_async → global queue
+        //   precache → dispatch_async → main queue 才跑 insertRows。这中间的
+        //   窗口里, numberOfRowsInSection 从数据源返新值, 而 tableView 内部
+        //   还是旧值。空 begin/endUpdates 在 endUpdates 里跑一致性校验 → 撞上
+        //   假 delta → NSInternalInconsistencyException
+        //   "_Bug_Detected_In_Client_Of_UITableView_Invalid_Number_Of_Rows_In_Section"
+        //   (同款异常字符串见 6b750ee startReminderAnimation 修复)。
+        //
+        // 修法两道防线, 与 addMessage: (line 365) 同源:
+        //   1) 前置漂移检查: 不 in-sync 直接跳过 begin/endUpdates。visible cells
+        //      内容已 refresh, heightCache 已失效; 用户下次滚一下 heightForRow
+        //      自然 measure 拿新值, 或等 pullup 完成后的 insertRows 一并收敛,
+        //      不会永久错高度。
+        //   2) 二次保险 @try/@catch: 极端 case (校验后立即被别的 main-queue block
+        //      重入改动 dp) 兜底不 crash; 不 fallback reloadData 避免打断
+        //      pullup 增量插入。
+        if (anyVisibleAffected && [self isTableViewRowCountInSyncWithDataProvider]) {
+            @try {
+                [UIView performWithoutAnimation:^{
+                    [self.tableView beginUpdates];
+                    [self.tableView endUpdates];
+                }];
+            } @catch (NSException *ex) {
+                NSLog(@"[WKMessageListView] channelInfoUpdate begin/endUpdates drift caught: %@", ex);
+            }
+        }
+//         [self.tableView reloadData]; // TODO: 不要用reloadData 会导致长按菜单错位
+    }
+}
+
+#pragma mark -- WKReactionManagerDelegate
+
+- (void)reactionManagerChange:(WKReactionManager *)reactionManager reactions:(NSArray<WKReaction *> *)reactions channel:(WKChannel *)channel {
+    if(![self.channel isEqual:channel]) {
+        return;
+    }
+    for (WKReaction *reaction in reactions) {
+        NSIndexPath *indexPath = [self.dataProvider indexPathAtMessageID:reaction.messageId];
+        if(indexPath) {
+            WKMessageModel *messageModel = [self.dataProvider messageAtIndexPath:indexPath];
+            if(reaction.isDeleted == 1) {
+                [messageModel cancelReaction:reaction];
+            }else {
+                [messageModel addReaction:reaction];
+            }
+            WKMessageCell *messageCell = [self.tableView cellForRowAtIndexPath:indexPath];
+            [messageCell refresh:messageModel];
+            [messageCell layoutReaction];
+        }
+    }
+}
+
+#pragma mark -- WKConnectionManagerDelegate
+
+
+// 弱/断网恢复后, 给当前打开的会话页跑一次 "rehydrate":
+//   - 多页 pullup 把 DB 已落但 UI 未感知的消息追上 (gap fill, 上限 35 页 ≈ 1050 条)
+//   - 期间 live push 进 pendingRecvMessages 缓冲, 完成后批量回放
+//   - 末尾 reloadData 收敛 insertRows 路径残留的漂移
+//   - 命中上限再加一条 HUD 提示, 让用户知道还有更多, 继续滚动加载
+// 与 onAppDidBecomeActiveReconcile / onConversationSyncFinished 是平行的三条兜底路径,
+// 各自处理 (回前台 / 会话级 sync 完成 / 传输层重连) 三种 trigger。
+//
+// debounce 500ms: 抖动网络下 disconnect→connecting→connected 反复抖动时只触发一次,
+// 避免 rehydrate 被打散成多次小循环和现有 pullup 抢 ioQueue。
+-(void) onConnectStatus:(WKConnectStatus)status reasonCode:(WKReason)reasonCode {
+    WKConnectStatus prev = self.prevConnectStatus;
+    self.prevConnectStatus = status;
+    if (status != WKConnected) return;
+    if (prev == WKConnected) return; // ping/pong 之类的无 transition, 不重复触发
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(beginRehydrate) object:nil];
+    [self performSelector:@selector(beginRehydrate) withObject:nil afterDelay:0.5];
+}
+
+// rehydrate 多页 pullup 上限: 35 × eachPageMsgLimit(默认 30) ≈ 1050 条。
+// 和 user agree: 超过这个量级时, 不再无限拉, 提示用户"消息很多, 下拉刷新查看更早"。
+// 选 35 是兼顾 "多数断网场景能一次追完" + "极端断网几小时内不至于把内存拉爆" 的
+// 平衡点; eachPageMsgLimit 若 app 配置改大, 实际上限按比例放大。
+static const NSInteger kMaxRehydratePages = 35;
+
+-(void) beginRehydrate {
+    if (!self.channel) return;
+    // 不在窗口里 = VC 已经被另一层 push 盖住 (资料/相册/设置), 此时跑 rehydrate 会:
+    //   - capped HUD 弹到当前实际所在的无关页 ([WKNavigationManager].topViewController.view);
+    //   - 多页 pullup 跟前台会话页的首屏加载抢 ioQueue。
+    // 先要求 self.window 非 nil, 等 VC 重新 attach 时再触发 (重连后 onConnectStatus
+    // 仍会经过 prevConnectStatus 状态机重算)。
+    if (!self.window) return;
+    if ([WKSDK shared].connectionManager.connectStatus != WKConnected) return;
+    if (self.isRehydrating) return;
+    if (self.isPulldownInProgress) return; // 让 pulldown 自己跑完, 它的 drain 会接住 pending push
+    self.isRehydrating = YES;
+    // watchdog: SDK pullup 假死 (网络硬挂 / 服务端不响应) 时, isRehydrating 永远不会落,
+    // live push 全被 buffer 不渲染。30s 是 HTTP 默认超时的一半, 比单页 pullup 真实耗时大
+    // 一个数量级; 到点强制 finish (capped 路径 + drain), 至少不会让用户陷在静默状态。
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(forceFinishRehydrateOnTimeout) object:nil];
+    [self performSelector:@selector(forceFinishRehydrateOnTimeout) withObject:nil afterDelay:30.0];
+    BOOL wasAtBottom = self.positionAtBottom;
+    self.rehydrateEnteredAtBottom = wasAtBottom;
+    [self rehydrateNextPage:0 wasAtBottom:wasAtBottom];
+}
+
+-(void) forceFinishRehydrateOnTimeout {
+    if (!self.isRehydrating) return;
+    [self finishRehydrateCapped:YES wasAtBottom:self.rehydrateEnteredAtBottom];
+}
+
+// pullup 一页 → 看 hasMore + 页计数 → 递归。
+// 复用 [self pullup:] 的好处: 它已经处理 dedup 重试 / section-row 增量 insert /
+// @try @catch 失败回退 reloadData, 不需要在这里再重新走一遍。
+// dedup-stuck 兜底: 若 pullup 跑完一轮后 dp.lastMessage.clientMsgNo 没推进, 说明 SDK
+// 这一页全是已存在的消息 (内部 3 次 retry 也没救回来), 再继续递归只是在原地空转 ——
+// 直接当成 "拉不动了" 收尾 + capped HUD, 比把 35 页全空跑一遍代价小得多。
+-(void) rehydrateNextPage:(NSInteger)pageIndex wasAtBottom:(BOOL)wasAtBottom {
+    // 重入闸: 30s watchdog 可能已经把 isRehydrating 置 NO + drain + reload, 而某个
+    // pullup: completion 仍在飞 (SDK 网络请求 watchdog 拦不掉)。迟到 completion 回来
+    // 不该再启动下一页, 否则形成 watchdog finish + late-completion 重复 finish 的状态机
+    // 重入 (重复 reloadData / 二次 HUD / 二次 buffer drain)。这里和 completion 体内
+    // 双闸, 只要 isRehydrating==NO 一律早出。
+    if (!self.isRehydrating) return;
+    if (![self pullupHasMore]) {
+        [self finishRehydrateCapped:NO wasAtBottom:wasAtBottom];
+        return;
+    }
+    if (pageIndex >= kMaxRehydratePages) {
+        [self finishRehydrateCapped:YES wasAtBottom:wasAtBottom];
+        return;
+    }
+    NSString *anchorBefore = @"";
+    WKMessageModel *beforeLast = [self.dataProvider lastMessage];
+    if (beforeLast.clientMsgNo.length > 0) anchorBefore = beforeLast.clientMsgNo;
+    __weak typeof(self) weakSelf = self;
+    [self pullup:^(bool more) {
+        __strong typeof(weakSelf) ss = weakSelf;
+        if (!ss) return;
+        // 同一只闸: watchdog 已经走完, 这里就当无事发生 (drain/reload 已被 finish 做过)
+        if (!ss.isRehydrating) return;
+        WKMessageModel *afterLast = [ss.dataProvider lastMessage];
+        BOOL madeProgress = afterLast && ![afterLast.clientMsgNo isEqualToString:anchorBefore];
+        if (!more) {
+            [ss finishRehydrateCapped:NO wasAtBottom:wasAtBottom];
+            return;
+        }
+        if (!madeProgress) {
+            [ss finishRehydrateCapped:YES wasAtBottom:wasAtBottom];
+            return;
+        }
+        [ss rehydrateNextPage:pageIndex + 1 wasAtBottom:wasAtBottom];
+    }];
+}
+
+-(void) finishRehydrateCapped:(BOOL)capped wasAtBottom:(BOOL)wasAtBottom {
+    self.isRehydrating = NO;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(forceFinishRehydrateOnTimeout) object:nil];
+
+    // typing 残留清掉 —— 后台/断网期间 bot 回复经 conversation-sync 直写 DB,
+    // 绕过了 onRecvMessages 的清除路径, 这里统一兜底。
+    if ([[WKTypingManager shared] hasTyping:self.channel]) {
+        [[WKTypingManager shared] removeTypingByChannel:self.channel newMessage:nil];
+    }
+
+    // anchor 对账 (沿用原 onConnectStatus 的 last-message refresh 语义)
+    WKMessageModel *dpLast = [self.dataProvider lastMessage];
+    if (dpLast && (!self.lastMessage || ![self.lastMessage.clientMsgNo isEqualToString:dpLast.clientMsgNo])) {
+        WKMessage *newLastMsg = [[WKSDK shared].chatManager getLastMessage:self.channel];
+        if (newLastMsg) {
+            [self updateLastMsgIfNeed:[[WKMessageModel alloc] initWithMessage:newLastMsg]];
+        }
+    }
+
+    // 渲染收尾: 一次性 reloadData 收敛 insertRows 路径里可能残留的 dp/tableView 漂移。
+    // 这是治 "scroll 上滑很多气泡空白" 的关键 —— rehydrate 等于把表的状态机拨回零。
+    // wasAtBottom 是进入 rehydrate 时的快照, 多页 pullup + watchdog 路径下 rehydrate
+    // 可能跑十几秒, 用户中途上滑读历史; 二次判定一次 positionAtBottom, 只在用户"进入时
+    // 在底 && 现在仍在底"才 scroll-to-bottom, 避免把读历史的用户拽回去。
+    [self.tableView reloadData];
+    if (wasAtBottom && self.positionAtBottom) {
+        [self scrollToBottom:NO];
+    }
+
+    // 期间 buffer 的 live push 批量回放。pulldown 不在跑时由本方法 drain;
+    // pulldown 在跑时让它自己的 endPulldown 路径接管, 避免重复回放。
+    if (!self.isPulldownInProgress) {
+        [self drainPendingRecvMessagesAfterRehydrate];
+    }
+
+    // gate-clear 接力: 回前台对账时若卡在 isRehydrating 早退, 这里走完后补一次。
+    [self wk_tryConsumePendingReconcile];
+
+    // capped HUD 也只在仍属活跃显示页时弹, 避免 VC 已被 push 盖住但还没 detach
+    // (e.g. push 资料页期间 watchdog 触发) 时把 HUD 弹到无关页面。
+    if (capped && self.window) {
+        // 与 OctoContext 的所有 toast 同口径走 showMsg: (CSToast 轻量, 与会话列表
+        // "添加到关注" 一致), 不再用 showHUDWithHide: 的居中暗色 MBProgressHUD。
+        UIView *topView = [WKNavigationManager shared].topViewController.view ?: self;
+        [topView showMsg:LLang(@"消息很多，下拉刷新查看更早")];
+    }
+}
+
+-(void) drainPendingRecvMessagesAfterRehydrate {
+    if (!self.pendingRecvMessages || self.pendingRecvMessages.count == 0) return;
+    NSArray<WKMessage*> *pending = [self.pendingRecvMessages copy];
+    [self.pendingRecvMessages removeAllObjects];
+    for (WKMessage *m in pending) {
+        [self handleRecvMessage:m];
+    }
+}
+
+// orderSeq 跳号缺口的 DB-范围补刷:
+//   conversation-sync 直写 DB 把 [dpLast+1, live-1] 的 backlog 写入了, 同时 IM stream
+//   先派来这条 live。简单 dp.addMessage(live) 会留洞, 后续 anchor-相等早退路径再也救
+//   不回来 (现有 beginRehydrate 的 pullup baseOrderSeq = dp.lastMessage, 加完 live 之后
+//   pullup 永远返回 0)。这里用 SDK 的 pullUp:startOrderSeq:endOrderSeq:limit: 变体
+//   按 (gapStart, gapEnd] 拉一次, 中间漏的 + 这条 live 一起入 dp。
+//
+// 期间到达的下一条 live push: 复用 isRehydrating 闸 (handleRecvMessage line 1955 的
+// 缓冲分支), 进 pendingRecvMessages, 完成后用现有 drain 路径回放; race-safe。
+//
+// 防卡死: 30s watchdog 触发 forceFinish。SDK pullUp 假死时不让 isRehydrating 永久卡住。
+-(void) fillOrderSeqGapAndInsert:(WKMessageModel*)live previousLast:(WKMessageModel*)dpLastBefore {
+    if (!live || !dpLastBefore) return;
+    if (!self.channel) return;
+    self.isRehydrating = YES;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(forceFinishRehydrateOnTimeout) object:nil];
+    [self performSelector:@selector(forceFinishRehydrateOnTimeout) withObject:nil afterDelay:30.0];
+
+    BOOL wasAtBottom = self.positionAtBottom;
+    uint32_t gapStart = dpLastBefore.orderSeq;
+    uint32_t gapEnd = live.orderSeq;
+    // R4 nit (Octo-Q P1): 限额按 gap 实际宽度拉满, 而不是固定 eachPageMsgLimit (默认 30)。
+    // 锁屏 30 分钟群很活跃可能 60+ 条, 单页 30 条会留中段永久缺口 (后续 anchor-相等
+    // 早退路径 + beginRehydrate 的 forward-only pullup 都救不回来)。上限 500 是兜底,
+    // 防止恶意大 gap (如 orderSeq 服务端跳号) 把单次拉爆 / 服务器超时; 这种极端情况
+    // 退化成单页 + 现有 beginRehydrate / pullup 多页接力,与原行为一致。
+    int defaultLimit = (int)[WKApp shared].config.eachPageMsgLimit;
+    if (defaultLimit <= 0) defaultLimit = 30;
+    uint32_t gapWidth = (gapEnd > gapStart) ? (gapEnd - gapStart) : 0;
+    int limit = MAX(defaultLimit, MIN((int)gapWidth, 500));
+
+    __weak typeof(self) weakSelf = self;
+    [[WKSDK shared].chatManager pullUp:self.channel
+                          startOrderSeq:gapStart
+                            endOrderSeq:gapEnd
+                                  limit:limit
+                               complete:^(NSArray<WKMessage *> * _Nonnull intermediate, NSError * _Nonnull error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) ss = weakSelf;
+            if (!ss) return;
+            if (!ss.isRehydrating) return; // watchdog 已 finish, 迟到回调早出
+            [NSObject cancelPreviousPerformRequestsWithTarget:ss selector:@selector(forceFinishRehydrateOnTimeout) object:nil];
+
+#if DEBUG
+            NSLog(@"[GapFill] complete gapStart=%u gapEnd=%u fetched=%lu err=%@",
+                  gapStart, gapEnd, (unsigned long)intermediate.count, error);
+#endif
+
+            BOOL liveAlreadyIncluded = NO;
+            if (intermediate.count > 0 && !error) {
+                for (WKMessage *m in intermediate) {
+                    if (m.orderSeq <= gapStart) continue; // 防御 SDK 包含端点
+                    if ([m.clientMsgNo isEqualToString:live.clientMsgNo]) {
+                        liveAlreadyIncluded = YES;
+                    }
+                    [ss.dataProvider addMessage:[[WKMessageModel alloc] initWithMessage:m]];
+                }
+            }
+            if (!liveAlreadyIncluded) {
+                [ss.dataProvider addMessage:live];
+            }
+            // 一次 reloadData 收敛: 多条 addMessage 后行/段计数已变, insertRow 增量太脆弱。
+            [ss.tableView reloadData];
+            if (wasAtBottom && ss.positionAtBottom) {
+                [ss scrollToBottom:NO];
+            }
+
+            ss.isRehydrating = NO;
+            // typing 残留清掉 (与 finishRehydrateCapped 同款防御, 见 line 2956-2958)
+            if ([[WKTypingManager shared] hasTyping:ss.channel]) {
+                [[WKTypingManager shared] removeTypingByChannel:ss.channel newMessage:nil];
+            }
+            // 期间 buffer 的 live push 批量回放
+            if (!ss.isPulldownInProgress) {
+                [ss drainPendingRecvMessagesAfterRehydrate];
+            }
+            // gate-clear 接力: 回前台对账时若卡在 isRehydrating 早退, 这里走完后补一次。
+            [ss wk_tryConsumePendingReconcile];
+        });
+    }];
+}
+
+// 回前台对账：兜住"后台收消息离屏 insert 致最新消息行空白"的回归。
+//   不依赖 self.lastMessage == dbLastMsg 这种"anchor 相等 ⇒ UI 正确"的判断
+//   (那正是 handleRecvMessage 在后台把 anchor 提前推进后、让 onConversationSyncFinished
+//    误判跳过补刷的根因)。这里只问一个问题：底部那一行到底有没有被真正渲染出来。
+//   positionAtBottom 时底部行本应是已显示的 cell，cellForRowAtIndexPath: 返回 nil 说明它是
+//   被离屏 insert 进来、从未走过 willDisplayCell:/refresh: 的空白壳 —— 本 bug 的精确签名。
+//   只发 reloadData(安全 sink，重查 numberOfRows，不要求行数一致)，所有检查均为纯查询。
+- (void)onAppDidBecomeActiveReconcile:(NSNotification *)note {
+    if (!self.channel) {
+        return;
+    }
+    #if DEBUG
+    NSLog(@"[BubbleBugRepro] reconcile ENTRY note=%@ dirty=%d pending=%d pulldown=%d rehydrate=%d pullupMore=%d posAtBottom=%d",
+          note.name ?: @"(consume)",
+          self.dirtyAfterBackground, self.pendingReconcile,
+          self.isPulldownInProgress, self.isRehydrating,
+          [self pullupHasMore], self.positionAtBottom);
+    #endif
+    // gate 命中早退路径: dirtyAfterBackground 仍为 YES (说明后台真的动过状态、
+    // 需要补刷) 时把 pendingReconcile 置位, 等 gate 清掉的回调路径再调
+    // wk_tryConsumePendingReconcile 补一次。覆盖三种场景:
+    //   - 用户上滑读历史时锁屏复活 (pullupHasMore=YES)
+    //   - 重连补齐期间锁屏复活 (isRehydrating=YES)
+    //   - pulldown 跑着的时候锁屏复活 (isPulldownInProgress=YES)
+    // 不持锁不抢 tableView, 安全。
+    if (self.isPulldownInProgress) {
+        if (self.dirtyAfterBackground) self.pendingReconcile = YES;
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] reconcile GATE=isPulldownInProgress pendingNow=%d", self.pendingReconcile);
+        #endif
+        return;
+    }
+    if (self.isRehydrating) {
+        if (self.dirtyAfterBackground) self.pendingReconcile = YES;
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] reconcile GATE=isRehydrating pendingNow=%d", self.pendingReconcile);
+        #endif
+        return;
+    }
+    if ([self pullupHasMore]) {
+        if (self.dirtyAfterBackground) self.pendingReconcile = YES;
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] reconcile GATE=pullupHasMore pendingNow=%d", self.pendingReconcile);
+        #endif
+        return;
+    }
+    // 防抖: gate 全部放行后再判, 这样 gate 命中早退不会污染时间戳, 下条通知仍能
+    // 补一次。同一回前台动作 (Will*+Did*+SceneWill*+SceneDidActive) 半秒内只跑一次
+    // reloadData, 避免连刷抢主线程影响首帧丝滑。
+    //
+    // 例外: relay 路径 (note==nil, wk_tryConsumePendingReconcile 派发) 不受 debounce
+    // 影响 —— 老实现 relay 会撞上 debounce early-return 却不清 pendingReconcile,
+    // 与本方法文档 "接力补刷应当不受 500ms 防抖影响" 相悖 (PR #64 review OctoBoooot 命中)。
+    NSTimeInterval _reconcileNow = CFAbsoluteTimeGetCurrent();
+    BOOL _isRelay = (note == nil);
+    if (!_isRelay && _reconcileNow - self.reconcileLastTs < 0.5) {
+        return;
+    }
+    self.reconcileLastTs = _reconcileNow;
+    WKMessageModel *dpLast = [self.dataProvider lastMessage];
+    if (!dpLast) {
+        return;
+    }
+
+    // R4 fix: 后台期 (锁屏 / handleRecvMessage 后台分支 / onConversationSyncFinished) 改过状态,
+    // 即便 numberOfRows 一致也得强制 reloadData。原因: 后台 reloadData + scrollToBottom:NO
+    // 会读 contentSize 触发离屏 layout, UIKit 算了 numberOfRows + heightForRow 但 cell
+    // 不在 window, willDisplayCell: 不回调 → refresh: 永不跑。回前台 UIKit 误判 "已布局"
+    // 不再补 willDisplay, cell 内容永久空白 (用户报: 锁屏 30 分钟解锁很多气泡空白)。
+    BOOL dirty = self.dirtyAfterBackground;
+    self.dirtyAfterBackground = NO;
+
+    BOOL needsReload = NO;
+    if (![self isTableViewRowCountInSyncWithDataProvider]) {
+        needsReload = YES; // 行数已漂移 → reloadData 收敛
+    } else {
+        NSInteger sections = [self.tableView numberOfSections];
+        if (sections > 0) {
+            NSInteger lastSection = sections - 1;
+            NSInteger rows = [self.tableView numberOfRowsInSection:lastSection];
+            if (rows > 0) {
+                NSIndexPath *lastPath = [NSIndexPath indexPathForRow:rows - 1 inSection:lastSection];
+                UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:lastPath];
+                if (self.positionAtBottom && cell == nil) {
+                    needsReload = YES; // 在底部却没有底部 cell → 离屏 insert 漏渲染
+                }
+            }
+        }
+    }
+    // 后台动过状态 + 仍在底 → 强制走一次 reloadData, 重新 willDisplay → refresh:。
+    // 不动 needsReload 上面的判定, 只在非底 / 非 dirty 路径保持原有 cheap-path 行为。
+    if (!needsReload && dirty && self.positionAtBottom) {
+#if DEBUG
+        NSLog(@"[Reconcile] dirtyAfterBackground forces reload (positionAtBottom=YES)");
+#endif
+        needsReload = YES;
+    }
+
+    if (needsReload) {
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] reconcile RELOAD dirty=%d positionAtBottom=%d", dirty, self.positionAtBottom);
+        #endif
+        [self.tableView reloadData];
+        if (self.positionAtBottom) {
+            [self scrollToBottom:NO];
+        }
+    } else {
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] reconcile NOOP (no signals)");
+        #endif
+    }
+    // 真的跑到这里说明 reconcile 主路径已经走过 (或 cheap-path 确认 UI 状态干净),
+    // pendingReconcile 就此清掉避免后续 gate-clear 路径无谓再补一次。
+    self.pendingReconcile = NO;
+}
+
+// gate (pulldown / rehydrate) 清掉后的统一接力点: 若 pending 立位则异步派发一次
+// reconcile 重跑。异步避开当前调用栈 (pulldown / rehydrate 完成的回调内部还在
+// 持续操作 tableView, reload 嵌套进去会跟 batchUpdates / scroll-to-bottom 抢
+// 主线程), 让本帧 UI 先稳定下来再补刷, 保持丝滑。
+//
+// 防抖时间戳由 reconcile 自己维护, 这里不动 — 接力补刷应当不受 500ms 防抖影响
+// (前一次 reconcile 是 gate 命中直接早退, 没动时间戳, 这次能真正跑进主路径)。
+-(void) wk_tryConsumePendingReconcile {
+    if (!self.pendingReconcile) return;
+    if (!self.channel) return;
+    #if DEBUG
+    NSLog(@"[BubbleBugRepro] consumePending SCHEDULED");
+    #endif
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!ws.pendingReconcile) return; // 期间已被别条路径消费
+        #if DEBUG
+        NSLog(@"[BubbleBugRepro] consumePending FIRING");
+        #endif
+        [ws onAppDidBecomeActiveReconcile:nil];
+    });
+}
+
+#pragma mark - WKConversationManagerDelegate
+
+// conversation-sync 完成后(SDK 已 merge 进 DB)的全量补刷钩子，对齐 Android 的
+// syncCompleted → getData(true)。App 后台期间收到的新消息经 conversation-sync 直写
+// DB，可能绕过 onRecvMessages 的增量插入；切回前台 sync 完成后，这里检查当前 channel
+// 的 DB 最后一条消息是否比 UI 显示的更新，有更新则强制补刷，避免 pullup 的 drift 兜底
+// 吞掉刷新导致新消息不显示。已由 SDK 派发回主线程，这里不再 dispatch_async。
+- (void)onConversationSyncFinished {
+    if(!self.channel) {
+        return;
+    }
+    WKMessage *dbLastMsg = [[WKSDK shared].chatManager getLastMessage:self.channel];
+    if(!dbLastMsg) {
+        return;
+    }
+    // R4 nit (Octo-Q P2 #3): 仅在 app 真的不在前台时才置 dirty。foreground sync (发消息触发的
+    // sync / 在线时短重连) 也会回调本方法, 不应让下一次 become-active 多走一次 reloadData。
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+        self.dirtyAfterBackground = YES;
+    }
+
+    // R4 fix: 早退条件改用 dp.lastMessage (已渲染入 dp 的实际 tail), 不用 self.lastMessage
+    // (会被 handleRecvMessage 的 updateLastMsgIfNeed 提前推到 dbLastMsg, 即使中间有
+    // sync 直写 DB 的消息没进 dp, anchor 仍相等 → 误早退)。Fix 1 (handleRecvMessage 的
+    // orderSeq gap 检测) 已经从源头杜绝 gap, 这里只是 belt-and-suspenders。
+    WKMessageModel *dpLast = [self.dataProvider lastMessage];
+    if(dpLast && [dpLast.clientMsgNo isEqualToString:dbLastMsg.clientMsgNo]) {
+        return;
+    }
+
+    // 残留 typing 一并清掉(后台期间 bot 回复直写 DB 绕过了清除路径)。
+    if([[WKTypingManager shared] hasTyping:self.channel]) {
+        [[WKTypingManager shared] removeTypingByChannel:self.channel newMessage:nil];
+    }
+
+    __weak typeof(self) weakSelf = self;
+    if([self pullupHasMore]) {
+        // 下方还有未加载的历史分页，整页 reloadData 会破坏分页锚点，
+        // 这里只更新最后一条预览引用，让 pullup/滚动时再增量补齐。
+        // 注：UI 是否真正显示到最新，现由回前台对账(onAppDidBecomeActiveReconcile:)裁决，
+        // 不再依赖此处/下方的 last-message 相等判断；故此分支刻意保持原样，避免重蹈
+        // 910709e 的 scroll-jump / 首屏不显示回归。
+        [self updateLastMsgIfNeed:[[WKMessageModel alloc] initWithMessage:dbLastMsg]];
+        return;
+    }
+    // 已到底：补刷把新消息拉进 dataProvider 并刷新 UI。
+    [self pullup:^(bool more) {
+        WKMessageModel *localLastMsg = [weakSelf.dataProvider lastMessage];
+        if(!localLastMsg) {
+            return;
+        }
+        if(weakSelf.lastMessage && [weakSelf.lastMessage.clientMsgNo isEqualToString:localLastMsg.clientMsgNo]) {
+            return;
+        }
+        WKMessage *newLastMsg = [[WKSDK shared].chatManager getLastMessage:weakSelf.channel];
+        if(newLastMsg) {
+            [weakSelf updateLastMsgIfNeed:[[WKMessageModel alloc] initWithMessage:newLastMsg]];
+        }
+    }];
+}
+
+#pragma mark - WKTypingManagerDelegate
+
+- (void)typingAdd:(WKTypingManager *)manager message:(WKMessage *)message {
+    if(![self.channel isEqual:message.channel] || [message.fromUid isEqualToString:[WKApp shared].loginInfo.uid]) {
+        return;
+    }
+    if([self pullupHasMore]) {
+        return;
+    }
+    WKMessageModel *model = [[WKMessageModel alloc] initWithMessage:message];
+
+    // 走增量插入而不是 reloadData。reloadData 会让所有 visible cell 经过 didEndDisplayingCell
+    // → prepareForReuse 周期；用户正在长按选区时 prepareForReuse 会 endInBubbleTextSelection，
+    // 导致选区被无端中断。增量 insertRows 只动新行所在 indexPath，其它 cell 维持原状，选区
+    // 也就不会被打断。漂移路径仍兜底走 reloadData。
+    BOOL inSyncBefore = [self isTableViewRowCountInSyncWithDataProvider];
+    if (!inSyncBefore) {
+        [self.dataProvider addMessage:model];
+        [self.tableView reloadData];
+    } else {
+        NSInteger oldSectionCount = [self.dataProvider dateCount];
+        NSInteger oldLastSectionRowCount = (oldSectionCount > 0)
+            ? [self.dataProvider rowCountAtSection:oldSectionCount - 1] : 0;
+
+        [self.dataProvider addMessage:model];
+
+        // typing 由 _isTailPinnedNoLock: 固定置底, 所以正常必然是纯尾插; 这里仍做一次
+        // 判定作为不变式的显式声明 —— 万一不是尾插, 下面按"末尾新增"算的 indexPath 会错位。
+        // 不能直接 return: 方法末尾还有 positionAtBottom 滚动 (@yujiawei P2-5)。
+        BOOL typingSkipIncremental = ![self.dataProvider lastInsertWasPureTailAppend];
+        if (typingSkipIncremental) {
+            [self.tableView reloadData];
+        }
+
+        NSInteger newSectionCount = [self.dataProvider dateCount];
+        BOOL newSectionAdded = (newSectionCount > oldSectionCount);
+        NSInteger newLastSectionRowCount = (newSectionCount > 0)
+            ? [self.dataProvider rowCountAtSection:newSectionCount - 1] : 0;
+
+        if (typingSkipIncremental) {
+            // 已 reloadData, 跳过增量
+        } else if (newSectionAdded) {
+            @try {
+                [UIView performWithoutAnimation:^{
+                    [self.tableView insertSections:[NSIndexSet indexSetWithIndex:newSectionCount - 1]
+                                  withRowAnimation:UITableViewRowAnimationNone];
+                }];
+            } @catch (NSException *ex) {
+                NSLog(@"[WKMessageListView] typingAdd insertSections drift: %@, fallback reloadData", ex);
+                [self.tableView reloadData];
+            }
+        } else if (newLastSectionRowCount > oldLastSectionRowCount) {
+            NSMutableArray<NSIndexPath *> *indexPaths = [NSMutableArray array];
+            for (NSInteger row = oldLastSectionRowCount; row < newLastSectionRowCount; row++) {
+                [indexPaths addObject:[NSIndexPath indexPathForRow:row inSection:newSectionCount - 1]];
+            }
+            @try {
+                [UIView performWithoutAnimation:^{
+                    [self.tableView insertRowsAtIndexPaths:indexPaths withRowAnimation:UITableViewRowAnimationNone];
+                }];
+            } @catch (NSException *ex) {
+                NSLog(@"[WKMessageListView] typingAdd insertRows drift: %@, fallback reloadData", ex);
+                [self.tableView reloadData];
+            }
+        }
+        // 行数不变（typing 替换同源 typing 等）则不动 tableView，dataProvider 的内部替换够了
+    }
+
+    if(self.positionAtBottom) {
+        [self animateMessageWithBlock:^{
+            [self scrollToBottom:NO];
+        }];
+    }
+}
+
+
+- (void)typingRemove:(WKTypingManager *)manager message:(WKMessage *)message  newMessage:(WKMessage *)newMessage{
+    if(![self.channel isEqual:message.channel] || [message.fromUid isEqualToString:[WKApp shared].loginInfo.uid]) {
+        return;
+    }
+    WKLogDebug(@"typingRemove------%@",newMessage);
+    if(!newMessage) { // 最后没有将消息发送出来
+        [self deleteMessageUI:message];
+    }
+
+}
+
+
+#pragma mark -- WKReminderManagerDelegate
+
+- (void)reminderManager:(WKReminderManager *)manager didChange:(WKChannel *)channel reminders:(NSArray<WKReminder *> *)reminders {
+    if(![channel isEqual:self.channel]) {
+        return;
+    }
+    NSArray<WKReminder*> *oldReminders = self.reminders;
+    if(!oldReminders||oldReminders.count ==0) {
+        self.reminders = reminders;
+    }else {
+        NSMutableArray<WKReminder*> *newReminders = [NSMutableArray array];
+        for (WKReminder *reminder in reminders) {
+            if(reminder.publisher && [reminder.publisher isEqualToString:WKApp.shared.loginInfo.uid]) {
+                continue;
+            }
+            WKReminder *newReminder = [reminder copy];
+            for (WKReminder *oldReminder in oldReminders) {
+                if(newReminder.reminderID == oldReminder.reminderID) {
+                    if(!newReminder.done && oldReminder.done) {
+                        newReminder.done = oldReminder.done;
+                    }
+                }
+            }
+            [newReminders addObject:newReminder];
+        }
+        self.reminders = newReminders;
+    }
+    [self updatePostionReminders:self.reminders force:true];
+    
+}
+
+#pragma mark - Message Effect
+
+-(void) checkAndTriggerEffectForMessage:(WKMessageModel *)message {
+    NSString *effectType = [[WKMessageEffectManager shared] effectTypeForMessage:message];
+    if (!effectType) return;
+
+    // 已触发过则跳过（同一条消息 cell 重用、重新入视图都不重播）
+    if ([[WKMessageEffectManager shared] hasTriggeredForMessage:message]) return;
+    // cell 不在视口时也要 mark：从上层 +300ms gate 走到这里只差 100ms，cell 仍消失
+    // 说明用户在做快速滚动，机会已用掉；mark 掉避免回滑重播。
+    // 注意：mark 之前 sourceRect 还没计算，不会误把 bottom-center fallback 给不可见消息
+    // 放特效（review R1）—— 我们 mark 后直接 return，不进 trigger 路径。
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // 双保险：+300ms 首帧 gate + 本处 +100ms 之间可能收到撤回信令；此时 message.revoke
+        // 已经由 SDK 就地更新（WKMessageModel.revoke 读的是 message.remoteExtra.revoke）。
+        // mark 掉消费，避免后续回滑/cell 复用重新入队。
+        if (message.revoke) {
+            [[WKMessageEffectManager shared] markTriggeredForMessage:message];
+            return;
+        }
+        NSIndexPath *indexPath = [self.dataProvider indexPathAtClientMsgNo:message.clientMsgNo];
+        if (!indexPath) {
+            [[WKMessageEffectManager shared] markTriggeredForMessage:message];
+            return;
+        }
+        UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:indexPath];
+        if (!cell) {
+            // cell 滚出视口 → mark 掉消费，不 trigger（避免下次回滑重播）
+            [[WKMessageEffectManager shared] markTriggeredForMessage:message];
+            return;
+        }
+
+        // cell 确认在视口 —— mark + trigger（防并发：再查一次 hasTriggered）
+        if ([[WKMessageEffectManager shared] hasTriggeredForMessage:message]) return;
+        [[WKMessageEffectManager shared] markTriggeredForMessage:message];
+
+        CGRect sourceRect = [self.tableView convertRect:cell.frame toView:self];
+
+        // 头像源规则:
+        //   - 私聊(channel.channelType == WK_PERSON) → 取对方头像(channel.channelId = 对方 uid)
+        //   - 群聊 → 取**群头像**(getGroupAvatar),作为能量汇聚完成后舷窗最终显示的图像
+        //     群成员头像仅用作能量汇聚动画的视觉素材(流过屏幕后被吸收,最终换成群头像)
+        UIImage *avatarImage = nil;
+        NSString *avatarURL = nil;
+        NSString *cacheKey = self.channelInfo.avatarCacheKey ?: @"";
+        if (self.channel.channelType == WK_PERSON) {
+            avatarURL = [WKAvatarUtil getAvatar:self.channel.channelId cacheKey:cacheKey];
+        } else {
+            avatarURL = [WKAvatarUtil getGroupAvatar:self.channel.channelId cacheKey:cacheKey];
+        }
+#if DEBUG
+        NSLog(@"[RocketAvatar] step1-url | channelType=%d channelId=%@ cacheKey=%@ → avatarURL=%@",
+              self.channel.channelType, self.channel.channelId, cacheKey, avatarURL);
+#endif
+        if (avatarURL.length > 0) {
+            avatarImage = [[SDImageCache sharedImageCache] imageFromCacheForKey:avatarURL];
+#if DEBUG
+            NSLog(@"[RocketAvatar] step2-cache | key=%@ hit=%@ size=%@",
+                  avatarURL,
+                  avatarImage ? @"YES" : @"NO(MISS)",
+                  avatarImage ? NSStringFromCGSize(avatarImage.size) : @"-");
+#endif
+            // MISS 时异步触发下载 → 下次使用该群发送表情包时缓存就命中
+            if (!avatarImage) {
+                [[SDWebImageManager sharedManager] loadImageWithURL:[NSURL URLWithString:avatarURL]
+                                                            options:SDWebImageRetryFailed
+                                                           progress:nil
+                                                          completed:^(UIImage * _Nullable image,
+                                                                      NSData * _Nullable data,
+                                                                      NSError * _Nullable error,
+                                                                      SDImageCacheType cacheType,
+                                                                      BOOL finished,
+                                                                      NSURL * _Nullable imageURL) {
+#if DEBUG
+                    NSLog(@"[RocketAvatar] async-preload 群头像 | url=%@ got=%@ err=%@",
+                          imageURL, image ? @"YES" : @"NO", error);
+#endif
+                }];
+            }
+        } else {
+#if DEBUG
+            NSLog(@"[RocketAvatar] step2-cache | SKIPPED (avatarURL empty)");
+#endif
+        }
+        // 兜底：若缓存未命中(极少数：从未加载过)，仍尝试用 cell 里的头像
+        //   ⚠️ 群聊下 cell.avatarImgView 是**发送者头像**,fallback 进来会让"群头像"误变成发送者头像
+        //   → 只在私聊下走 fallback;群聊缓存 MISS 时宁可不带头像(传 nil 给特效,舷窗空窗)
+        if (!avatarImage && indexPath && self.channel.channelType == WK_PERSON) {
+            UITableViewCell *avatarCell = [self.tableView cellForRowAtIndexPath:indexPath];
+            if ([avatarCell isKindOfClass:WKMessageCell.class]) {
+                avatarImage = ((WKMessageCell *)avatarCell).avatarImgView.avatarImgView.image;
+#if DEBUG
+                NSLog(@"[RocketAvatar] step3-fallback-cell | channelType=PERSON image=%@ size=%@",
+                      avatarImage ? @"GOT" : @"NIL",
+                      avatarImage ? NSStringFromCGSize(avatarImage.size) : @"-");
+#endif
+            }
+        } else if (!avatarImage) {
+#if DEBUG
+            NSLog(@"[RocketAvatar] step3-fallback-cell | SKIPPED (group chat → 不用 cell 头像,避免取到发送者)");
+#endif
+        }
+#if DEBUG
+        NSLog(@"[RocketAvatar] step4-final | avatarImage=%@ → 传给特效",
+              avatarImage ? [NSString stringWithFormat:@"GOT %@", NSStringFromCGSize(avatarImage.size)] : @"NIL");
+#endif
+
+        // 群聊 + rocketLaunch(使命必达)时,额外取群成员头像列表,触发"能量汇聚"动画
+        //   - 同步从 channelManager 拿已缓存的成员
+        //   - 每个成员用 WKAvatarUtil.getAvatar 拿 URL,从 SDImageCache 同步取图
+        //   - 最多 12 个,取到才进列表;拿不到的跳过
+        //   - 如果最后列表为空 → memberAvatars=nil,走私聊弧形入场(兜底)
+        NSArray<UIImage *> *memberAvatars = nil;
+        if (self.channel.channelType != WK_PERSON && [effectType isEqualToString:@"rocketLaunch"]) {
+            NSArray<WKChannelMember *> *members = [[WKSDK shared].channelManager getMembersWithChannel:self.channel];
+            NSMutableArray<UIImage *> *avatars = [NSMutableArray array];
+            for (WKChannelMember *m in members) {
+                if (avatars.count >= 12) break;
+                NSString *memberURL = (m.memberAvatar.length > 0)
+                    ? [WKAvatarUtil getFullAvatarWIthPath:m.memberAvatar]
+                    : [WKAvatarUtil getAvatar:m.memberUid];
+                if (memberURL.length == 0) continue;
+                UIImage *memberImg = [[SDImageCache sharedImageCache] imageFromCacheForKey:memberURL];
+                if (memberImg) [avatars addObject:memberImg];
+            }
+            // 成员太少时,用群头像补一到两个,让汇聚仍然有视觉动感
+            if (avatars.count > 0 && avatars.count < 3 && avatarImage) {
+                [avatars addObject:avatarImage];
+                [avatars addObject:avatarImage];
+            }
+            if (avatars.count > 0) {
+                memberAvatars = avatars;
+            }
+#if DEBUG
+            NSLog(@"[RocketGroup] channelType=%d members.count=%lu cached avatars=%lu → memberAvatars=%@",
+                  self.channel.channelType,
+                  (unsigned long)members.count,
+                  (unsigned long)avatars.count,
+                  memberAvatars ? @"有,汇聚动画" : @"空,走单 avatar");
+#endif
+        }
+
+        // sourceRect 必定非空：本方法开头已确保 cell 存在并成功计算出 sourceRect。
+        // 历史版本里的 bottom-center fallback 已移除（review R1）—— cell 不在视口时
+        // mark 后直接 return，绝不进入下面的 trigger 路径，避免给不可见消息放特效。
+        [[WKMessageEffectManager shared] triggerEffect:effectType
+                                            inHostView:self
+                                            sourceRect:sourceRect
+                                           avatarImage:avatarImage
+                                         memberAvatars:memberAvatars
+                                              fromSelf:message.isSend];
+    });
+}
+
+/// 首次看到消息时检查是否触发特效（由 willDisplayCell 调用，是唯一触发入口）
+///
+/// 设计原则：
+///   把 markTriggered 从"动画播放成功"解耦为"用户已有机会看到此消息"。
+///   只要 cell 进入过 willDisplayCell，无论后续是否真正播放，都把它从未来重播
+///   的候选里消费掉。这样快速滑过 / 一键已读后回滑都不会再触发重播。
+///
+/// 规则：
+///   1. 没命中 emoji → skip（不污染 triggered 集合）
+///   2. 已触发过 → skip
+///   3. 对方发送且已读 → mark + skip（已看过的，消费掉）
+///   4. 自己发送且 age > 30s → mark + skip（自己发的没 readed 语义，
+///      用年龄给"下拉历史看到自己几个月前发的"兜底；triggeredMessageIds 是主防线）
+///      ⚠️ 不对"对方消息"做年龄兜底：未读消息无论多老，第一次进入会话都应播。
+///   5. 延迟 300ms 后 cell 仍在可视区 → 进入下一阶段（最终会 mark + play）
+///      cell 已滚出可视区（一键置底 / 快速滑过）→ mark + skip（机会用掉了）
+-(void) checkFirstViewEffectForMessage:(WKMessageModel *)message {
+    if (!message) return;
+    if ([[WKMessageEffectManager shared] hasTriggeredForMessage:message]) return;
+
+    NSString *effectType = [[WKMessageEffectManager shared] effectTypeForMessage:message];
+    if (!effectType) return;
+
+    // 对方已读：用户之前已经看过这条消息，不再播
+    if (!message.isSend && message.readed) {
+        [[WKMessageEffectManager shared] markTriggeredForMessage:message];
+        return;
+    }
+
+    // 自己发的没 readed 语义，用年龄兜底（仅自己消息）：避免下拉历史时把
+    // 几个月前发的 [使命必达] 又播一遍。triggeredMessageIds 持久化是主防线，
+    // 这里是 set 被修剪（>1000）后的二级保险。
+    if (message.isSend) {
+        NSTimeInterval age = [self ageSecondsForMessage:message];
+        if (age > 30) {
+            [[WKMessageEffectManager shared] markTriggeredForMessage:message];
+            return;
+        }
+    }
+
+    NSString *clientMsgNo = message.clientMsgNo;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSIndexPath *indexPath = [strongSelf.dataProvider indexPathAtClientMsgNo:clientMsgNo];
+        // cell 已被 UITableView 回收 → 300ms 内滚出可视区，视为"快速划过"，消费掉
+        if (!indexPath || ![strongSelf.tableView cellForRowAtIndexPath:indexPath]) {
+            [[WKMessageEffectManager shared] markTriggeredForMessage:message];
+            return;
+        }
+        WKMessageModel *current = [strongSelf.dataProvider messageAtIndexPath:indexPath];
+        if (!current) return;
+        [strongSelf checkAndTriggerEffectForMessage:current];
+    });
+}
+
+/// 计算消息年龄（秒），自动兼容 timestamp 是秒还是毫秒的情况
+-(NSTimeInterval) ageSecondsForMessage:(WKMessageModel *)message {
+    if (!message) return 0;
+    NSInteger ts = MAX(message.timestamp, message.localTimestamp);
+    if (ts <= 0) return 0;
+    // 当前秒级 timestamp ~1.7e9，毫秒级 ~1.7e12；> 2e10 一定是毫秒
+    if (ts > 20000000000LL) ts = ts / 1000;
+    NSTimeInterval age = [[NSDate date] timeIntervalSince1970] - (NSTimeInterval)ts;
+    return MAX(0, age);
+}
+
+@end

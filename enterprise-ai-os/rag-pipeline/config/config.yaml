@@ -1,0 +1,222 @@
+# =============================================================================
+# rag-pipeline 配置模板
+# 用法: cp config/config.yaml.example config/config.yaml
+#
+# 取值优先级: 环境变量 > config.yaml > 代码默认值
+# ${VAR:-default} 语法由 src/main.py 的配置加载器展开
+# =============================================================================
+
+service:
+  name: rag-pipeline
+  version: 0.1.0
+  env: ${ENV:-dev}
+  host: 0.0.0.0
+  port: ${RAG_PORT:-8100}
+  root_path: ""                    # 网关反代前缀，如 /api/rag
+  cors_origins:
+    - http://localhost:3000        # octo-web 本地开发
+  request_timeout_seconds: 60
+  max_upload_mb: 200
+
+logging:
+  level: ${LOG_LEVEL:-INFO}
+  format: ${LOG_FORMAT:-json}
+  # 检索请求默认记录 query 摘要而非全文，避免敏感内容落盘
+  log_query_text: false
+
+auth:
+  # 复用 octo-auth，不自建用户体系
+  enabled: ${OCTO_AUTH_ENABLED:-true}
+  octo_auth_url: ${OCTO_AUTH_BASE_URL:-http://octo-auth:8080}
+  verify_endpoint: /v1/verify
+  cache_ttl_seconds: 60
+  # 服务间调用（memory-service / meeting-agent → 本服务）用共享密钥
+  internal_token: ${INTERNAL_SERVICE_TOKEN:-}
+  # 强制多租户隔离：所有读写必须带 tenant_id
+  require_tenant: true
+
+# -----------------------------------------------------------------------------
+# Embedding
+# -----------------------------------------------------------------------------
+embedding:
+  # gateway = 走 model-gateway（推荐）; local = 本机 sentence-transformers
+  provider: gateway
+  model: ${RAG_EMBEDDING_MODEL:-bge-m3}
+  dimensions: ${RAG_EMBEDDING_DIM:-1024}
+  batch_size: 32
+  max_input_tokens: 8192
+  normalize: true                  # L2 归一化，配合 cosine 距离
+  timeout_seconds: 30
+  max_retries: 3
+  # 同一文本重复 embedding 的缓存（Redis），摄入重跑时省钱
+  cache:
+    enabled: true
+    ttl_seconds: 604800            # 7 天
+    key_prefix: "rag:emb:"
+  gateway:
+    base_url: ${MODEL_GATEWAY_URL:-http://model-gateway:8200}
+    path: /v1/embeddings
+  local:
+    model_path: BAAI/bge-m3
+    device: cpu                    # cpu | cuda
+    trust_remote_code: false
+
+# -----------------------------------------------------------------------------
+# 重排（cross-encoder）
+# -----------------------------------------------------------------------------
+rerank:
+  enabled: true
+  provider: gateway                # gateway | local | none
+  model: ${RAG_RERANK_MODEL:-bge-reranker-v2-m3}
+  top_n: ${RAG_RERANK_TOP_N:-5}
+  batch_size: 16
+  timeout_seconds: 15
+  # 重排超时/失败时降级为融合分数排序，不让检索整体失败
+  fallback_on_error: true
+
+# -----------------------------------------------------------------------------
+# 分块
+# -----------------------------------------------------------------------------
+chunking:
+  default_strategy: recursive      # recursive | markdown | code | semantic | fixed
+  chunk_size: ${RAG_CHUNK_SIZE:-512}         # 以 token 计
+  chunk_overlap: ${RAG_CHUNK_OVERLAP:-64}
+  min_chunk_size: 64               # 小于此长度的尾块并入前一块
+  tokenizer: cl100k_base
+  # 每个 chunk 前置文档标题与章节路径，显著提升召回准确率
+  prepend_context_header: true
+  keep_separator: true
+  # 按 MIME / 扩展名选择策略
+  strategy_by_type:
+    "text/markdown": markdown
+    "text/x-python": code
+    "text/x-go": code
+    "application/pdf": recursive
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": recursive
+    "text/html": recursive
+  # 表格单独成块，不与正文混切
+  table_as_single_chunk: true
+
+# -----------------------------------------------------------------------------
+# 向量存储
+# -----------------------------------------------------------------------------
+vector_store:
+  backend: ${VECTOR_BACKEND:-pgvector}       # pgvector | milvus
+
+  pgvector:
+    dsn: ${DATABASE_URL}
+    schema: ${PG_SCHEMA_RAG:-rag}
+    table: document_chunks
+    # hnsw 查询快、构建慢；ivfflat 相反。文档库以查询为主，选 hnsw
+    index_type: hnsw
+    distance: cosine               # cosine | l2 | ip
+    hnsw:
+      m: 16
+      ef_construction: 64
+      ef_search: 100               # 运行期召回精度旋钮
+    pool:
+      min_size: 2
+      max_size: 20
+      timeout_seconds: 10
+
+  milvus:
+    host: ${MILVUS_HOST:-milvus}
+    port: ${MILVUS_PORT:-19530}
+    collection: ${MILVUS_COLLECTION_RAG:-aios_documents}
+    index_type: HNSW
+    metric_type: COSINE
+    params:
+      M: 16
+      efConstruction: 64
+    search_params:
+      ef: 100
+    consistency_level: Bounded
+
+# -----------------------------------------------------------------------------
+# 稀疏检索（BM25）—— 复用 OCTO 的 OpenSearch，不自建
+# -----------------------------------------------------------------------------
+sparse:
+  enabled: true
+  provider: octo-search-indexer
+  base_url: ${OCTO_SEARCH_INDEXER_URL:-http://octo-search-indexer:8092}
+  search_path: /v1/search
+  timeout_seconds: 5
+  fallback_on_error: true          # BM25 挂了就退化为纯向量检索
+
+# -----------------------------------------------------------------------------
+# 检索融合
+# -----------------------------------------------------------------------------
+retrieval:
+  top_k: ${RAG_TOP_K:-20}          # 每路召回量
+  fusion: rrf                      # rrf (Reciprocal Rank Fusion) | weighted_sum
+  alpha: ${RAG_HYBRID_ALPHA:-0.5}  # 0=纯 BM25, 1=纯向量（weighted_sum 时生效）
+  rrf_k: 60
+  score_threshold: 0.0             # 低于此分数直接丢弃
+  max_top_n: 50                    # 单次请求返回上限，防滥用
+  # 返回相邻 chunk 拼接，缓解切分导致的语义断裂
+  context_window_expand: 1
+  deduplicate_by_document: false
+
+# -----------------------------------------------------------------------------
+# 摄入管道
+# -----------------------------------------------------------------------------
+ingestion:
+  concurrency: ${RAG_INGEST_CONCURRENCY:-4}
+  batch_size: 64                   # 单批 upsert 的 chunk 数
+  max_document_mb: 200
+  # 同一 document_id 重复摄入按 content_hash 判定，未变则跳过
+  idempotent_by_hash: true
+  # 失败重试与死信
+  max_retries: 3
+  retry_backoff_seconds: 5
+  dead_letter_topic: aios.document.ingest.dlq
+  supported_types:
+    - text/plain
+    - text/markdown
+    - text/html
+    - application/pdf
+    - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+    - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+  # 抽取后是否保留原文到对象存储（合规审计需要）
+  keep_raw: true
+
+# -----------------------------------------------------------------------------
+# 事件总线
+# -----------------------------------------------------------------------------
+kafka:
+  enabled: true
+  bootstrap_servers: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+  consumer_group: ${KAFKA_CONSUMER_GROUP_PREFIX:-aios}-rag-pipeline
+  auto_offset_reset: latest
+  max_poll_records: 32
+  consume_topics:
+    ingest: ${KAFKA_TOPIC_DOC_INGEST:-aios.document.ingest}
+    octo_files: ${KAFKA_TOPIC_OCTO_FILES:-octo.file.uploaded}
+    octo_messages: ${KAFKA_TOPIC_OCTO_MESSAGES:-octo.message.created}
+  produce_topics:
+    indexed: ${KAFKA_TOPIC_DOC_INDEXED:-aios.document.indexed}
+
+# -----------------------------------------------------------------------------
+# 对象存储
+# -----------------------------------------------------------------------------
+storage:
+  endpoint: ${S3_ENDPOINT:-http://minio:9000}
+  region: ${S3_REGION:-us-east-1}
+  access_key: ${S3_ACCESS_KEY:-}
+  secret_key: ${S3_SECRET_KEY:-}
+  bucket: ${S3_BUCKET_DOCUMENTS:-aios-documents}
+  force_path_style: true
+  presign_expire_seconds: 3600
+
+cache:
+  redis_url: ${REDIS_URL:-redis://redis:6379/1}
+  # 相同 query+filters 的检索结果短缓存，抵挡重复提问
+  search_cache_ttl_seconds: 30
+
+observability:
+  metrics_enabled: true
+  metrics_path: /metrics
+  tracing_enabled: ${OTEL_ENABLED:-false}
+  otlp_endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+  # 慢查询阈值，超过则 WARN 并打点
+  slow_search_ms: 800

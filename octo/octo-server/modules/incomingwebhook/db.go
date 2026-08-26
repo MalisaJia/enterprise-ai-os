@@ -1,0 +1,368 @@
+package incomingwebhook
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/db"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/gocraft/dbr/v2"
+)
+
+// ErrQuotaExceeded 创建时【投递作用域】配额已满，由 insertWithQuota 在事务内原子判定。
+// 作用域 = (group_no, thread_short_id)：群本体（thread_short_id='')与每个子区各有一份
+// 独立配额、互不共享名额（子区多的群 / octo-loop 不再被父群总量卡死）。
+var ErrQuotaExceeded = errors.New("incomingwebhook: per-scope quota exceeded")
+
+// ErrCreatorQuotaExceeded 创建者在【当前投递作用域】的个人配额已满（仅普通成员/bot
+// 受限，管理员豁免），同样由 insertWithQuota 在事务内原子判定。
+var ErrCreatorQuotaExceeded = errors.New("incomingwebhook: per-creator quota exceeded")
+
+// ErrTotalQuotaExceeded 单群【跨群本体 + 所有子区】的 webhook 聚合总数已达上限
+// （max_total_per_group，仅在 > 0 时启用），同样由 insertWithQuota 在事务内原子判定。
+// 挡住「子区可无限建 → 单群总量失控」，与作用域/个人配额共享同一把父群行锁。
+var ErrTotalQuotaExceeded = errors.New("incomingwebhook: per-group total quota exceeded")
+
+// quotaLimits 描述一次创建要校验的三层上限。三层都在【同一把父群行锁】的串行临界区内
+// 评估，故任意维度都精确、无 check-then-act 竞态（新增维度只是同事务内多一条 COUNT）：
+//   - scope      本投递作用域 (group_no, thread_short_id) 可建上限：群本体传 max_per_group、
+//                子区传 max_per_thread。必须 > 0（调用方已按读侧防御夹紧）。
+//   - perCreator 本作用域下单个 creator_uid 的上限；<= 0 表示不启用（管理员创建路径）。
+//   - total      单群跨所有作用域的聚合总数上限；<= 0 表示不启用（未配置聚合天花板）。
+type quotaLimits struct {
+	scope      int
+	perCreator int
+	total      int
+}
+
+type incomingWebhookDB struct {
+	session *dbr.Session
+	ctx     *config.Context
+}
+
+func newDB(ctx *config.Context) *incomingWebhookDB {
+	return &incomingWebhookDB{ctx: ctx, session: ctx.DB()}
+}
+
+// insertWithQuota 在事务内做"配额校验 + 写入"原子操作：
+//  1. SELECT id FROM `group` ... FOR UPDATE：对父群行加 X 记录锁（group_no 命中
+//     UNIQUE 索引 group_groupNo，锁的是必然存在的单行 record lock）。并发的同 group
+//     创建请求在此串行化，逐个进入配额校验+写入。
+//  2. SELECT count(*) FROM incoming_webhook WHERE group_no=? AND thread_short_id=?：
+//     配额按【投递作用域】(group_no, thread_short_id) 计数——群本体（thread_short_id='')
+//     与每个子区各有一份独立配额、互不共享（子区多的群 / octo-loop 不再被父群总量卡死）。
+//     父群行锁已把同群并发串行化，此处普通读即可；count >= max 返回 ErrQuotaExceeded，
+//     事务回滚。命中 idx_incoming_webhook_thread(group_no, thread_short_id, status)。
+//  3. 显式回填 CreatedAt：dbr 的 InsertInto.Record 不会从 DB 默认值回读时间，
+//     不写就会导致响应里的 created_at = epoch(0)。
+//
+// 锁粒度【刻意】仍是父群行，比 per-scope 计数更粗（同群跨子区的并发创建也被串行化），
+// 但这是正确性必需、非遗漏：换成对 (group_no, thread_short_id) 范围 `... FOR UPDATE`，
+// 在空作用域首插时只命中 0 行 → 纯 gap lock。gap-X 锁互相兼容，并发事务会全部通过
+// count 检查、各自 INSERT 抢 insert-intention lock 互等 → InnoDB 死锁(1213)，且无
+// 重试，合法并发创建会以不透明的"创建失败"500 收场。锁父群这一必然存在的单行可彻底
+// 串行化而不触发 gap-lock 死锁（PR #31 yujiawei / Jerry-Xin review）。incoming_webhook
+// 体量小，父群级串行化成本可忽略；配额口径细到子区、锁口径粗到父群，两者独立。
+// lim.perCreator <= 0 表示不启用个人配额（管理员创建路径）；> 0 时校验【同一作用域下的】
+// creator_uid 计数，超限返回 ErrCreatorQuotaExceeded。作用域计数与该 per-creator 计数跑在
+// 同一 (group_no, thread_short_id, status) 索引区间、仅差 creator_uid 谓词，故【合并为一次
+// 条件聚合查询】(count(*) + count(CASE WHEN creator_uid=? ...)) 拿全，缩短持锁临界区。
+// lim.total > 0 时再多做一次【全群】(group_no，不带 thread 过滤) 的聚合计数校验，超限返回
+// ErrTotalQuotaExceeded——这就是「群聚合天花板」，挡住子区无限建导致的总量膨胀。三层配额
+// 共享同一把父群行锁，无需额外加锁；锁粗（父群）、算细（作用域/个人/全群任意维度）。
+func (d *incomingWebhookDB) insertWithQuota(m *incomingWebhookModel, lim quotaLimits) error {
+	tx, err := d.session.Begin()
+	if err != nil {
+		return fmt.Errorf("incomingwebhook: begin tx: %w", err)
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	var gid int
+	if _, err = tx.SelectBySql(
+		"SELECT id FROM `group` WHERE group_no=? FOR UPDATE",
+		m.GroupNo,
+	).Load(&gid); err != nil {
+		return fmt.Errorf("incomingwebhook: lock group for update: %w", err)
+	}
+
+	// 作用域计数 + per-creator 计数【合并为一次条件聚合查询】：二者跑在同一个
+	// (group_no, thread_short_id, status) 索引区间上，仅差 creator_uid 谓词，用
+	// COUNT(CASE ...) 一次拿全，缩短父群锁的持锁临界区（普通成员建 webhook 由两查降为
+	// 一查 → 同群并发建的吞吐更好；管理员场景仍是一查，零回归）。COUNT(CASE) 而非
+	// SUM(bool) 是为了返回 BIGINT、避免 SUM 的 DECIMAL 扫进 int 的驱动转换坑。
+	// 软删除（statusDeleted）的行不占配额：删除即释放名额（#254）。【禁用】的 webhook
+	// 刻意仍占配额（含个人配额）——否则成员可用 disable→create→disable→create 循环无限
+	// 囤积可随时启用的 webhook，配额就形同虚设；释放名额只能走删除。个人配额是【创建闸】
+	// 而非持续约束：调低 max_per_creator 不回收已超额成员的存量，只是不允许再建。
+	var scoped struct {
+		Scope   int `db:"scope_cnt"`
+		Creator int `db:"creator_cnt"`
+	}
+	if _, err = tx.SelectBySql(
+		"SELECT count(*) AS scope_cnt, "+
+			"count(CASE WHEN creator_uid = ? THEN 1 END) AS creator_cnt "+
+			"FROM incoming_webhook WHERE group_no=? AND thread_short_id=? AND status != ?",
+		m.CreatorUID, m.GroupNo, m.ThreadShortID, statusDeleted,
+	).Load(&scoped); err != nil {
+		return fmt.Errorf("incomingwebhook: scope count: %w", err)
+	}
+	if scoped.Scope >= lim.scope {
+		return ErrQuotaExceeded
+	}
+	if lim.perCreator > 0 && scoped.Creator >= lim.perCreator {
+		return ErrCreatorQuotaExceeded
+	}
+
+	if lim.total > 0 {
+		var totalCount int
+		if _, err = tx.SelectBySql(
+			// 群级聚合天花板：不带 thread_short_id 过滤，计【整个群】跨群本体+所有子区的
+			// 未删除 webhook 总数。父群行锁已把同群并发串行化，此处普通读即精确——即便另
+			// 一个作用域此刻有空位，只要全群总数触顶就拒绝，正是本天花板的用途。命中
+			// idx_incoming_webhook_thread(group_no, ...) 的 group_no 前缀。
+			"SELECT count(*) FROM incoming_webhook WHERE group_no=? AND status != ?",
+			m.GroupNo, statusDeleted,
+		).Load(&totalCount); err != nil {
+			return fmt.Errorf("incomingwebhook: total count: %w", err)
+		}
+		if totalCount >= lim.total {
+			return ErrTotalQuotaExceeded
+		}
+	}
+
+	m.CreatedAt = db.Time(time.Now())
+	if _, err = tx.InsertInto("incoming_webhook").
+		Columns(util.AttrToUnderscore(m)...).
+		Record(m).Exec(); err != nil {
+		return fmt.Errorf("incomingwebhook: insert: %w", err)
+	}
+	return tx.Commit()
+}
+
+// queryByWebhookID 不存在时返回 (nil, nil)；dbr.Load 在无结果时即返回 (0, nil)，
+// 调用方按 m == nil 判断未命中，无需特别处理 ErrNotFound（那是 LoadOne 的语义）。
+func (d *incomingWebhookDB) queryByWebhookID(webhookID string) (*incomingWebhookModel, error) {
+	var m *incomingWebhookModel
+	_, err := d.session.Select("*").From("incoming_webhook").
+		Where("webhook_id=?", webhookID).Load(&m)
+	return m, err
+}
+
+// queryByGroupNo 列出群【自身】(thread_short_id=”)的 webhook 供群维度管理端展示，隐藏
+// 软删除（statusDeleted）项（#254）。绑定到子区的 webhook 走 queryByThreadScope，不在
+// 群列表回显——两个挂载面各管各的作用域（见 api.go list / queryManageable）。命中
+// idx_incoming_webhook_thread(group_no, thread_short_id, status) 前缀。
+func (d *incomingWebhookDB) queryByGroupNo(groupNo string) ([]*incomingWebhookModel, error) {
+	var list []*incomingWebhookModel
+	_, err := d.session.Select("*").From("incoming_webhook").
+		Where("group_no=?", groupNo).
+		Where("thread_short_id=?", "").
+		Where("status != ?", statusDeleted).
+		OrderDir("created_at", false).
+		Load(&list)
+	return list, err
+}
+
+// queryByThreadScope 列出绑定到某子区(group_no + thread_short_id)的 webhook，供子区维度
+// 管理端展示，隐藏软删除项。与 queryByGroupNo 对称、作用域互斥。命中
+// idx_incoming_webhook_thread(group_no, thread_short_id, status)。
+func (d *incomingWebhookDB) queryByThreadScope(groupNo, threadShortID string) ([]*incomingWebhookModel, error) {
+	var list []*incomingWebhookModel
+	_, err := d.session.Select("*").From("incoming_webhook").
+		Where("group_no=?", groupNo).
+		Where("thread_short_id=?", threadShortID).
+		Where("status != ?", statusDeleted).
+		OrderDir("created_at", false).
+		Load(&list)
+	return list, err
+}
+
+// updateFieldsAllowed 限定 updateFields 可写的列，防御未来调用方误传用户输入作 key
+// 触发任意列改写。新增可更新列时显式在此追加。
+var updateFieldsAllowed = map[string]struct{}{
+	"name":               {},
+	"avatar":             {},
+	"status":             {},
+	"token_hash":         {},
+	"allow_mention_all":  {},
+	"allow_mention_bots": {},
+	"mention_uids":       {},
+}
+
+// updateFields 更新单个 webhook 的允许列。带 status != statusDeleted 守卫：对已软删除
+// 的行一律不写入——这是并发复活漏洞的根因防线。queryManageable（非事务读）与本次写入
+// 之间有 TOCTOU 窗口，若期间被并发 DELETE 软删，无守卫的写会把 status / token_hash
+// 写回，令已删除 webhook 复活（重回列表 + 旧 token 可推送）。InnoDB 行锁让该条件 UPDATE
+// 与并发 DELETE 的 UPDATE 串行化，保证"一旦删除，任何后续写都落空"。调用方应回读确认
+// 行未被软删除（见 api 层 update / regenerate）。
+//
+// ⚠️ 正确性依赖单语句 autocommit 的当前读（UPDATE ... WHERE 对最新已提交行版本求值）。
+// 若未来把 update + 回读包进同一显式 REPEATABLE READ 事务、改用快照 SELECT，这个
+// "删除后写必落空"的不变量会被破坏，须改用 SELECT ... FOR UPDATE 重新串行化。
+func (d *incomingWebhookDB) updateFields(webhookID string, fields map[string]interface{}) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	for k := range fields {
+		if _, ok := updateFieldsAllowed[k]; !ok {
+			return fmt.Errorf("incomingwebhook: updateFields: disallowed column %q", k)
+		}
+	}
+	_, err := d.session.Update("incoming_webhook").
+		SetMap(fields).
+		Where("webhook_id=?", webhookID).
+		Where("status != ?", statusDeleted).Exec()
+	return err
+}
+
+// deleteByWebhookID 软删除（#254）：把 status 置为 statusDeleted 而非物理 DELETE，
+// 保留行供该 webhook 历史消息的发送者名/头像渲染（display datasource 不按 status
+// 过滤）。push 闸（status != statusEnabled）随之自动失效，列表/配额按 status !=
+// statusDeleted 排除，且 update 不再允许复活已删除行。调用方应先确认目标行存在且
+// 未删除（api 层在 query 后判 statusDeleted 返回 not-found）。
+// status != statusDeleted 守卫使重复软删除幂等：并发两次 DELETE，第二次落空。
+func (d *incomingWebhookDB) deleteByWebhookID(webhookID string) error {
+	_, err := d.session.Update("incoming_webhook").
+		Set("status", statusDeleted).
+		Where("webhook_id=?", webhookID).
+		Where("status != ?", statusDeleted).Exec()
+	return err
+}
+
+// queryMemberRole 一次点读返回 uid 在 groupNo 的成员资格与管理员身份：
+//   - isMember：是【内部、正常状态、未删除】成员（与 group.QueryIsGroupManagerOrCreator
+//     的 fail-safe 口径一致：is_deleted=0 + is_external=0 + status=Normal）；
+//   - isAdmin：在 isMember 基础上 role ∈ {creator, manager}。
+//
+// 单查询同时服务三处（一次往返拿全两个事实，省掉管理路径的二连击）：
+//   - 管理路径的 actor 解析（resolveActor：成员资格 + 管理员判定）；
+//   - 管理路径的"创建者仍在群内"闸（requireCreatorInGroup）；
+//   - push 路径的创建者在群闸 + 覆盖权限（cachedCreatorMembership 的回源查询，
+//     isAdmin 决定 push 的 username/avatar_url 覆盖是否生效）。
+//
+// 直接点读 group_member 表而非经 group 模块 DB：该表已是 bot_api 等模块的既有
+// 跨模块读取面，且这里只需一行，避免给 group.DB 增加仅本模块使用的接口。
+func (d *incomingWebhookDB) queryMemberRole(groupNo, uid string) (isMember, isAdmin bool, err error) {
+	var roles []int
+	_, err = d.session.Select("role").From("group_member").
+		Where("group_no=? AND uid=? AND is_deleted=0 AND is_external=0 AND status=?",
+			groupNo, uid, int(common.GroupMemberStatusNormal)).
+		Limit(1).Load(&roles)
+	if err != nil || len(roles) == 0 {
+		return false, false, err
+	}
+	return true, roles[0] == group.MemberRoleCreator || roles[0] == group.MemberRoleManager, nil
+}
+
+// filterGroupMembers 返回 uids 中【当前是 groupNo 内部正常成员】的子集,映射到各自的
+// 展示昵称(uid → user.name)。返回值【既是成员闸又是昵称表】:key 存在 = 是本群成员
+// (assembleMention 只看 key 判归属),value = 昵称(仅定向 @气泡渲染用,可能为空串——
+// 未 join 到 user 行时)。
+//
+// 用于 push 路径的定向 @ 校验:webhook token 是写进 CI/平台配置的低信任共享密钥,必须
+// 把 @ 目标收敛到本群成员,杜绝「泄露的 token @ 任意平台用户 / 跨 Space 身份」以及借
+// 「@<uid> 是否被保留」探测成员归属。成员定义与 queryMemberRole 同口径(is_deleted=0
+// + is_external=0 + status=Normal)——外部成员在 v1 刻意不可被 @(空间隔离保守取舍)。
+//
+// 昵称口径与群成员列表一致:LEFT JOIN user → IFNULL(user.name,”)(见 group/db.go 的
+// queryMembers*)。LEFT JOIN 不影响成员判定(只 group_member 的 WHERE 决定行集),仅补昵称;
+// 未 join 到 user 行(如某些 bot)→ 空串,render 侧据此跳过、绝不渲染 "@ "。uids 由调用方
+// 先去重并钳到上限,IN 列表有界。空入参短路返回。
+//
+// ⚠️ 与 @所有 AI 的非对称是【有意】的:定向 @uid 走本闸、排除外部成员(保守);而
+// @所有 AI(ais) 的 bot 展开走 fetchBotMemberUIDs→GetMembers,与 message/bot_api 入口
+// 同源、只排除已删成员(故可能含外部 bot 成员)——广播侧取 parity。两条路径都不越群/
+// 越 Space(都以本群成员为界,外部 bot 也确是本群成员),差异仅是「定向保守 vs 广播对齐
+// 其它入口」的取舍,非遗漏。
+func (d *incomingWebhookDB) filterGroupMembers(groupNo string, uids []string) (map[string]string, error) {
+	out := make(map[string]string, len(uids))
+	if groupNo == "" || len(uids) == 0 {
+		return out, nil
+	}
+	type memberRow struct {
+		UID  string `db:"uid"`
+		Name string `db:"name"`
+	}
+	var got []memberRow
+	_, err := d.session.Select("group_member.uid", "IFNULL(user.name,'') AS name").
+		From("group_member").
+		LeftJoin("user", "group_member.uid=user.uid").
+		Where("group_member.group_no=?", groupNo).
+		Where("group_member.uid in ?", uids).
+		Where("group_member.is_deleted=0 AND group_member.is_external=0 AND group_member.status=?", int(common.GroupMemberStatusNormal)).
+		Load(&got)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range got {
+		out[r.UID] = r.Name
+	}
+	return out, nil
+}
+
+// disableEnabledByWebhookID 把【仍处于启用态】的单个 webhook 置为禁用，用于 push
+// 路径发现创建者已退群时的懒级联禁用。status=statusEnabled 守卫保证：
+//   - 幂等（并发懒禁用只有一次生效）；
+//   - 绝不触碰软删除行（不会把 deleted 翻成 disabled 而复活到管理列表）。
+func (d *incomingWebhookDB) disableEnabledByWebhookID(webhookID string) error {
+	_, err := d.session.Update("incoming_webhook").
+		Set("status", statusDisabled).
+		Where("webhook_id=?", webhookID).
+		Where("status = ?", statusEnabled).Exec()
+	return err
+}
+
+// markUsed 累加调用计数并刷新 last_used_at；非关键路径，调用方应忽略错误（最多记日志）。
+// 走 ExecContext：审计在 push 路径的同步兜底分支下跑在请求 goroutine 上，必须受 ctx
+// 超时约束，否则 DB 饱和变慢会无限拖住 push 响应。
+// status != statusDeleted 守卫：与其它写路径一致，异步审计执行时行若已被并发软删除，
+// 不再给已删除 webhook 记账（不影响安全，仅保持纵深防御的一致性）。
+func (d *incomingWebhookDB) markUsed(ctx context.Context, webhookID string, now time.Time) error {
+	_, err := d.session.UpdateBySql(
+		"UPDATE incoming_webhook SET call_count = call_count + 1, last_used_at = ? WHERE webhook_id = ? AND status != ?",
+		now, webhookID, statusDeleted,
+	).ExecContext(ctx)
+	return err
+}
+
+// disableByGroupNo 把指定群下所有【未删除】的 webhook 置为禁用，用于群解散等级联场景。
+// 必须跳过 statusDeleted 行：否则会把软删除（2）翻成禁用（0），令其重新出现在管理列表
+// 并重新占用配额，等同"复活"了已删除的 webhook（#254）。
+func (d *incomingWebhookDB) disableByGroupNo(groupNo string) error {
+	_, err := d.session.Update("incoming_webhook").
+		Set("status", statusDisabled).
+		Where("group_no=?", groupNo).
+		Where("status != ?", statusDeleted).Exec()
+	return err
+}
+
+// insertAudit 写一条投递审计（成功或失败）。新增列（status/reason/http_status/adapter）
+// 由 util.AttrToUnderscore + Record 反射自动映射，无需改动。走 ExecContext，理由见 markUsed。
+func (d *incomingWebhookDB) insertAudit(ctx context.Context, m *auditModel) error {
+	_, err := d.session.InsertInto("incoming_webhook_audit").
+		Columns(util.AttrToUnderscore(m)...).
+		Record(m).ExecContext(ctx)
+	return err
+}
+
+// queryRecentAudits 倒序取某 webhook 最近 limit 条投递记录，供管理端 deliveries 排障。
+// 命中 idx_iwa_webhook_time(webhook_id, created_at) 前缀索引：等值 webhook_id + 按
+// created_at 倒序，无需回表全扫。limit 由调用方钳制在合理上限。
+//
+// 二级排序 id 倒序：created_at 是秒级精度，同秒内多条投递若只按 created_at 排序顺序
+// 不确定（「最近」语义会抖动）；id 自增、单调，作 tiebreaker 给出确定的最近优先顺序。
+func (d *incomingWebhookDB) queryRecentAudits(webhookID string, limit int) ([]*auditModel, error) {
+	var list []*auditModel
+	_, err := d.session.Select("*").From("incoming_webhook_audit").
+		Where("webhook_id=?", webhookID).
+		OrderDir("created_at", false).
+		OrderDir("id", false).
+		Limit(uint64(limit)).
+		Load(&list)
+	return list, err
+}

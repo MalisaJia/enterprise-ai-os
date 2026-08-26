@@ -1,0 +1,387 @@
+//
+//  WKConversationListVM.h
+//  WuKongBase
+//
+//  Created by tt on 2019/12/22.
+//
+
+#import <Foundation/Foundation.h>
+#import "WKConversationWrapModel.h"
+
+@class WKCategoryEntity;
+
+NS_ASSUME_NONNULL_BEGIN
+
+typedef NS_ENUM(NSInteger, WKConversationFilterType) {
+    WKConversationFilterFollow = 0, // 关注（含分组的群 + DM + 子区）
+    WKConversationFilterRecent = 1, // 最近（全平铺时间序）
+};
+
+/// 会话列表展示项（可以是普通会话 或 分组 section header）
+@interface WKConversationDisplayItem : NSObject
+@property (nonatomic, strong, nullable) WKConversationWrapModel *conversation; // 普通会话
+@property (nonatomic, assign) BOOL isSectionHeader;   // 是否为分组 header
+@property (nonatomic, copy, nullable) NSString *sectionId;
+@property (nonatomic, copy, nullable) NSString *sectionTitle;
+@property (nonatomic, assign) BOOL isDefaultSection;  // 默认分组（不可管理）
+@property (nonatomic, assign) NSInteger groupCount;   // 分组内群聊数量
+@property (nonatomic, assign) NSInteger unreadCount;  // 分组内未读总数
+@property (nonatomic, assign) BOOL hasMention;        // 分组内是否有@我提醒（折叠时显示）
++ (instancetype)itemWithConversation:(WKConversationWrapModel *)model;
++ (instancetype)sectionHeaderWithId:(NSString *)sectionId title:(NSString *)title isDefault:(BOOL)isDefault;
+@end
+
+@interface WKConversationListVM : NSObject
+
+/// 当前过滤类型（群组/私聊）
+@property (nonatomic, assign) WKConversationFilterType filterType;
+
++ (WKConversationListVM *)shared;
+
+
+-(void) reset; // 重置数据
+
+/// 是否应在当前空间显示该会话。复用主会话列表的全套空间过滤逻辑:
+///   - 系统通知 / 文件助手 全局放行
+///   - BotFather 当前空间未隐藏时放行
+///   - WK_GROUP: WKSpaceFilter Skip → 过滤; FailOpen 时降级走 syncedGroupChannelIds 白名单
+///   - WK_PERSON: WKSpaceFilter Skip → 过滤; FailOpen 时看 lastMessage.content.space_id 兜底
+/// 转发选择 / 新建会话目录等独立 VC 通过 [WKConversationListVM shared] 复用此过滤,
+/// 避免重复实现导致与主列表不一致 (白名单 race / FailOpen 漏过等场景)。
+-(BOOL) shouldShowConversation:(WKConversation*)conversation;
+
+/// sync完成后调用：记录当前VM中的群聊channelId作为"当前空间合法群聊"白名单
+/// shouldShowConversation: 中会用此白名单过滤其他空间的群聊
+-(void) snapshotSyncedGroupIds;
+
+/// 将群聊添加到当前空间白名单（用于群聊创建后立即显示在会话列表）
+-(void) addGroupToWhitelist:(NSString*)channelId;
+
+/// 用持久化的会话归属表（conversation_space）水化空间白名单 + SDK 会话读路径的空间作用域。
+/// 启动 / 切空间时在 `reset` 之后、任何 `loadConversationList` 之前调用。
+///
+/// 为什么必须有：`reset` 把 syncedGroupChannelIds 清成 nil，而 shouldShowConversation:
+/// 对 nil 的语义是"尚未 sync，暂不过滤"。原先这个 fail-open 窗口安全是因为 DB 刚被
+/// deleteAllConversation 清空；改成保留多空间缓存后，必须靠归属表在第一帧就给出
+/// 正确的白名单，否则别的空间的会话会漏进列表。
+-(void) hydrateSpaceScope:(NSString*)spaceId;
+
+/// 实时会话更新被判定为"属于当前空间"后，把结论同步进内存群白名单。
+/// 归属落库是异步的，而 shouldShowConversation: 的群分支读内存集合 —— 不同步更新的话，
+/// 刚进来的新群会在下一次 loadConversationList 时被自己的白名单挡掉。
+/// DM 不参与：它没有内存白名单，空间隔离完全交给 SQL 作用域（多一份内存集合只会漂移，
+/// 曾导致"进聊天详情返回后所有私聊消失"）。
+-(void) noteSpaceMembershipChannels:(NSArray<WKChannel*>*)channels;
+
+/// 把"当前实际渲染出来的会话集"记成当前空间的归属快照（只增不删）。
+///
+/// 这是缓存的**主要**建立方式，而不是靠"预测归属"：
+/// 会话是否属于当前空间，本来就有一整套判定链（sync 白名单 → WKSpaceFilter →
+/// SpaceBotRegistry → pruneNonCurrentSpaceGroups / pruneNonCurrentSpaceBots /
+/// sweepForeignToSpace 四层兜底）。这条链跑完之后留在 conversationWrapModels 里的，
+/// 就是"这个空间该显示的会话"最可信的答案 —— 比任何单一证据信号都强。把它记下来，
+/// 下次冷启动（含断网）就能还原成用户上次看到的那个列表。
+///
+/// 反过来，只靠证据预测归属会有缺口：很多 DM 的消息 payload 不带 space_id、群的
+/// channelInfo.extra 也未必有 space_id，于是证据链命中不了 → 归属漏记 → 断网冷启动
+/// 只剩系统 bot（实测过的现象）。
+///
+/// 调用时机：列表构建完成 / Space 切换收尾 / sync 收尾 / App 进后台。
+/// 只增不删：tombstone（退群、删会话）仍由真正的全量 sync 与 prune/sweep 负责。
+-(void) persistRenderedMembershipSnapshot;
+
+/// 同上，synchronous=YES 时同步写完再返回。App 进后台必须用同步版本 ——
+/// 异步写可能还没执行进程就被挂起，而那一刻恰好是最需要记住列表状态的时候。
+-(void) persistRenderedMembershipSnapshotSynchronous:(BOOL)synchronous;
+
+/// 检查群聊是否在当前空间白名单中
+/// 白名单未初始化（首次sync前）时返回YES（暂不过滤）
+-(BOOL) isGroupInWhitelist:(NSString*)channelId;
+
+/// 白名单是否已被 snapshot/sync 初始化过。
+/// : 新消息路径需要区分「白名单 nil（race / 重置中）」vs「白名单空集（明确无群）」——
+/// 前者不能再作 fail-open 默认通过，必须走 verifyAndAddGroupsToList 回兜，
+/// 否则外部群新消息会在 Space 切换瞬态窗口里绕过 SpaceFilter 污染当前 Space 列表。
+-(BOOL) isGroupWhitelistInitialized;
+
+/// : 从当前 VM 的 conversationWrapModels 中裁剪掉当前 Space 不应展示的群聊。
+/// 扫描所有 WK_GROUP 条目，对每一条调 WKSpaceFilter —— 拿到 Skip 就移除残留，
+/// 避免「访问过群后内存层 / SDK cache 残留 → 新消息路径将其浮到当前 Space 列表顶部」。
+/// 在 Space 切换完成（snapshotSyncedGroupIds 之后）和 filter 批次结束时调用。
+/// 返回被移除的 channelId 列表（便于 caller 触发 UI 刷新 / 记日志）。
+-(NSArray<NSString*>*) pruneNonCurrentSpaceGroups;
+
+/// YUJ-bot-isolation: 清掉 VM 中"已 robot=YES 但不属于指定 Space my_bots∪space_bots 集合"的 Bot 行。
+/// 与 web 不同：iOS 上 Bot DM 的 channel_id 不带 `s{spaceId}_` 前缀、消息 payload 也不带
+/// space_id（实测线上服务端如此），因此前缀 / 消息字段三层信号都失效，必须靠
+/// WKSpaceBotRegistry 的服务端权威列表兜底。在 WKSpaceBotRegistryDidLoadNotification
+/// 触发时调用。返回被移除的 channelId 列表。
+-(NSArray<NSString*>*) pruneNonCurrentSpaceBotsForSpace:(NSString*)spaceId;
+
+/// Space 切换/sync 完成后的兜底总清扫 —— 把 conversationWrapModels +
+/// threadWrapModels 里凡是不属于指定 Space 的条目全部移除。覆盖 4 类:
+///   - WK_GROUP：WKSpaceFilter.Skip → 移除
+///   - WK_PERSON Bot：WKSpaceBotRegistry.NotMember → 移除
+///   - WK_PERSON 非 Bot：lastMessage.space_id 明确不匹配 → 移除（保守，缺 space_id 保留）
+///   - WK_COMMUNITY_TOPIC：parentGroupNo 不在 syncedGroupChannelIds → 移除
+/// 调用时机：Space 切换 sync 完成 callback 末尾（snapshot/prune 之后），
+/// 兜住"切换瞬间通过 fail-open 漏入的会话"。
+/// outRemovedCount / outRemovedThreadCount 可传 NULL。
+-(void) sweepForeignToSpace:(NSString*)spaceId
+                removedCount:(nullable NSInteger*)outRemovedCount
+         removedThreadCount:(nullable NSInteger*)outRemovedThreadCount;
+
+/// : 后端 sync 在当前 Space 不返回 botfather 时本地兜底合成占位 conversation，
+/// 保证用户能看到系统 bot 入口（对齐 Android Round-3 Fix C）。
+/// 调用时机：sync 完成 / Space 切换后的 loadConversationList 之后，
+/// 即在 snapshotSyncedGroupIds + pruneNonCurrentSpaceGroups 之后 / UI 刷新之前。
+/// 硬约束：
+///   1. 只挂在 VM 层 conversationWrapModels，不写入 WKSDK conversationManager / DB —
+///      避免污染 修复的持久化层（群聊 cache 清理策略针对 DB，不影响此 VM-only
+///      合成条目）；占位 conversation 随下次 reset / loadConversationList 自然丢弃。
+///   2. 尊重 WKBotFatherHidden_<spaceId> 用户隐藏标记 — 已删除过的 Space 不自动恢复，
+///      对齐 shouldShowConversation / filterConversationsBySpace 的既有语义。
+///   3. 已存在 botfather entry（sync 正常返回 / 新消息路径先到）时无操作。
+/// 返回 YES 表示实际合成了 entry（caller 可据此决定是否额外刷新 UI）。
+-(BOOL) ensureSystemBotsVisible;
+/**
+ 加载最近会话列表
+ */
+-(void) loadConversationList:(void(^)(void)) finished;
+
+
+/**
+ 最近会话数量
+
+ @return <#return value description#>
+ */
+-(NSInteger) conversationCount;
+
+
+/**
+ 最近会话列表数据
+
+ @return <#return value description#>
+ */
+-(NSArray<WKConversationWrapModel*> *) conversationList;
+
+
+/**
+ 排序
+ */
+-(void) sortConversationList;
+/**
+ 获取频道会话的下表
+
+ @param channel <#channel description#>
+ @return <#return value description#>
+ */
+-(NSInteger) indexAtChannel:(WKChannel*)channel;
+
+
+/**
+ 获取频道对应的z最近会话对象
+
+ @param channel <#channel description#>
+ @return <#return value description#>
+ */
+-(WKConversationWrapModel*) modelAtChannel:(WKChannel*) channel;
+
+-(WKConversationWrapModel*) modelAtIndex:(NSInteger)index;
+
+/**
+ 取代频道最近会话model
+
+ @param model <#model description#>
+ @param channel <#channel description#>
+ */
+-(void) replaceAtChannel:(WKConversationWrapModel*)model atChannel:(WKChannel*)channel;
+
+-(void) replaceObjectAtIndex:(NSInteger)index withObject:(WKConversationWrapModel*)model;
+/**
+ 移除指定频道的会话
+
+ @param channel <#channel description#>
+ */
+-(void) removeAtChannnel:(WKChannel*)channel;
+
+-(void) removeAtIndex:(NSInteger)index;
+
+
+/// 移除所有会话
+-(void) removeAll;
+/**
+ 插入会话
+
+ @param model <#model description#>
+ @param insert <#insert description#>
+ */
+-(void) insert:(WKConversationWrapModel*)model atIndex:(NSInteger)insert;
+
+-(NSInteger) insert:(WKConversationWrapModel*)model;
+
+
+/**
+  获取真正需要显示的conversation对象（如果最近会话属于某个最近会话的子类 其实真正要显示的是这个父类的最近会话信息）
+ */
+-(WKConversationWrapModel*) getRealShowConversationWrap:(WKConversationWrapModel*) wrapModel;
+/**
+  获取插入位置
+ */
+-(NSInteger) findInsertPlace:(WKConversationWrapModel*)model;
+
+/**
+ 获取指定下标的最近会话对象
+
+ @param index <#index description#>
+ @return <#return value description#>
+ */
+-(WKConversationWrapModel*) conversationAtIndex:(NSInteger)index;
+
+
+/// 移除最近会话
+/// @param index <#index description#>
+-(void) removeConversationAtIndex:(NSInteger)index;
+
+
+/// 拉取所有群组的子区数量
+-(void) fetchThreadCountsForGroups;
+
+/// 重建过滤列表（filterType 变更或数据增删后调用）
+-(void) rebuildFilteredList;
+
+/// 全量会话列表（不受 tab 过滤影响，用于跨 tab 检测@提醒等）
+-(NSArray<WKConversationWrapModel*> *) allConversations;
+
+/// 当前 VM 已知的所有需要 channelInfo 的频道（PERSON/GROUP + threadWrapModels + 子区缓存），
+/// 用于 VC 端冷启动后 channelInfo 后台预热（避免 mute 判错把红点冲到 99+）。
+/// 内部按 channel.channelId+channelType 去重；调用方按返回顺序分批 fetchChannelInfo 即可。
+-(NSArray<WKChannel*> *) allKnownChannelsForWarmup;
+
+/// 关注 tab 未读数
+-(NSInteger) getFollowUnreadCount;
+
+/// 最近 tab 未读数（DM + 3 天内活跃的群 + 子区，全部 !mute）
+-(NSInteger) getRecentUnreadCount;
+
+/// 最近 tab「双击 tab 依次定位下一个未读」用：按当前 filteredConversations 顺序
+/// 返回**肉眼能看到红点**的行下标（升序，可直接当 tableView 的 row 用）。
+///
+/// 判定口径故意收在这里，与 getRecentUnreadCount / cell 渲染同源，避免出现
+/// 「tab 红点是 0，但双击还能跳到某一行」这种错位：
+///   - filterType != Recent 返回空数组 —— 关注 tab 的 row 来自 groupDisplayList
+///     （含分组 header），下标语义和 filteredConversations 不通用
+///   - 跳过静音（isChannelMuted:，与 tab 红点同源）
+///   - 跳过 placeholder 子区（lastMessage == nil）：那个 unreadCount 来自接口，
+///     不一定是当前用户的未读，cell 也不给它渲染红点（同 getRecentUnreadCount）
+///   - 未读取 recentTabActivityUnreadCount，与 WKConversationListCell.refreshUnread
+///     在最近 tab 下用的是同一个 getter
+-(NSArray<NSNumber *> *) recentUnreadRowIndexes;
+
+/// 子区独立 wrap models — 用于"最近 tab 平铺、子区独立成行"。
+/// 与 conversationWrapModels 互不重叠：后者只有 PERSON+GROUP，前者只有 COMMUNITY_TOPIC。
+@property(nonatomic,copy,readonly,nullable) NSArray<WKConversationWrapModel*> *threadWrapModels;
+
+/// 同 modelAtChannel: 但子区也会被找到（先查 channelIndex，再扫 threadWrapModels）。
+/// 用于 unread / channelInfo 这类更新场景。
+-(nullable WKConversationWrapModel*) anyModelAtChannel:(WKChannel*) channel;
+
+/// 3 天内无活动的群判定。最近 tab 用：列表过滤 + 未读统计都用同一谓词避免不一致。
+/// DM/子区 不参与该过滤。
++ (BOOL)isInactiveGroup:(WKConversationWrapModel*)model;
+
+/// 子区会话增量更新（来自 onConversationUpdate）。最近 tab 调，用于刷新
+/// threadWrapModels 集合并触发 rebuildFilteredList。不动 conversationWrapModels。
+- (void)applyThreadConversationUpdates:(NSArray<WKConversation*>*)threadConversations;
+
+/// 把 SDK 单独投递的子区 unreadCount 增量更新到 cachedTopicsByGroup 里现有条目上。
+/// 解决 PR review #1 critical：anyModelAtChannel 只看 conversationWrapModels +
+/// threadWrapModels，但 threadWrapModels 严格按 parent.threadPreviews 收，
+/// 是 cachedTopicsByGroup 的真子集。Follow tab badge / 群行「+N 子区」角标都直接
+/// 读 cachedTopicsByGroup[..].unreadCount —— "已关注但不在 preview 行"的子区
+/// 收到 unread callback 时若不写回这份缓存，badge 永远停在旧值。
+/// 只更新已存在条目，不 create 占位（避免越过 syncedGroups 闸门把跨 Space /
+/// 未 sync 的子区凭空塞进缓存）。返回 YES 表示找到并更新了至少一条。
+- (BOOL)updateCachedSubzoneUnread:(WKChannel*)channel unreadCount:(NSInteger)unreadCount;
+
+/// 刷新指定群组的子区数量
+-(void) refreshThreadCountForGroups:(NSSet<NSString*>*)groupNos;
+
+/// 子区预览展开状态
+-(BOOL) isThreadExpanded:(NSString*)channelId;
+-(void) toggleThreadExpanded:(NSString*)channelId;
+-(void) restoreExpandedThreadGroups;
+
+/// 有会话置顶
+-(BOOL) hasConversationTop;
+
+/**
+ 获取所有未读数量
+
+ @return <#return value description#>
+ */
+-(NSInteger) getAllUnreadCount;
+
+#pragma mark - Category (分组)
+
+/// 分组列表
+@property (nonatomic, strong) NSArray<WKCategoryEntity *> *categoryList;
+
+/// 折叠状态
+@property (nonatomic, strong) NSMutableSet<NSString *> *collapsedSections;
+
+/// 加载分组数据
+-(void) loadCategoriesWithCompletion:(nullable void(^)(void))completion;
+
+/// 构建群聊 tab 的展示列表（含 section header），同时计算全局 hasMention 状态
+-(NSArray<WKConversationDisplayItem *> *) buildGroupDisplayList;
+
+/// 将一次子区 reminder 推送结果合并进 cachedRemindersByChannelId。
+/// 子区不在 conversationWrapModels / channelIndex 内，buildGroupDisplayList 的
+/// follow/recent tab mention 计算只能从这份缓存读 — 缓存是 loadConversationList
+/// 一次性建好的，若新到的子区 reminder 不回写，[有人@我] 标签永远不会在 tab 上亮。
+/// channel 非 WK_COMMUNITY_TOPIC 时该方法 no-op（顶层群/DM 走 model.simpleReminders 路径）。
+-(void) applySubzoneRemindersUpdate:(WKChannel *)channel reminders:(NSArray<WKReminder *> *)reminders;
+
+/// 按 WKFollowedKeysStore 把已关注子区从 SDK DB batch-fetch 进 cachedTopicsByGroup。
+/// SDK 的 getConversationList 不返回 WK_COMMUNITY_TOPIC（设计如此），冷启动 +
+/// followedKeys 后加载 race 下这份 cache 会持续是空 → "+N子区" cell 上的 unread
+/// 数字永远 0。在 loadConversationList 末尾 + onFollowedKeysStoreDidUpdate 各调一次
+/// 保证最终一致。返回新加入的条目数（便于决策是否触发 UI reload）。
+-(NSInteger) seedFollowedThreadsIntoTopicsCache;
+
+/// 冷启动两阶段分页 catchup（PR review #7 warning）：当 fetchThreadCountsForGroups
+/// 第一次跑时若 store 还没加载，所有群都按 maxPages=1 拉（避免 N×10 网络放大）；
+/// 等 store 加载完成后 VC 在 onFollowedKeysStoreDidUpdate 调本方法，对「现已知
+/// 有已关注子区」的群发 maxPages=10 完整分页 listAllThreads 补 unread。
+/// 内部带 didColdStartFullPaging 闸门，保证整个 VM 生命周期内只跑一次（subsequent
+/// follow 切换不会再次触发，避免在 toggle 高频通知里重复拉网络）。
+- (void)coldStartCatchupIfNeeded;
+
+/// buildGroupDisplayList 计算出的 tab 级 @提醒状态，分关注 / 最近两个集合：
+///   - Follow:  与 getFollowUnreadCount 同口径（DM/Channel/Thread 走 WKFollowedKeysStore）
+///   - Recent:  与 getRecentUnreadCount 同口径（DM 全部；Group 非 3 天 stale；Thread 走
+///              threadWrapModels 排除 placeholder）
+/// 同一会话可能同时落在两个集合（例如关注的 3 天活跃群），这种情况下两个字段都会为 YES。
+@property (nonatomic, assign, readonly) BOOL lastBuildFollowHasMention;
+@property (nonatomic, assign, readonly) BOOL lastBuildRecentHasMention;
+
+/// 从缓存获取指定群聊下子区的未读数和 @提醒状态（供 cell 渲染用，无 DB 查询）
+-(void) getThreadIndicatorForGroup:(NSString *)groupNo threadUnread:(NSInteger *)outUnread threadHasMention:(BOOL *)outHasMention;
+
+/// 同上，但允许排除一组 channelId（例如已经作为预览行单独显示红点的子区）。
+/// 用于"+N个子区"badge 的计算，避免把预览行已经展示的未读数重复计入。
+-(void) getThreadIndicatorForGroup:(NSString *)groupNo
+               excludingChannelIds:(nullable NSSet<NSString *> *)excluded
+                      threadUnread:(NSInteger *)outUnread
+                  threadHasMention:(BOOL *)outHasMention;
+
+/// 保存折叠状态
+-(void) saveCollapsedSections;
+
+/// 恢复折叠状态
+-(void) restoreCollapsedSections;
+
+@end
+
+NS_ASSUME_NONNULL_END

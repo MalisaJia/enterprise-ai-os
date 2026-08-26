@@ -1,0 +1,447 @@
+# =============================================================================
+# model-gateway 配置模板（模型路由核心配置）
+# 用法: cp config/config.yaml.example config/config.yaml
+#
+# 这个文件是网关的"大脑"：模型清单、单价、能力标签、路由规则、降级链都在这里。
+# 支持热加载（见 registry.hot_reload），改完不需要重启。
+# =============================================================================
+
+service:
+  name: model-gateway
+  version: 0.1.0
+  env: ${ENV:-dev}
+  host: 0.0.0.0
+  port: ${MODEL_GATEWAY_PORT:-8200}
+  root_path: ""
+  # 流式长连接需要更长的 keep-alive
+  keepalive_timeout_seconds: 120
+  # 单请求总超时（含 fallback 重试），超过则返回 504
+  request_timeout_seconds: 300
+  cors_origins: []
+
+logging:
+  level: ${LOG_LEVEL:-INFO}
+  format: ${LOG_FORMAT:-json}
+  # 安全红线：绝不记录 prompt / completion 原文，只记录哈希与长度。
+  # 需要排查内容问题时走单独的、带审批的 debug 采样开关。
+  log_request_body: false
+  log_response_body: false
+  debug_sample_rate: 0.0
+
+auth:
+  enabled: ${OCTO_AUTH_ENABLED:-true}
+  octo_auth_url: ${OCTO_AUTH_BASE_URL:-http://octo-auth:8080}
+  verify_endpoint: /v1/verify
+  cache_ttl_seconds: 60
+  internal_token: ${INTERNAL_SERVICE_TOKEN:-}
+  # 兼容层：允许 OCTO 存量服务用静态 key 接入（逐步迁移到 octo-auth）
+  static_api_keys: []
+  #  - key: sk-aios-smart-summary-xxxx
+  #    tenant_id: default
+  #    label: octo-smart-summary
+  #    allowed_models: ["deepseek-chat", "qwen-plus"]
+
+# -----------------------------------------------------------------------------
+# Provider —— 厂商接入配置
+# 凭证只从环境变量读，绝不写进本文件
+# -----------------------------------------------------------------------------
+providers:
+  qwen:
+    enabled: true
+    type: openai_compatible          # 阿里百炼提供 OpenAI 兼容模式
+    base_url: ${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+    api_key: ${QWEN_API_KEY:-}
+    timeout_seconds: 120
+    connect_timeout_seconds: 5
+    max_connections: 100
+    max_retries: 2
+    # 厂商侧配额，用于网关做前置保护（避免打到厂商才被拒）
+    limits:
+      rpm: 1200
+      tpm: 1000000
+
+  deepseek:
+    enabled: true
+    type: openai_compatible
+    base_url: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+    api_key: ${DEEPSEEK_API_KEY:-}
+    timeout_seconds: 180             # 推理型模型响应慢，超时要放宽
+    connect_timeout_seconds: 5
+    max_connections: 100
+    max_retries: 2
+    limits:
+      rpm: 600
+      tpm: 500000
+
+  glm:
+    enabled: true
+    type: openai_compatible
+    base_url: ${GLM_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+    api_key: ${GLM_API_KEY:-}
+    timeout_seconds: 120
+    connect_timeout_seconds: 5
+    max_connections: 60
+    max_retries: 2
+    limits:
+      rpm: 600
+      tpm: 400000
+
+  yi:
+    enabled: true
+    type: openai_compatible
+    base_url: ${YI_BASE_URL:-https://api.lingyiwanwu.com/v1}
+    api_key: ${YI_API_KEY:-}
+    timeout_seconds: 120
+    connect_timeout_seconds: 5
+    max_connections: 40
+    max_retries: 2
+    limits:
+      rpm: 300
+      tpm: 200000
+
+  vllm:
+    # 私有化部署：数据不出内网的场景走这里
+    enabled: false
+    type: openai_compatible
+    base_url: ${VLLM_BASE_URL:-http://vllm:8000/v1}
+    api_key: ${VLLM_API_KEY:-not-needed}
+    timeout_seconds: 300
+    max_connections: 200
+    max_retries: 1
+
+# -----------------------------------------------------------------------------
+# 模型注册表
+#
+# capabilities 是路由的核心依据。task_type 策略靠它来筛候选。
+# price 单位：美元 / 1K tokens（人民币计价的厂商按当期汇率折算，由运维定期校准）
+# -----------------------------------------------------------------------------
+registry:
+  hot_reload: true
+  hot_reload_interval_seconds: 30
+
+  models:
+    # ---- Qwen ----
+    - id: qwen-max
+      provider: qwen
+      upstream_name: qwen-max
+      type: chat
+      context_window: 32768
+      max_output_tokens: 8192
+      capabilities: [chat, reasoning, tool_call, chinese, long_context]
+      price: { input: 0.0024, output: 0.0096 }
+      weight: 100                    # 同优先级内的加权轮询权重
+      priority: 1                    # 越小越优先
+      tags: [general, high_quality]
+
+    - id: qwen-plus
+      provider: qwen
+      upstream_name: qwen-plus
+      type: chat
+      context_window: 131072
+      max_output_tokens: 8192
+      capabilities: [chat, tool_call, chinese, long_context]
+      price: { input: 0.0004, output: 0.0012 }
+      weight: 100
+      priority: 1
+      tags: [general, balanced]
+
+    - id: qwen-turbo
+      provider: qwen
+      upstream_name: qwen-turbo
+      type: chat
+      context_window: 131072
+      max_output_tokens: 8192
+      capabilities: [chat, chinese, fast]
+      price: { input: 0.00005, output: 0.0002 }
+      weight: 100
+      priority: 2
+      tags: [cheap, fast]
+
+    # ---- DeepSeek ----
+    - id: deepseek-chat
+      provider: deepseek
+      upstream_name: deepseek-chat
+      type: chat
+      context_window: 65536
+      max_output_tokens: 8192
+      capabilities: [chat, tool_call, chinese, code]
+      price: { input: 0.00027, output: 0.0011 }
+      weight: 120                    # 性价比最高，给更高权重
+      priority: 1
+      tags: [general, balanced, cost_effective]
+
+    - id: deepseek-reasoner
+      provider: deepseek
+      upstream_name: deepseek-reasoner
+      type: chat
+      context_window: 65536
+      max_output_tokens: 8192
+      capabilities: [chat, reasoning, deep_thinking, chinese]
+      price: { input: 0.00055, output: 0.00219 }
+      weight: 100
+      priority: 1
+      tags: [reasoning]
+      # 推理模型不支持 tool_call / temperature，网关需拦掉这些参数而非透传报错
+      unsupported_params: [tools, tool_choice, temperature, top_p]
+
+    - id: deepseek-coder
+      provider: deepseek
+      upstream_name: deepseek-chat    # 当前 coder 已合并入 chat，保留别名便于业务无感切换
+      type: chat
+      context_window: 65536
+      max_output_tokens: 8192
+      capabilities: [chat, code, fim, chinese]
+      price: { input: 0.00027, output: 0.0011 }
+      weight: 100
+      priority: 1
+      tags: [code]
+
+    # ---- GLM ----
+    - id: glm-4-plus
+      provider: glm
+      upstream_name: glm-4-plus
+      type: chat
+      context_window: 131072
+      max_output_tokens: 4096
+      capabilities: [chat, reasoning, tool_call, chinese, long_context]
+      price: { input: 0.0069, output: 0.0069 }
+      weight: 80
+      priority: 2
+      tags: [general, high_quality]
+
+    - id: glm-4-long
+      provider: glm
+      upstream_name: glm-4-long
+      type: chat
+      context_window: 1048576         # 百万级上下文，长文档场景首选
+      max_output_tokens: 4096
+      capabilities: [chat, chinese, ultra_long_context]
+      price: { input: 0.00014, output: 0.00014 }
+      weight: 100
+      priority: 1
+      tags: [long_context]
+
+    # ---- Yi ----
+    - id: yi-large
+      provider: yi
+      upstream_name: yi-large
+      type: chat
+      context_window: 32768
+      max_output_tokens: 4096
+      capabilities: [chat, chinese, reasoning]
+      price: { input: 0.0028, output: 0.0028 }
+      weight: 60
+      priority: 3                     # 主要作为 fallback 备份
+      tags: [general, backup]
+
+    # ---- Embedding ----
+    - id: bge-m3
+      provider: qwen
+      upstream_name: text-embedding-v3
+      type: embedding
+      dimensions: 1024
+      max_input_tokens: 8192
+      capabilities: [embedding, chinese, multilingual]
+      price: { input: 0.00007, output: 0.0 }
+      weight: 100
+      priority: 1
+      tags: [embedding]
+
+    - id: embedding-glm
+      provider: glm
+      upstream_name: embedding-3
+      type: embedding
+      dimensions: 2048
+      max_input_tokens: 8192
+      capabilities: [embedding, chinese]
+      price: { input: 0.00007, output: 0.0 }
+      weight: 50
+      priority: 2
+      tags: [embedding, backup]
+
+    # ---- Rerank ----
+    - id: bge-reranker-v2-m3
+      provider: qwen
+      upstream_name: gte-rerank
+      type: rerank
+      max_input_tokens: 4096
+      capabilities: [rerank, chinese]
+      price: { input: 0.0001, output: 0.0 }
+      weight: 100
+      priority: 1
+      tags: [rerank]
+
+# -----------------------------------------------------------------------------
+# 路由
+#
+# 别名（alias）是给业务用的稳定契约：业务只写 "auto:code"，
+# 具体落到哪个模型由运维通过本配置决定，换模型无需改业务代码。
+# -----------------------------------------------------------------------------
+routing:
+  default_strategy: task_type        # explicit | priority | task_type | cost | latency | load
+  # 显式指定了具体 model id 时是否仍允许网关改写（成本超支降级场景）
+  allow_override_explicit: false
+
+  aliases:
+    "auto:chat":
+      candidates: [deepseek-chat, qwen-plus, glm-4-plus, yi-large]
+      strategy: task_type
+    "auto:code":
+      candidates: [deepseek-coder, qwen-max, glm-4-plus]
+      strategy: task_type
+    "auto:reasoning":
+      candidates: [deepseek-reasoner, qwen-max, glm-4-plus]
+      strategy: task_type
+    "auto:long":
+      # 超长上下文：按 context_window 降序，先试百万窗口
+      candidates: [glm-4-long, qwen-plus, deepseek-chat]
+      strategy: task_type
+    "auto:cheap":
+      candidates: [qwen-turbo, deepseek-chat, glm-4-long]
+      strategy: cost
+    "auto:embedding":
+      candidates: [bge-m3, embedding-glm]
+      strategy: priority
+    "auto:rerank":
+      candidates: [bge-reranker-v2-m3]
+      strategy: priority
+
+  # task_type 策略的能力映射：请求声明的任务类型 → 必需能力标签
+  task_capability_map:
+    chat: [chat]
+    code: [code]
+    reasoning: [reasoning]
+    long_context: [long_context]
+    embedding: [embedding]
+    rerank: [rerank]
+    tool_call: [tool_call]
+
+  # 降级链：当前模型不可用（熔断/限流/5xx）时依次尝试下一个。
+  # 原则是"同能力、可接受的成本差"，绝不把代码任务降级到没有 code 能力的模型。
+  fallback:
+    enabled: true
+    max_depth: 2                     # 最多再试 2 个，避免请求雪崩式放大
+    # 仅这些错误触发 fallback；4xx 参数错误重试无意义
+    trigger_on: [timeout, connection_error, rate_limited, server_error, circuit_open]
+    chains:
+      deepseek-chat: [qwen-plus, glm-4-plus]
+      deepseek-reasoner: [qwen-max, glm-4-plus]
+      deepseek-coder: [qwen-max, glm-4-plus]
+      qwen-max: [glm-4-plus, deepseek-chat]
+      qwen-plus: [deepseek-chat, glm-4-plus]
+      qwen-turbo: [deepseek-chat]
+      glm-4-plus: [qwen-max, deepseek-chat]
+      glm-4-long: [qwen-plus]
+      yi-large: [qwen-plus, deepseek-chat]
+      bge-m3: [embedding-glm]
+
+  # latency 策略的数据来源：滚动窗口内的 P95
+  latency_window_seconds: 300
+  # load 策略：按活跃连接数选最闲的
+  load_metric: active_requests
+
+# -----------------------------------------------------------------------------
+# 限流（Redis 分布式令牌桶）
+# 三级独立生效，任一级超限即拒绝。租户级防"邻居噪音"，模型级防打爆厂商配额。
+# -----------------------------------------------------------------------------
+rate_limit:
+  enabled: true
+  backend: redis
+  redis_url: ${REDIS_URL:-redis://redis:6379/0}
+  algorithm: token_bucket            # token_bucket | sliding_window
+  # 超限行为：reject 返回 429；queue 排队等待；degrade 降级到廉价模型
+  on_exceed: reject
+  max_queue_wait_seconds: 5
+  # 返回标准 RateLimit-* 响应头，让客户端能自适应退避
+  emit_headers: true
+
+  tiers:
+    tenant:
+      enabled: true
+      rpm: 3000
+      tpm: 2000000
+      concurrent: 200
+    user:
+      enabled: true
+      rpm: 120
+      tpm: 100000
+      concurrent: 10
+    model:
+      enabled: true
+      # 留空则取 providers.*.limits 的值
+      rpm: null
+      tpm: null
+
+  # 特定调用方的例外（如 rag-pipeline 批量摄入需要更高配额）
+  overrides:
+    - subject: "service:rag-pipeline"
+      rpm: 6000
+      tpm: 5000000
+      concurrent: 64
+
+# -----------------------------------------------------------------------------
+# 熔断
+# 阈值选择说明：连续 5 次失败开断（够灵敏但不误伤偶发抖动），
+# 冷却 30s（厂商抖动的典型恢复时间），半开只放 3 个探测请求。
+# -----------------------------------------------------------------------------
+circuit_breaker:
+  enabled: true
+  # 状态存 Redis，多实例共享同一判定，避免每个实例各自试错
+  state_backend: redis
+  redis_url: ${REDIS_URL:-redis://redis:6379/0}
+  failure_threshold: 5
+  failure_rate_threshold: 0.5        # 滚动窗口失败率超 50% 也开断
+  rolling_window_seconds: 60
+  min_requests_in_window: 20         # 样本不足时不按失败率判定，避免小样本误判
+  open_duration_seconds: 30          # 开路冷却时长
+  half_open_max_requests: 3          # 半开探测请求数
+  half_open_success_threshold: 2     # 探测成功这么多次才闭合
+  # 这些错误计入失败；429 单独由限流处理，不计熔断（否则被限流会误开断路器）
+  count_as_failure: [timeout, connection_error, server_error]
+  ignore: [rate_limited, invalid_request, content_filter]
+
+# -----------------------------------------------------------------------------
+# 用量与成本
+# -----------------------------------------------------------------------------
+metering:
+  enabled: true
+  # 实时计数在 Redis（供限额判定），异步批量落 PostgreSQL（供对账）
+  redis_url: ${REDIS_URL:-redis://redis:6379/0}
+  database_url: ${DATABASE_URL:-}
+  flush_interval_seconds: 10
+  batch_size: 200
+  # 流式响应无法从响应体拿 usage，需本地用 tiktoken 估算并标记为估算值
+  estimate_stream_usage: true
+  currency: USD
+  # 月度预算：超支行为
+  quota:
+    enabled: false
+    on_exceed: degrade               # reject | degrade | warn
+    degrade_to: "auto:cheap"
+    tenant_monthly_usd: 5000
+    user_monthly_usd: 100
+
+# -----------------------------------------------------------------------------
+# 请求处理细节
+# -----------------------------------------------------------------------------
+request:
+  # 各厂商对参数支持不一致，网关统一裁剪 unsupported_params 而非把错误抛给业务
+  strip_unsupported_params: true
+  # 上下文超模型窗口时的处理：reject 明确报错 / truncate 截断中间消息 / reroute 换大窗口模型
+  on_context_overflow: reroute
+  default_max_tokens: 4096
+  # 强制上限，防止单请求烧掉大量预算
+  hard_max_tokens: 32768
+  # 幂等键：相同 Idempotency-Key 在 TTL 内返回缓存结果（重试场景省钱）
+  idempotency:
+    enabled: true
+    ttl_seconds: 300
+
+observability:
+  metrics_enabled: true
+  metrics_path: /metrics
+  tracing_enabled: ${OTEL_ENABLED:-false}
+  otlp_endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+  # 首 token 延迟是流式体感的关键指标，单独埋点
+  track_time_to_first_token: true
+  slow_request_ms: 10000

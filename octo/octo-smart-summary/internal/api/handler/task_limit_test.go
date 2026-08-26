@@ -1,0 +1,162 @@
+//go:build cgo
+
+package handler
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"unicode/utf8"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/gin-gonic/gin"
+)
+
+// setupCreateRouter wires only the CreateSummary route with the same auth/space
+// middleware stack used by the other handler tests.
+func setupCreateRouter(h *TaskHandler) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.AuthMiddleware(&mockTokenResolver{}), middleware.SpaceMiddleware())
+	r.POST("/api/v1/summaries", h.CreateSummary)
+	return r
+}
+
+// doCreateSummary issues a POST /api/v1/summaries with the given JSON body,
+// authenticated as userID.
+func doCreateSummary(r *gin.Engine, body map[string]interface{}, userID string) *httptest.ResponseRecorder {
+	raw, _ := json.Marshal(body)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/summaries", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	if userID != "" {
+		req.Header.Set("Token", userID)
+	}
+	req.Header.Set("X-Space-Id", "space1")
+	r.ServeHTTP(w, req)
+	return w
+}
+
+// makeSources builds n source entries matching the sourceReq shape
+// (source_type + source_id) the handler expects.
+func makeSources(n int) []map[string]interface{} {
+	sources := make([]map[string]interface{}, 0, n)
+	for i := 0; i < n; i++ {
+		sources = append(sources, map[string]interface{}{
+			"source_type": 1,
+			"source_id":   fmt.Sprintf("grp_%d", i),
+		})
+	}
+	return sources
+}
+
+// respCode extracts the business code from a JSON response body.
+func respCode(t *testing.T, w *httptest.ResponseRecorder) int {
+	t.Helper()
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v (body=%s)", err, w.Body.String())
+	}
+	c, ok := resp["code"].(float64)
+	if !ok {
+		t.Fatalf("response has no numeric code: %s", w.Body.String())
+	}
+	return int(c)
+}
+
+// TestCreateSummary_SourceCountAtLimit verifies that exactly maxSourceCount
+// sources are NOT rejected by the count-limit check (code 40003).
+func TestCreateSummary_SourceCountAtLimit(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupCreateRouter(h)
+
+	body := map[string]interface{}{
+		"title":   "limit-test",
+		"sources": makeSources(maxSourceCount),
+	}
+	w := doCreateSummary(r, body, "creator1")
+
+	if code := respCode(t, w); code == 40003 {
+		t.Errorf("expected %d sources to pass the count limit, but got count-limit rejection 40003 (http %d): %s",
+			maxSourceCount, w.Code, w.Body.String())
+	}
+}
+
+// TestCreateSummary_SourceCountExceedsLimit verifies that maxSourceCount+1
+// sources are rejected with HTTP 400 and code 40003.
+func TestCreateSummary_SourceCountExceedsLimit(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupCreateRouter(h)
+
+	body := map[string]interface{}{
+		"title":   "limit-test",
+		"sources": makeSources(maxSourceCount + 1),
+	}
+	w := doCreateSummary(r, body, "creator1")
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 for %d sources, got %d: %s", maxSourceCount+1, w.Code, w.Body.String())
+	}
+	if code := respCode(t, w); code != 40003 {
+		t.Errorf("expected code 40003 for exceeding source limit, got %d: %s", code, w.Body.String())
+	}
+}
+
+func TestCreateSummary_SourceCountExceedsLimitBeforeDedup(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupCreateRouter(h)
+
+	sources := makeSources(maxSourceCount)
+	sources = append(sources, sources[0])
+	w := doCreateSummary(r, map[string]interface{}{
+		"title":   "raw-limit-before-dedup",
+		"sources": sources,
+	}, "creator1")
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 for %d raw sources, got %d: %s", len(sources), w.Code, w.Body.String())
+	}
+	if code := respCode(t, w); code != 40003 {
+		t.Fatalf("expected code 40003 before dedup, got %d: %s", code, w.Body.String())
+	}
+}
+
+func TestCreateSummary_TopicLimit(t *testing.T) {
+	db, imDB := setupTestDBs(t)
+	h := NewTaskHandler(db, imDB, "")
+	r := setupCreateRouter(h)
+
+	fullTopic := strings.Repeat("总", maxSummaryTopicRunes)
+	w := doCreateSummary(r, map[string]interface{}{
+		"title":   "topic-limit-test",
+		"topic":   fullTopic,
+		"sources": makeSources(1),
+	}, "creator1")
+	if w.Code == http.StatusBadRequest && respCode(t, w) == 40001 {
+		t.Fatalf("expected %d-rune topic to pass validation: %s", maxSummaryTopicRunes, w.Body.String())
+	}
+	var task model.SummaryTask
+	if err := db.Order("id DESC").First(&task).Error; err != nil {
+		t.Fatalf("load created task: %v", err)
+	}
+	if task.Title != "topic-limit-test" || task.Topic != fullTopic {
+		t.Fatalf("title/topic persistence mismatch: title=%q topicRunes=%d", task.Title, utf8.RuneCountInString(task.Topic))
+	}
+
+	w = doCreateSummary(r, map[string]interface{}{
+		"title":   "topic-limit-test",
+		"topic":   strings.Repeat("总", maxSummaryTopicRunes+1),
+		"sources": makeSources(1),
+	}, "creator1")
+	if w.Code != http.StatusBadRequest || respCode(t, w) != 40001 || !strings.Contains(w.Body.String(), "topic 不能超过 2300 字符") {
+		t.Fatalf("expected %d-rune topic to be rejected: status=%d body=%s", maxSummaryTopicRunes+1, w.Code, w.Body.String())
+	}
+}

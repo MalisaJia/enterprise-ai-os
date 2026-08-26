@@ -1,0 +1,141 @@
+//
+//  WKMergeForwardDetailCell.h
+//  WuKongBase
+//
+//  Created by tt on 2020/10/12.
+//
+
+#import "WKFormItemCell.h"
+#import <WuKongIMSDK/WuKongIMSDK.h>
+NS_ASSUME_NONNULL_BEGIN
+
+@interface WKMergeForwardDetailHeaderView : UIView
+
+- (instancetype)initWithFrame:(CGRect)frame title:(NSString*)title;
+
+@end
+
+//---------- 基础框架cell ----------
+@interface WKMergeForwardDetailModel : WKFormItemModel
+
+@property(nonatomic,strong) WKMessage *message;
+
+@property(nonatomic,assign) BOOL hideAvatar; // 隐藏头像
+
+// / Web PR#981-982 / Android ChatMultiForwardDetailAdapter 对齐：
+// 合并转发详情里每条消息作者的外部群字段（来自父 WKMergeForwardContent.users
+// 中匹配 message.fromUid 的条目），用于 viewer-relative 渲染「 @SpaceName」后缀。
+// 可读键：is_external / source_space_name / home_space_id / home_space_name。
+@property(nonatomic,strong,nullable) NSDictionary *userExtras;
+
+
+@end
+
+@interface WKMergeForwardDetailCell : WKFormItemCell
+
++(CGFloat) contentHeightForModel:(WKFormItemModel*)model maxWidth:(CGFloat)maxWidth;
+
+@property(nonatomic,strong) WKMergeForwardDetailModel *model;
+
+@property(nonatomic,strong) UIView *messageContentView;
+
+@end
+
+//---------- 文本cell ----------
+
+@interface WKMergeForwardDetailTextModel : WKMergeForwardDetailModel
+
+@end
+
+@interface WKMergeForwardDetailTextCell : WKMergeForwardDetailCell
+
+@end
+
+//----------图片cell ----------
+
+@interface WKMergeForwardDetailImageModel : WKMergeForwardDetailModel
+
+@end
+
+@interface WKMergeForwardDetailImageCell : WKMergeForwardDetailCell
+
+@end
+
+//---------- 图文混排 cell（RichText=14，WKRichTextContent）----------
+// 复用 WKRichTextCell 的图文 attributed 构建逻辑，按 block 顺序内联渲染文字 + 图片，
+// 与聊天页一致。之前 RichText 落到 Other cell 只显示 conversationDigest（图片→[图片] 文本），
+// 图片丢失。
+
+@interface WKMergeForwardDetailRichTextModel : WKMergeForwardDetailModel
+
+@end
+
+@interface WKMergeForwardDetailRichTextCell : WKMergeForwardDetailCell
+
+@end
+
+
+
+//---------- 文件cell ----------
+
+@interface WKMergeForwardDetailFileModel : WKMergeForwardDetailModel
+
+@end
+
+@interface WKMergeForwardDetailFileCell : WKMergeForwardDetailCell
+
+@end
+
+//---------- 语音cell ----------
+
+@interface WKMergeForwardDetailVoiceModel : WKMergeForwardDetailModel
+
+@end
+
+@interface WKMergeForwardDetailVoiceCell : WKMergeForwardDetailCell
+
+@end
+
+//---------- 视频cell ----------
+
+@interface WKMergeForwardDetailVideoModel : WKMergeForwardDetailModel
+
+@end
+
+@interface WKMergeForwardDetailVideoCell : WKMergeForwardDetailCell
+
+@end
+
+//---------- 嵌套合并转发cell ----------
+
+@interface WKMergeForwardDetailNestedModel : WKMergeForwardDetailModel
+
+@end
+
+@interface WKMergeForwardDetailNestedCell : WKMergeForwardDetailCell
+
+@end
+
+//---------- 表情/贴图 cell（WK_LOTTIE_STICKER=12 / WK_EMOJI_STICKER=13 / WK_GIF=3）----------
+// 与聊天页 WKLottieStickerCell 一致：160×160 固定尺寸 + WKStickerImageView
+// (支持 gif/webp/png/jpg/lottie)。合并转发详情里以缩略呈现，跟聊天里同款视觉。
+
+@interface WKMergeForwardDetailStickerModel : WKMergeForwardDetailModel
+
+@end
+
+@interface WKMergeForwardDetailStickerCell : WKMergeForwardDetailCell
+
+@end
+
+//----------其他cell ----------
+
+@interface WKMergeForwardDetailOtherModel : WKMergeForwardDetailModel
+
+@end
+
+@interface WKMergeForwardDetailOtherCell : WKMergeForwardDetailCell
+
+@end
+
+NS_ASSUME_NONNULL_END

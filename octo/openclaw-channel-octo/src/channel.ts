@@ -1,0 +1,1866 @@
+import type {
+  ChannelPlugin,
+  OpenClawConfig,
+  ChannelMessageActionAdapter,
+} from "openclaw/plugin-sdk";
+import type { ChannelOutboundContext } from "openclaw/plugin-sdk/channel-contract";
+import { DEFAULT_ACCOUNT_ID } from "./sdk-compat.js";
+import { createHeartbeatLoop } from "./heartbeat.js";
+import { createConnectionWatchdog } from "./connection-watchdog.js";
+import {
+  buildWatchdogPredicate,
+  createDeferredReconnect,
+  createReconnectSequencer,
+  createSingleFlightFlag,
+} from "./reconnect-coordination.js";
+import { OctoConfigJsonSchema, type OctoConfig } from "./config-schema.js";
+import { CHANNEL_ID, MAX_UPLOAD_SIZE, stripAllChannelPrefixes, getChannelConfig } from "./constants.js";
+import { streamToFileWithCap } from "./stream-helpers.js";
+import {
+  listOctoAccountIds,
+  resolveDefaultOctoAccountId,
+  resolveOctoAccount,
+  type ResolvedOctoAccount,
+} from "./accounts.js";
+import { registerBot, sendMessage, sendHeartbeat, postDocComment, postHtmlDocReply, sendMediaMessage, inferContentType, ensureTextCharset, fetchBotGroups, getGroupMd, parseImageDimensions, parseImageDimensionsFromFile, getUploadPresign, uploadFileToPresignedUrl } from "./api-fetch.js";
+import type { GroupMember } from "./api-fetch.js";
+import { PLUGIN_VERSION } from "./version.js";
+import { getOctoRuntime } from "./runtime.js";
+import { forkScopeStartupWarning } from "./commands/fork.js";
+
+/** Get OpenClaw host version from PluginRuntime.version (provided by SDK). */
+function getAgentVersion(): string {
+  try {
+    return getOctoRuntime().version ?? "";
+  } catch {
+    return "";
+  }
+}
+import { WKSocket } from "./socket.js";
+import { handleInboundMessage, type OctoStatusSink, sanitizeFilename } from "./inbound.js";
+import { runWithSessionInitRetry, isSessionInitConflict } from "./session-retry.js";
+import { notifyInboundConflictDropped } from "./inbound-conflict-notice.js";
+import { enqueueInbound, getInboundQueueKey } from "./inbound-queue.js";
+import {
+  createFileEventCursorStore,
+  setCardEventPollStarter,
+  startEventPoller,
+  type EventPoller,
+} from "./events-poll.js";
+import { synthesizeCardActionMessage } from "./card-action.js";
+import {
+  docCommentParentId,
+  type DocCommentMention,
+} from "./doc-mention.js";
+import { createFileDocMentionDedupeStore } from "./doc-mention-dedupe.js";
+import { createFileDocTaskDeadLetterStore } from "./doc-task-deadletter.js";
+import { createDocMentionHandler, DOC_TASK_NOTICE_TIMEOUT_MS } from "./doc-mention-handler.js";
+import { handleCardAction } from "./card-action-handler.js";
+
+/**
+ * 会话初始化冲突(core CAS)兜底重试参数。同群紧挨两条消息时,turn N 的 session 收尾写
+ * 与 turn N+1 init 竞态。
+ *
+ * `retries=4, backoffMs=1500` 线性退避,累计等待 1.5+3+4.5+6 = **15 秒**。选这个上限是因为
+ * 真实场景观察到:进度卡 + 复杂 turn(10+ steps / 25s+)让 core 侧收尾写显著变长,原来的
+ * 2.4s 窗口不够覆盖(联调实测 3 次 attempt 全撞、消息被丢)。
+ *
+ * 若 15s 内仍不停撞车(每次 init 读到的 revision 都不同),那大概率不是瞬态冲突,而是 core
+ * 已知的 skillsSnapshot 翻转持久性 bug —— 加多少重试都救不了,需上游 core 修。此时最终抛错
+ * 让 dispatch 走既有失败路径。
+ */
+const SESSION_INIT_RETRY = { retries: 4, backoffMs: 1500 } as const;
+import { ChannelType, MessageType, type BotMessage, type MessagePayload, type SendMessageResult } from "./types.js";
+import { buildEntitiesFromFallback, parseStructuredMentions, convertStructuredMentions, sanitizeOutboundMentions, MENTION_FORMAT_HINT } from "./mention-utils.js";
+import type { MentionEntity } from "./types.js";
+import { handleOctoMessageAction, parseTarget, resolveOutboundOctoTarget, normalizeOutboundChannelPrefix, extractInlineMentionUids, type MessageActionResult } from "./actions.js";
+import { getOrCreateGroupMdCache, registerBotGroupIds, getKnownGroupIds, writeGroupMdToDisk, extractParentGroupNo } from "./group-md.js";
+import { registerOwnerUid } from "./owner-registry.js";
+import { registerKnownBot, isKnownBot } from "./bot-registry.js";
+import { preloadGroupMemberCache, getGroupMembersFromCache } from "./member-cache.js";
+import { preloadMentionPrefs } from "./mention-prefs.js";
+import { initPersonaPromptCache, stopPersonaPromptCache } from "./persona-prompt.js";
+import { registerOctoThreadBindingAdapter } from "./thread-binding-adapter.js";
+import { normalizeAccountId } from "./account-id.js";
+import path from "node:path";
+import os from "node:os";
+import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
+import { createReadStream, createWriteStream, statSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+// HistoryEntry type - compatible with any version
+type HistoryEntry = { sender: string; body: string; timestamp: number };
+const DEFAULT_GROUP_HISTORY_LIMIT = 20;
+
+const UPLOAD_TEMP_DIR = path.join("/tmp", "octo-upload");
+
+/**
+ * Build OutboundDeliveryResult from Octo's SendMessageResult.
+ *
+ * Fail-fast on missing/empty message_id: when the Octo API returned 2xx but
+ * the body is missing `message_id`, that is an API anomaly — surfacing it as
+ * an error is better than silently returning `messageId: ""`, which OpenClaw
+ * 2026.5.7+ treats as `deliverySucceeded=false` and quietly drops downstream
+ * (see issue #51).
+ *
+ * For early-return noop paths (empty content, no actual API call), do NOT
+ * use this helper — return `{ channel, to, messageId: "" }` directly with an
+ * inline comment.
+ */
+function toDeliveryResult(to: string, result: SendMessageResult | undefined) {
+  const messageId = result?.message_id ? String(result.message_id).trim() : "";
+  if (!messageId) {
+    throw new Error("Octo send API returned no message_id");
+  }
+  return { channel: CHANNEL_ID, to, messageId };
+}
+
+/** Download a URL to a temp file with backpressure, return the temp path. */
+async function downloadToTempFile(url: string, filename: string, signal?: AbortSignal): Promise<{ tempPath: string; contentType: string | undefined }> {
+  await mkdir(UPLOAD_TEMP_DIR, { recursive: true });
+  // sanitizeFilename: defense in depth — strips path separators / rejects
+  // traversal segments. Shared with inbound.ts (single source of truth).
+  const safeName = sanitizeFilename(filename);
+  const tempPath = path.join(UPLOAD_TEMP_DIR, `${randomUUID()}-${safeName}`);
+
+  // Do NOT trust a HEAD Content-Length for the size check: a remote server may
+  // omit or lie about it, and the presigned PUT signs the exact byte count the
+  // caller derives from statSync() (SigV4 403 on any mismatch). Enforce the cap
+  // while streaming the body — see streamToFileWithCap for the read loop /
+  // backpressure / error / cancel logic.
+  const resp = await fetch(url, { signal: signal ?? AbortSignal.timeout(300_000) });
+  if (!resp.ok) throw new Error(`Failed to download media from ${url}: ${resp.status}`);
+  const contentType = resp.headers.get("content-type") ?? undefined;
+  if (!resp.body) throw new Error(`No response body from ${url}`);
+
+  await streamToFileWithCap({
+    body: resp.body as ReadableStream<Uint8Array>,
+    destPath: tempPath,
+    maxBytes: MAX_UPLOAD_SIZE,
+  });
+  return { tempPath, contentType };
+}
+
+/** Cleanup old temp upload files (>1h). Called opportunistically. */
+async function cleanupOldUploadTempFiles(): Promise<void> {
+  try {
+    const { readdir, stat, unlink: rm } = await import("node:fs/promises");
+    const files = await readdir(UPLOAD_TEMP_DIR);
+    const now = Date.now();
+    for (const f of files) {
+      const fp = path.join(UPLOAD_TEMP_DIR, f);
+      const st = await stat(fp).catch(() => null);
+      if (st && now - st.mtimeMs > 3600_000) await rm(fp).catch(() => {});
+    }
+  } catch { /* dir may not exist */ }
+}
+
+// Module-level history storage — survives auto-restarts.
+// All accountId-keyed in-memory state below normalizes accountId at the
+// helper boundary (see ./account-id.ts), so mixed-case BotFather IDs
+// (issue #33) cannot split a single bot's cache across two map slots.
+const _historyMaps = new Map<string, Map<string, any[]>>();
+function getOrCreateHistoryMap(accountId: string): Map<string, any[]> {
+  const id = normalizeAccountId(accountId);
+  let m = _historyMaps.get(id);
+  if (!m) {
+    m = new Map<string, any[]>();
+    _historyMaps.set(id, m);
+  }
+  return m;
+}
+
+// Track last answered inbound message_seq per session for history segmentation.
+// Stores the message_seq of the @mention message that triggered the bot's last reply,
+// NOT the bot's own reply message_seq (sendMessage API returns 0 for that).
+const _lastBotReplySeq = new Map<string, Map<string, number>>();
+function getOrCreateLastBotReplySeqMap(accountId: string): Map<string, number> {
+  const id = normalizeAccountId(accountId);
+  let m = _lastBotReplySeq.get(id);
+  if (!m) {
+    m = new Map<string, number>();
+    _lastBotReplySeq.set(id, m);
+  }
+  return m;
+}
+
+// Module-level member mapping: displayName -> uid
+// Used to resolve @mentions in AI replies
+const _memberMaps = new Map<string, Map<string, string>>();
+export function getOrCreateMemberMap(accountId: string): Map<string, string> {
+  const id = normalizeAccountId(accountId);
+  let m = _memberMaps.get(id);
+  if (!m) {
+    m = new Map<string, string>();
+    _memberMaps.set(id, m);
+  }
+  return m;
+}
+
+// Module-level reverse mapping: uid -> displayName
+// Used to show display names instead of uids in replies
+const _uidToNameMaps = new Map<string, Map<string, string>>();
+export function getOrCreateUidToNameMap(accountId: string): Map<string, string> {
+  const id = normalizeAccountId(accountId);
+  let m = _uidToNameMaps.get(id);
+  if (!m) {
+    m = new Map<string, string>();
+    _uidToNameMaps.set(id, m);
+  }
+  return m;
+}
+
+// Group member cache timestamps: groupId -> lastFetchedAt (ms)
+const _groupCacheTimestamps = new Map<string, Map<string, number>>();
+function getOrCreateGroupCacheTimestamps(accountId: string): Map<string, number> {
+  const id = normalizeAccountId(accountId);
+  let m = _groupCacheTimestamps.get(id);
+  if (!m) {
+    m = new Map<string, number>();
+    _groupCacheTimestamps.set(id, m);
+  }
+  return m;
+}
+
+/**
+ * Outbound @mention prefetch.
+ *
+ * Proactive sends (cron, new sub-topic, agent-initiated @) never go through the
+ * inbound member-cache refresh, so the per-account memberMap/uidToNameMap can be
+ * empty or stale at send time. Before converting, if the text contains an `@`,
+ * pull the target group's members from the shared 5-min-TTL cache and fill both
+ * maps. Cache hit = zero cost; on a cold start (cache miss) this performs one
+ * synchronous member-list API round-trip on the send path. Threads only know the
+ * parent group_no for the member API, so strip the `____` sub-topic suffix.
+ * Best-effort: any failure degrades silently (the outbound sanitizer is the real
+ * safety net).
+ */
+async function prefetchOutboundMembers(opts: {
+  content: string;
+  channelId: string;
+  apiUrl: string;
+  botToken: string;
+  memberMap: Map<string, string>;
+  uidToNameMap: Map<string, string>;
+  log?: { info?: (msg: string) => void; error?: (msg: string) => void };
+}): Promise<void> {
+  if (!opts.content.includes("@")) return;
+  try {
+    const groupNo = extractParentGroupNo(opts.channelId);
+    if (!groupNo) return;
+    const members = await getGroupMembersFromCache({
+      apiUrl: opts.apiUrl,
+      botToken: opts.botToken,
+      groupNo,
+      log: opts.log,
+    });
+    for (const m of members) {
+      if (m.name && m.uid) {
+        opts.memberMap.set(m.name, m.uid);
+        opts.uidToNameMap.set(m.uid, m.name);
+      }
+    }
+  } catch (err) {
+    opts.log?.error?.(`octo: prefetchOutboundMembers failed: ${err}`);
+  }
+}
+
+// Module-level robot flags: uid -> robot (server-authoritative GroupMember.robot)
+// Consulted by the 免@ mention gate to keep requireMention for ANY bot sender,
+// including cross-process / external bots not registered via registerKnownBot().
+// Flat uid→robot map (not keyed by groupId), like uidToNameMap.
+const _memberRobotMaps = new Map<string, Map<string, boolean>>();
+function getOrCreateMemberRobotMap(accountId: string): Map<string, boolean> {
+  const id = normalizeAccountId(accountId);
+  let m = _memberRobotMaps.get(id);
+  if (!m) {
+    m = new Map<string, boolean>();
+    _memberRobotMaps.set(id, m);
+  }
+  return m;
+}
+
+// Current-group member roster: parent groupNo -> this group's GroupMember[].
+// Per-account (keyed by accountId), per-group inside. UNLIKE the flat
+// uidToNameMap (which accumulates names across every group for mention/sender
+// resolution and must NOT be cleared), this holds ONLY the current group's
+// roster so the [Group Members] / member-count prompt context reflects one
+// group, not the cross-group union (#125). Populated by refreshGroupMemberCache
+// on each inbound message; negative-cached (entry deleted) on fetch failure so
+// a stale roster is never re-injected.
+const _currentGroupMembersMaps = new Map<string, Map<string, GroupMember[]>>();
+function getOrCreateCurrentGroupMembersMap(accountId: string): Map<string, GroupMember[]> {
+  const id = normalizeAccountId(accountId);
+  let m = _currentGroupMembersMaps.get(id);
+  if (!m) {
+    m = new Map<string, GroupMember[]>();
+    _currentGroupMembersMaps.set(id, m);
+  }
+  return m;
+}
+
+
+// --- Group → Account mapping: tracks which accounts are active in each group ---
+// Used by handleAction to resolve the correct account when framework passes wrong accountId
+// A group may have multiple bots (1:N), so we store a Set of accountIds per group.
+//
+// Both the registration side AND the query side normalize accountId — Set
+// membership checks are case-sensitive, so storing the raw mixed-case form
+// would make later lowercase queries miss (and vice versa). See issue #33.
+const _groupToAccounts = new Map<string, Set<string>>(); // groupNo → Set of <normalized accountIds>
+
+export function registerGroupToAccount(groupNo: string, accountId: string): void {
+  const id = normalizeAccountId(accountId);
+  let s = _groupToAccounts.get(groupNo);
+  if (!s) { s = new Set(); _groupToAccounts.set(groupNo, s); }
+  s.add(id);
+}
+
+/**
+ * Resolve the correct accountId for a group.
+ * - If the group has exactly one registered account → return it (safe to correct).
+ * - If the group has multiple accounts (shared group) → return undefined (don't override).
+ * - If the group is unknown → return undefined.
+ *
+ * Returned id is always normalized (registration side normalizes).
+ */
+export function resolveAccountForGroup(groupNo: string): string | undefined {
+  const s = _groupToAccounts.get(groupNo);
+  if (!s || s.size !== 1) return undefined;
+  return s.values().next().value;
+}
+
+/** Check if a specific accountId is registered for a group. */
+export function isAccountRegisteredForGroup(groupNo: string, accountId: string): boolean {
+  return _groupToAccounts.get(groupNo)?.has(normalizeAccountId(accountId)) ?? false;
+}
+
+// --- Cache cleanup: evict groups inactive for >4 hours ---
+const CACHE_MAX_AGE_MS = 4 * 60 * 60 * 1000;
+const CACHE_CLEANUP_INTERVAL_MS = 30 * 60 * 1000;
+export const _test_CACHE_MAX_AGE_MS = CACHE_MAX_AGE_MS;
+const _cacheActivity = new Map<string, Map<string, number>>();
+
+export function touchCache(accountId: string, groupId: string): void {
+  const id = normalizeAccountId(accountId);
+  let m = _cacheActivity.get(id);
+  if (!m) { m = new Map(); _cacheActivity.set(id, m); }
+  m.set(groupId, Date.now());
+}
+
+export function cleanupStaleCaches(): void {
+  const cutoff = Date.now() - CACHE_MAX_AGE_MS;
+
+  // First pass: clean stale raw-key activity entries and their raw-keyed maps.
+  // Parent-keyed maps (_groupCacheTimestamps, _currentGroupMembersMaps) are
+  // handled in the second pass to avoid deleting entries that a sibling
+  // thread still needs (#128).
+  for (const [accountId, activityMap] of _cacheActivity) {
+    for (const [groupId, lastAccess] of activityMap) {
+      if (lastAccess < cutoff) {
+        _historyMaps.get(accountId)?.delete(groupId);
+        _lastBotReplySeq.get(accountId)?.delete(groupId);
+        _memberMaps.get(accountId)?.delete(groupId);
+        // Note: uidToNameMap is a flat uid→name map (not keyed by groupId),
+        // so we don't delete from it here — names remain valid across groups.
+        activityMap.delete(groupId);
+      }
+    }
+    if (activityMap.size === 0) _cacheActivity.delete(accountId);
+  }
+
+  // Second pass: clean parent-keyed maps (_groupCacheTimestamps,
+  // _currentGroupMembersMaps). These are keyed by parent groupNo (via
+  // extractParentGroupNo), not raw channel_id. Delete only when:
+  // 1. The timestamp is stale, AND
+  // 2. No live (non-stale) raw-key activity maps to this parent groupNo.
+  // This correctly handles: thread channels sharing a parent (sibling kept
+  // alive), orphaned parent entries (all threads gone), and plain groups
+  // (extractParentGroupNo returns the group as-is).
+  for (const [accountId, tsMap] of _groupCacheTimestamps) {
+    const activityMap = _cacheActivity.get(accountId);
+    for (const [groupNo, ts] of tsMap) {
+      if (ts >= cutoff) continue; // fresh — skip
+      // Check if any live raw-key activity maps to this parent groupNo
+      let hasLiveThread = false;
+      if (activityMap) {
+        for (const [rawKey, rawTs] of activityMap) {
+          if (rawTs >= cutoff && extractParentGroupNo(rawKey) === groupNo) {
+            hasLiveThread = true;
+            break;
+          }
+        }
+      }
+      if (!hasLiveThread) {
+        tsMap.delete(groupNo);
+        _currentGroupMembersMaps.get(accountId)?.delete(groupNo);
+      }
+    }
+    if (tsMap.size === 0) _groupCacheTimestamps.delete(accountId);
+  }
+}
+
+// --- Test-only exports for cache cleanup verification (issue #128) ---
+/** @internal — for testing only */
+export const _test_caches = {
+  get cacheActivity() { return _cacheActivity; },
+  get groupCacheTimestamps() { return _groupCacheTimestamps; },
+  get currentGroupMembersMaps() { return _currentGroupMembersMaps; },
+  clear() {
+    _cacheActivity.clear();
+    _groupCacheTimestamps.clear();
+    _currentGroupMembersMaps.clear();
+  },
+  /** Directly set a _cacheActivity entry (bypasses touchCache's Date.now()) */
+  setActivity(accountId: string, groupId: string, ts: number) {
+    const id = normalizeAccountId(accountId);
+    let m = _cacheActivity.get(id);
+    if (!m) { m = new Map(); _cacheActivity.set(id, m); }
+    m.set(groupId, ts);
+  },
+  /** Directly set a _groupCacheTimestamps entry */
+  setGroupCacheTimestamp(accountId: string, groupNo: string, ts: number) {
+    const id = normalizeAccountId(accountId);
+    const m = getOrCreateGroupCacheTimestamps(id);
+    m.set(groupNo, ts);
+  },
+  /** Directly set a _currentGroupMembersMaps entry */
+  setCurrentGroupMembers(accountId: string, groupNo: string, members: GroupMember[]) {
+    const id = normalizeAccountId(accountId);
+    const m = getOrCreateCurrentGroupMembersMap(id);
+    m.set(groupNo, members);
+  },
+};
+
+// Known bot robot_ids across all accounts — for bot-to-bot loop prevention.
+// Backed by the shared bot-registry so inbound.ts can consult the same set
+// without importing channel.ts (channel.ts → inbound.ts is one-way; importing
+// back would create a cycle). The thin wrapper keeps existing call sites
+// (_knownBotUids.add / .has) unchanged.
+const _knownBotUids = {
+  add: (uid: string) => registerKnownBot(uid),
+  has: (uid: string) => isKnownBot(uid),
+};
+
+// Singleton timer to prevent accumulation during hot reload (#54)
+let _cleanupTimer: NodeJS.Timeout | null = null;
+
+function ensureCleanupTimer(): void {
+  if (_cleanupTimer) return; // Already running
+  _cleanupTimer = setInterval(cleanupStaleCaches, CACHE_CLEANUP_INTERVAL_MS);
+  if (typeof _cleanupTimer === "object" && _cleanupTimer && "unref" in _cleanupTimer) {
+    _cleanupTimer.unref();
+  }
+}
+
+/** Resolve correct accountId for outbound context using group→account mapping */
+export function resolveOutboundAccountId(ctxTo: string, fallbackAccountId: string): string {
+  // Same prefix / inline-mention-UID normalisation as the outbound send path —
+  // otherwise `channel:<id>` never makes it past parseTarget (which doesn't
+  // recognise that prefix) and the group→account lookup silently falls back,
+  // routing the turn through the wrong bot's token.
+  let targetForParse = normalizeOutboundChannelPrefix(ctxTo);
+  if (targetForParse.startsWith("group:")) {
+    const groupPart = targetForParse.slice(6);
+    const atIdx = groupPart.indexOf("@");
+    if (atIdx >= 0) targetForParse = "group:" + groupPart.slice(0, atIdx);
+  }
+  const { channelId, channelType } = parseTarget(targetForParse, undefined, getKnownGroupIds());
+  if (channelType === ChannelType.Group || channelType === ChannelType.CommunityTopic) {
+    const groupId = channelType === ChannelType.CommunityTopic ? channelId.split("____")[0] : channelId;
+    const correctAccountId = resolveAccountForGroup(groupId);
+    if (correctAccountId) return correctAccountId;
+  }
+  return fallbackAccountId;
+}
+
+/** Shared check: return available actions if at least one account is configured, else empty. */
+function getAvailableActions(cfg: any): string[] {
+  try {
+    const ids = listOctoAccountIds(cfg);
+    const hasConfigured = ids.some((id) => {
+      const acct = resolveOctoAccount({ cfg, accountId: id });
+      return acct.enabled && acct.configured && !!acct.config.botToken;
+    });
+    if (!hasConfigured) return [];
+  } catch {
+    return [];
+  }
+  return ["send", "read", "search"];
+}
+
+const meta = {
+  id: "octo",
+  label: "Octo",
+  selectionLabel: "Octo",
+  detailLabel: "Octo Bot",
+  docsPath: "/channels/octo",
+  docsLabel: "octo",
+  blurb: "Connect OpenClaw to Octo",
+  markdownCapable: false,
+  order: 90,
+};
+
+// ---------------------------------------------------------------------------
+// setupWizard + setup adapter — power `openclaw channels add --channel octo`.
+//
+// Without these, OpenClaw reports "octo does not have an interactive setup
+// screen yet" for the wizard path, and "Channel does not support
+// non-interactive add" for the --bot-token/--http-url CLI flag path.
+//
+// We follow feishu's "credentials: [] + collect everything in finalize"
+// pattern — simpler than writing per-credential descriptors with inspect/
+// applySet hooks, and lets us match the OpenClaw `channels add --channel octo` UX.
+// ---------------------------------------------------------------------------
+
+const ACCOUNT_ID_RE = /^[A-Za-z0-9_]+$/;
+
+// Two token prefixes bind through this channel:
+//   bf_*  — User Bot (BotFather /newbot): full group + thread + OBO access.
+//   app_* — App Bot (Admin 后台「应用 Bot」): DM-only, server-enforced.
+// The CLI's job is to let either bind; the capability boundary is enforced
+// server-side (octo-server bot_api rejects App Bot group/thread/OBO calls),
+// so we must not reject app_ here just because it can't do everything bf_ can.
+const BOT_TOKEN_PREFIXES = ["bf_", "app_"] as const;
+const BOT_TOKEN_ERROR =
+  "Bot token must start with 'bf_' (BotFather /newbot) or 'app_' (Admin App Bot) and be longer than 13 chars.";
+
+function isValidBotToken(v: unknown): v is string {
+  return (
+    typeof v === "string" &&
+    !!v.trim() &&
+    BOT_TOKEN_PREFIXES.some((p) => v.startsWith(p)) &&
+    v.length > 13
+  );
+}
+
+
+function setOctoAccountConfig(
+  cfg: OpenClawConfig,
+  accountId: string,
+  botToken: string,
+  apiUrl: string,
+): OpenClawConfig {
+  const channels = ((cfg as any).channels ?? {}) as Record<string, any>;
+  const channel = (channels[CHANNEL_ID] ?? {}) as Record<string, any>;
+  const accounts = (channel.accounts ?? {}) as Record<string, any>;
+  return {
+    ...cfg,
+    channels: {
+      ...channels,
+      [CHANNEL_ID]: {
+        ...channel,
+        enabled: true,
+        accounts: {
+          ...accounts,
+          [accountId]: {
+            ...(accounts[accountId] ?? {}),
+            enabled: true,
+            botToken,
+            apiUrl,
+          },
+        },
+      },
+    },
+  } as OpenClawConfig;
+}
+
+const octoSetupWizard = {
+  channel: CHANNEL_ID,
+  status: {
+    configuredLabel: "configured",
+    unconfiguredLabel: "needs bot token",
+    configuredHint: "configured",
+    unconfiguredHint: "needs bot token",
+    configuredScore: 2,
+    unconfiguredScore: 0,
+    resolveConfigured: ({ cfg, accountId }: { cfg: OpenClawConfig; accountId?: string }) => {
+      const account = resolveOctoAccount({ cfg, accountId: accountId ?? DEFAULT_ACCOUNT_ID });
+      return account.configured;
+    },
+    resolveStatusLines: async ({ cfg, accountId, configured }: { cfg: OpenClawConfig; accountId?: string; configured: boolean }) => {
+      if (!configured) return ["Octo: needs bot token (bf_* or app_*)"];
+      const account = resolveOctoAccount({ cfg, accountId: accountId ?? DEFAULT_ACCOUNT_ID });
+      return [`Octo: configured (api: ${account.config.apiUrl})`];
+    },
+  },
+  resolveAccountIdForConfigure: ({ accountOverride, defaultAccountId, cfg }: any) => {
+    const resolved = (typeof accountOverride === "string" && accountOverride.trim() ? accountOverride.trim() : undefined)
+      ?? resolveDefaultOctoAccountId(cfg)
+      ?? defaultAccountId
+      ?? DEFAULT_ACCOUNT_ID;
+    // Same validation as the non-interactive setupAdapter: bail before
+    // finalize writes an unreachable cfg.channels.octo.accounts[<bad-id>]
+    // key that `openclaw channels remove` cannot later target.
+    if (!ACCOUNT_ID_RE.test(resolved)) {
+      throw new Error(`Invalid account ID "${resolved}". Only letters, digits, and underscores allowed.`);
+    }
+    return resolved;
+  },
+  resolveShouldPromptAccountIds: () => false,
+  credentials: [] as any[],
+  finalize: async ({ cfg, accountId, prompter }: any) => {
+    const existing = resolveOctoAccount({ cfg, accountId });
+
+    const botToken = await prompter.text({
+      message: "Bot token (bf_* or app_*)",
+      placeholder: "bf_... or app_...",
+      initialValue: existing.config.botToken ?? "",
+      sensitive: true,
+      validate: (v: string) => {
+        if (!v || !v.trim()) return "Bot token is required.";
+        if (!isValidBotToken(v)) return BOT_TOKEN_ERROR;
+        return undefined;
+      },
+    });
+
+    const apiUrl = await prompter.text({
+      message: "API URL",
+      placeholder: "http://localhost:8090/api",
+      initialValue: existing.config.apiUrl,
+      validate: (v: string) => {
+        if (!v || !v.trim()) return "API URL is required.";
+        try { new URL(v); } catch { return "Must be a valid URL (e.g. https://your-server/api)."; }
+        return undefined;
+      },
+    });
+
+    return { cfg: setOctoAccountConfig(cfg, accountId, botToken.trim(), apiUrl.trim()) };
+  },
+};
+
+const octoSetupAdapter = {
+  resolveAccountId: ({ cfg, accountId }: { cfg: OpenClawConfig; accountId?: string }) =>
+    (accountId && accountId.trim()) || resolveDefaultOctoAccountId(cfg) || DEFAULT_ACCOUNT_ID,
+  validateInput: ({ accountId, input }: { accountId: string; input: any }) => {
+    if (!ACCOUNT_ID_RE.test(accountId)) {
+      return `Invalid account ID "${accountId}". Only letters, digits, and underscores allowed.`;
+    }
+    const botToken = input.botToken ?? input.token;
+    if (botToken !== undefined) {
+      if (!isValidBotToken(botToken)) {
+        return BOT_TOKEN_ERROR;
+      }
+    }
+    const apiUrl = input.baseUrl ?? input.url ?? input.httpUrl;
+    if (apiUrl !== undefined) {
+      if (typeof apiUrl !== "string" || !apiUrl.trim()) {
+        return "API URL must be a non-empty string.";
+      }
+      try { new URL(apiUrl); } catch { return "API URL must be a valid URL."; }
+    }
+    return undefined;
+  },
+  applyAccountConfig: ({ cfg, accountId, input }: { cfg: OpenClawConfig; accountId: string; input: any }) => {
+    const existing = resolveOctoAccount({ cfg, accountId });
+    const botToken = (input.botToken ?? input.token ?? existing.config.botToken ?? "").trim();
+    // existing.config.apiUrl always populated by resolveOctoAccount (falls back
+    // to DEFAULT_API_URL = "http://localhost:8090/api"), so the trailing ??
+    // never fires in practice but is kept as a belt-and-suspenders default.
+    const apiUrl = (input.baseUrl ?? input.url ?? input.httpUrl ?? existing.config.apiUrl).trim();
+    if (!botToken) throw new Error("Bot token is required. Pass --bot-token bf_xxx (or app_xxx) — also accepted via --token.");
+    return setOctoAccountConfig(cfg, accountId, botToken, apiUrl);
+  },
+};
+
+/**
+ * Wrap a plugin action payload as an OpenClaw AgentToolResult.
+ *
+ * The host feeds `result.content` straight into its Codex dynamic tool-result
+ * conversion (`convertToolContents` → `content.reduce`) with no Array.isArray
+ * guard, so a bare `{ ok, data }` return (content === undefined) throws
+ * "Cannot read properties of undefined (reading 'reduce')" *after* the send
+ * already succeeded. Returning a `content[]` satisfies that contract.
+ *
+ * The raw payload is kept in `details`: the host reads `details.ok` /
+ * `details.error` to classify success vs failure, and `extractToolPayload`
+ * reads `details` for delivery evidence — so success/error semantics and
+ * downstream inspection are preserved unchanged.
+ *
+ * Compact (non-pretty) JSON on purpose: read/search/group-md payloads can carry
+ * large histories, member rosters or full GROUP.md; pretty-printing inflates
+ * them ~30% and trips the host's dynamic tool-result char cap sooner.
+ */
+export function toActionToolResult(payload: MessageActionResult): {
+  content: { type: "text"; text: string }[];
+  details: MessageActionResult;
+} {
+  let text: string;
+  try {
+    const serialized = JSON.stringify(payload);
+    // JSON.stringify can return undefined WITHOUT throwing (e.g. a root-level
+    // toJSON() returning undefined). Coerce to a fixed string so content.text
+    // is always a valid string and the host's content.reduce never breaks.
+    text = typeof serialized === "string" ? serialized : "[unserializable payload]";
+  } catch {
+    // Last-resort net: a throwing JSON.stringify (circular ref / BigInt). Use a
+    // fixed string and do NOT read back the payload here — this branch exists
+    // precisely so the helper never throws, so it must not re-invoke any
+    // payload getter/toString that could itself throw. The raw payload is still
+    // available in `details` for the host's error classification.
+    text = "[unserializable payload]";
+  }
+  return {
+    content: [{ type: "text", text }],
+    details: payload,
+  };
+}
+
+export const octoPlugin: ChannelPlugin<ResolvedOctoAccount> = {
+  id: "octo",
+  meta,
+  setupWizard: octoSetupWizard as any,
+  setup: octoSetupAdapter as any,
+  capabilities: {
+    chatTypes: ["direct", "group"],
+    media: true,
+    reactions: false,
+    threads: true,
+  },
+  reload: { configPrefixes: [`channels.${CHANNEL_ID}`] },
+  // Declare ACP thread-binding support so OpenClaw's session-binding service
+  // recognizes Octo as a thread-binding-capable channel. Without this block,
+  // `getCapabilities({channel:"octo",...})` returns
+  // `{ adapterAvailable: false, bindSupported: false }` and ACP spawns abort
+  // with `errorCode: "thread_binding_invalid"` (#23).
+  //
+  // - `supportsCurrentConversationBinding: true` is the minimum for OpenClaw's
+  //   generic current-placement bind path to accept Octo.
+  // - `createManager` is the runtime entry point: OpenClaw calls it on demand
+  //   per (cfg, accountId) and we install a SessionBindingAdapter that adds
+  //   "child" placement support (creates a new Octo sub-thread on bind).
+  // - `resolveConversationRef` normalizes octo's `groupNo____shortId` thread
+  //   format so callers passing a parent + threadId get the correct merged ref.
+  // - `buildBoundReplyPayload` returns null because Octo doesn't have a
+  //   per-thread pin/notify equivalent of Telegram's topic pin payload.
+  conversationBindings: {
+    supportsCurrentConversationBinding: true,
+    defaultTopLevelPlacement: "current",
+    resolveConversationRef: ({ conversationId, parentConversationId, threadId }: {
+      accountId?: string | null;
+      conversationId: string;
+      parentConversationId?: string;
+      threadId?: string | number | null;
+    }) => {
+      // Already a thread ref like "groupNo____shortId": split into parent+child.
+      if (conversationId.includes("____")) {
+        const parent = conversationId.split("____")[0]!;
+        return { conversationId, parentConversationId: parent };
+      }
+      // Caller passed a parent group + an explicit threadId: synthesize the
+      // composite conversationId in Octo's canonical format.
+      const tid = threadId == null ? "" : String(threadId).trim();
+      if (tid) {
+        return {
+          conversationId: `${conversationId}____${tid}`,
+          parentConversationId: conversationId,
+        };
+      }
+      return {
+        conversationId,
+        ...(parentConversationId ? { parentConversationId } : {}),
+      };
+    },
+    buildBoundReplyPayload: () => null,
+    createManager: ({ cfg, accountId }: { cfg: any; accountId?: string | null }) => {
+      const resolvedId =
+        (accountId && accountId.trim()) ||
+        resolveDefaultOctoAccountId(cfg) ||
+        DEFAULT_ACCOUNT_ID;
+      const account = resolveOctoAccount({ cfg, accountId: resolvedId });
+      if (!account.config.botToken) {
+        // Account not yet configured (botToken missing). Return a no-op
+        // manager so OpenClaw's lifecycle doesn't crash. NOTE: the runtime
+        // tracks one manager per (plugin, account) and will NOT call
+        // createManager again on subsequent binds for the same account, so
+        // configuring the bot AFTER first bind requires a gateway restart
+        // (or an in-process config reload hook) to install a working manager.
+        return { stop: () => {} };
+      }
+      // The SDK's `createManager` signature does NOT include a log sink, so
+      // we wire a minimal console-backed fallback. This surfaces
+      // `createThread` failures in the `child`-placement path that would
+      // otherwise be swallowed into a generic null binding result.
+      const fallbackLog = {
+        info: (msg: string) => console.log(`[octo:thread-binding] ${msg}`),
+        warn: (msg: string) => console.warn(`[octo:thread-binding] ${msg}`),
+        debug: (msg: string) => console.debug(`[octo:thread-binding] ${msg}`),
+      };
+      const unregister = registerOctoThreadBindingAdapter({
+        accountId: resolvedId,
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken,
+        log: fallbackLog,
+      });
+      return { stop: () => unregister() };
+    },
+  },
+  actions: {
+    listActions: ({ cfg }: { cfg: any }) => {
+      const actions = getAvailableActions(cfg);
+      return actions as any; // TODO: remove when SDK types support this
+    },
+    describeMessageTool: ({ cfg }: { cfg: any }) => {
+      const actions = getAvailableActions(cfg);
+      if (actions.length === 0) return null;
+      return { actions, capabilities: [] };
+    },
+    extractToolSend: ({ args }: { args: Record<string, unknown> }) => {
+      const target = args.target as string | undefined;
+      // Return the canonical `to` field that openclaw core uses in
+      // isMessagingToolSendAction to recognise Octo sends as committed
+      // delivery evidence.  Without `to`, isDeliveredMessagingToolResult
+      // is false → messagingToolSentMediaUrls is never populated →
+      // image-only agent turns are classified as non_deliverable_terminal_turn.
+      return target ? { to: target } : {};
+    },
+    handleAction: async (ctx: any) => {
+      // Resolve correct accountId: framework may pass wrong one when agent has multiple accounts.
+      // Use currentChannelId to look up which account actually owns the group.
+      // When multiple bots share the same group, do NOT correct — the caller's accountId is authoritative.
+      let accountId = ctx.accountId ?? DEFAULT_ACCOUNT_ID;
+      const currentChannelId = ctx.toolContext?.currentChannelId;
+      if (currentChannelId) {
+        // Use the shared helper so all three runtime prefixes
+        // (octo:/channel:/group:) are handled — see src/constants.ts.
+        // Pre-fix this only stripped "octo:", so a prefixed currentChannelId
+        // like "channel:grp1____x" yielded rawGroupNo="channel:grp1" and
+        // the isAccountRegisteredForGroup check below would miss the account
+        // entirely. Fix tracked in #102.
+        const rawId = stripAllChannelPrefixes(currentChannelId);
+        // 子区 channelID (groupNo____shortId) → 提取父群 groupNo
+        const rawGroupNo = rawId.includes("____") ? rawId.split("____")[0] : rawId;
+        // Only correct if current accountId is NOT registered for this group
+        // (i.e., framework passed a clearly wrong accountId).
+        // For shared groups (multiple bots), don't override — respect framework's choice.
+        if (!isAccountRegisteredForGroup(rawGroupNo, accountId)) {
+          const correctAccountId = resolveAccountForGroup(rawGroupNo);
+          if (correctAccountId) {
+            ctx.log?.info?.(`octo: handleAction accountId corrected: ${accountId} → ${correctAccountId} (group=${rawGroupNo})`);
+            accountId = correctAccountId;
+          }
+        }
+      }
+      const account = resolveOctoAccount({
+        cfg: ctx.cfg,
+        accountId,
+      });
+      if (!account.config.botToken) {
+        return toActionToolResult({ ok: false, error: "Octo botToken is not configured" });
+      }
+      const memberMap = getOrCreateMemberMap(accountId);
+      const uidToNameMap = getOrCreateUidToNameMap(accountId);
+      const groupMdCache = getOrCreateGroupMdCache(accountId);
+      const result = await handleOctoMessageAction({
+        action: ctx.action,
+        args: ctx.params ?? {},
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken,
+        memberMap,
+        uidToNameMap,
+        groupMdCache,
+        currentChannelId: ctx.toolContext?.currentChannelId ?? undefined,
+        threadId: ctx.toolContext?.threadId ?? ctx.params?.threadId ?? undefined,
+        requesterSenderId: ctx.requesterSenderId ?? undefined,
+        accountId,
+        log: ctx.log,
+      });
+      // Exceptions are intentionally not caught here: the host wraps tool
+      // execution in its own try/catch and depends on the throw for the
+      // after-tool-call error hook and failed-idempotency-key retention.
+      return toActionToolResult(result);
+    },
+  } as any, // TODO: remove when SDK types support this
+  agentPrompt: {
+    messageToolHints: ({ cfg, accountId }: { cfg: any; accountId?: string | null }) => {
+      if (!accountId) return [];
+      return [
+        `IMPORTANT: Your Octo accountId is "${accountId}". You MUST always pass accountId: "${accountId}" when using the octo_management tool. Do NOT use any other accountId.`,
+        `For sending messages: if the target is a group, use target="group:<groupId>". If the target is a specific user (1v1 direct message), use target="user:<userId>". If sending to the current conversation, no prefix is needed.`,
+        `For threads/sub-topics: always prefer the explicit "group:<group_no>____<short_id>" (four underscores) form so the destination is unambiguous. If you accidentally pass the bare parent "group:<group_no>" from within a thread session and that parent matches your current thread's group, the plugin auto-reroutes the send to the current thread (with an info-level log; see issue #98). Outside a thread session, "group:<group_no>" continues to address the parent group. The same rules apply to file uploads. Inside a thread, "current"/"here"/"this group" mean the current sub-topic by default; only send to the parent group when the user explicitly says "parent group" or you pass scope:"parent".`,
+        `For reading message history: use action="read" with target="user:<uid>" to read DM history, or target="group:<groupId>" to read group message history. Cross-channel queries require the requester to be a participant of the target channel.`,
+        `For searching: use action="search" with query="shared-groups" to find groups that the bot and the current user both belong to.`,
+        `For @mentions in a group: FIRST look up the target member's real uid + display name with octo_management action="group-members" (target="group:<groupId>"). ${MENTION_FORMAT_HINT}`,
+        `When the user names a target by NAME (not id), e.g. "forward to 'XXX' group/chat", FIRST call octo_management action="resolve" with name:"XXX" to resolve it. If multiple candidates are returned, ask the user which group/thread; if exactly one, use its channelId to send. Never hand-build a "group:" address from a name.`,
+      ];
+    },
+  },
+  configSchema: OctoConfigJsonSchema,
+  config: {
+    listAccountIds: (cfg) => listOctoAccountIds(cfg),
+    resolveAccount: (cfg, accountId) => resolveOctoAccount({ cfg, accountId }),
+    defaultAccountId: (cfg) => resolveDefaultOctoAccountId(cfg) ?? listOctoAccountIds(cfg)[0] ?? DEFAULT_ACCOUNT_ID,
+    isEnabled: (account) => account.enabled,
+    isConfigured: (account) => account.configured,
+    describeAccount: (account) => ({
+      accountId: account.accountId,
+      name: account.name,
+      enabled: account.enabled,
+      configured: account.configured,
+      apiUrl: account.config.apiUrl,
+      botToken: account.config.botToken ? "[set]" : "[missing]",
+      wsUrl: account.config.wsUrl ?? "[auto-detect]",
+    }),
+  },
+  messaging: {
+    normalizeTarget: (target) => target.trim(),
+    targetResolver: {
+      looksLikeId: (input) => Boolean(input.trim()),
+      hint: "<userId or channelId>",
+    },
+  },
+  outbound: {
+    deliveryMode: "direct",
+    sendText: async (ctx) => {
+      // Resolve correct accountId — framework may pass wrong one for multi-bot setups
+      const accountId = resolveOutboundAccountId(
+        ctx.to,
+        ctx.accountId ?? DEFAULT_ACCOUNT_ID,
+      );
+      const account = resolveOctoAccount({
+        cfg: ctx.cfg as OpenClawConfig,
+        accountId,
+      });
+      if (!account.config.botToken) {
+        throw new Error("Octo botToken is not configured");
+      }
+      const content = ctx.text?.trim();
+      if (!content) {
+        // noop early-return: no API call was made, so no real message_id
+        // exists. Runtime will see messageId="" and judge
+        // deliverySucceeded=false — that is the CORRECT semantics for
+        // "we delivered nothing". Do NOT fabricate an ID here. See
+        // toDeliveryResult() helper at the top of this file.
+        return { channel: CHANNEL_ID, to: ctx.to, messageId: "" };
+      }
+
+      // Parse target — merge framework-provided threadId into CommunityTopic
+      // channel_id when ctx.to is a bare group. Inline mention UIDs
+      // (`(group|channel):<id>@uid1,uid2`) are pulled out here via the
+      // shared extractor so both prefix forms propagate UIDs consistently.
+      const mentionUids: string[] = extractInlineMentionUids(ctx.to);
+
+      const { channelId, channelType } = resolveOutboundOctoTarget(ctx.to, ctx.threadId);
+
+      let mentionEntities: MentionEntity[] = [];
+      let finalContent = content;
+
+      if (channelType === ChannelType.Group || channelType === ChannelType.CommunityTopic) {
+        const accountMemberMap = getOrCreateMemberMap(accountId);
+        const uidToNameMap = getOrCreateUidToNameMap(accountId);
+
+        // Ensure member maps are populated for proactive sends (cron / new
+        // sub-topic / agent-initiated @) where the inbound refresh never ran.
+        await prefetchOutboundMembers({
+          content: finalContent,
+          channelId,
+          apiUrl: account.config.apiUrl,
+          botToken: account.config.botToken,
+          memberMap: accountMemberMap,
+          uidToNameMap,
+        });
+
+        // v2 path: convert @[uid:name] → @name + entities
+        const structuredMentions = parseStructuredMentions(finalContent);
+        if (structuredMentions.length > 0) {
+          const converted = convertStructuredMentions(finalContent, structuredMentions);
+          finalContent = converted.content;
+          mentionEntities = [...converted.entities];
+          for (const uid of converted.uids) {
+            if (!mentionUids.includes(uid)) {
+              mentionUids.push(uid);
+            }
+          }
+        }
+
+        // v1 fallback: resolve remaining @name via memberMap
+        const { entities, uids } = buildEntitiesFromFallback(finalContent, accountMemberMap);
+        const existingOffsets = new Set(mentionEntities.map(e => e.offset));
+        for (const entity of entities) {
+          if (!existingOffsets.has(entity.offset)) {
+            mentionEntities.push(entity);
+          }
+        }
+        for (const uid of uids) {
+          if (!mentionUids.includes(uid)) {
+            mentionUids.push(uid);
+          }
+        }
+
+        // Last-line guard — rewrite/downgrade/strip any malformed @ the
+        // conversion+fallback couldn't resolve, and drop illegal uids so a bad
+        // mention is never leaked to the server.
+        const sanitized = sanitizeOutboundMentions({
+          content: finalContent,
+          entities: mentionEntities,
+          uids: mentionUids,
+          uidToNameMap,
+        });
+        finalContent = sanitized.content;
+        mentionEntities = sanitized.entities;
+        mentionUids.length = 0;
+        mentionUids.push(...sanitized.uids);
+      }
+
+      // Detect @all/@所有人 in content
+      const hasAtAll = /(?:^|(?<=\s))@(?:all|所有人)(?=\s|[^\w]|$)/i.test(finalContent);
+
+      // Outbound reply attribution: only honor an explicit `ctx.replyToId` from core
+      // (user/reply-mode driven). The dispatch's own final answer threads to the user's
+      // triggering message in inbound.ts (Q→A quoting, standard IM shape); this
+      // channel-level send path (proactive / message-tool) does not fabricate a reply target.
+      const replyMsgId = typeof ctx.replyToId === "string" && ctx.replyToId.trim()
+        ? ctx.replyToId.trim()
+        : undefined;
+
+      const sendResult = await sendMessage({
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken,
+        channelId,
+        channelType,
+        content: finalContent,
+        ...(mentionUids.length > 0 ? { mentionUids } : {}),
+        ...(mentionEntities.length > 0 ? { mentionEntities } : {}),
+        mentionAll: hasAtAll || undefined,
+        ...(replyMsgId ? { replyMsgId } : {}),
+      });
+
+      return toDeliveryResult(ctx.to, sendResult);
+    },
+    sendMedia: async (ctx) => {
+      // Resolve correct accountId — framework may pass wrong one for multi-bot setups
+      const accountId = resolveOutboundAccountId(
+        ctx.to,
+        ctx.accountId ?? DEFAULT_ACCOUNT_ID,
+      );
+      const account = resolveOctoAccount({
+        cfg: ctx.cfg as OpenClawConfig,
+        accountId,
+      });
+      if (!account.config.botToken) {
+        throw new Error("Octo botToken is not configured");
+      }
+
+      const mediaUrl = ctx.mediaUrl;
+      if (!mediaUrl) {
+        throw new Error("sendMedia called without mediaUrl");
+      }
+
+      // Resolve + validate the target BEFORE any media work (download / presign
+      // / upload). resolveOutboundOctoTarget throws on an empty/prefix-only
+      // target (#138); doing it here means an unroutable send fails fast instead
+      // of burning an upload first (and orphaning the uploaded object).
+      const { channelId, channelType } = resolveOutboundOctoTarget(ctx.to, ctx.threadId);
+
+      // 1. Resolve file — stream-based for HTTP/file paths, Buffer for data URIs
+      let fileBuffer: Buffer | undefined;   // body for data: URIs (held in memory)
+      let bodyPath: string | undefined;     // body streamed from disk (file:// / temp)
+      let fileSize: number;
+      let contentType: string | undefined;
+      let filename: string;
+      let tempPath: string | undefined; // temp file we created (will be cleaned up)
+      let localFilePath: string | undefined; // path for parseImageDimensionsFromFile
+
+      // Opportunistic cleanup of stale temp files
+      cleanupOldUploadTempFiles().catch(() => {});
+
+      if (mediaUrl.startsWith("data:")) {
+        // Parse data URI: data:[<mediatype>][;base64],<data>
+        const match = mediaUrl.match(/^data:([^;,]+)?(?:;base64)?,(.*)$/);
+        if (!match) {
+          throw new Error("Invalid data URI format");
+        }
+        contentType = match[1] || "application/octet-stream";
+        const b64 = match[2];
+        // Estimate decoded size from base64 length BEFORE allocating the
+        // Buffer, so an oversize `data:` URI is rejected without the 100MB+
+        // allocation it would otherwise force. The formula is exact for
+        // canonical base64 (whitespace stripped before measuring); padding
+        // bytes are subtracted because '=' chars don't decode to data.
+        const trimmedB64 = b64.replace(/\s/g, "");
+        const padding = trimmedB64.endsWith("==") ? 2 : trimmedB64.endsWith("=") ? 1 : 0;
+        const decodedSize = Math.floor(trimmedB64.length * 3 / 4) - padding;
+        if (decodedSize > MAX_UPLOAD_SIZE) {
+          throw new Error(`File too large (${decodedSize} bytes, max ${MAX_UPLOAD_SIZE})`);
+        }
+        const buf = Buffer.from(b64, "base64");
+        fileBuffer = buf;
+        fileSize = buf.length;
+        // Generate a reasonable filename from MIME type
+        const extMap: Record<string, string> = {
+          "text/markdown": ".md", "text/plain": ".txt", "application/pdf": ".pdf",
+          "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp",
+          "application/json": ".json", "application/zip": ".zip",
+          "audio/mpeg": ".mp3", "video/mp4": ".mp4",
+        };
+        const ext = extMap[contentType] || ".bin";
+        filename = `file${ext}`;
+        // If OpenClaw provides a filename hint via ctx, prefer it
+        if ((ctx as Record<string, unknown>).filename) {
+          filename = String((ctx as Record<string, unknown>).filename);
+        }
+      } else if (mediaUrl.startsWith("file://") || path.isAbsolute(mediaUrl)) {
+        // Local file — either a file:// URL or a bare absolute path. OpenClaw
+        // tools (e.g. image generation) hand us the latter with no scheme
+        // (#183); it must read from disk, not fall through to `new URL()`,
+        // which throws `TypeError: Invalid URL` on a leading-slash path.
+        const filePath = mediaUrl.startsWith("file://")
+          ? decodeURIComponent(mediaUrl.slice(7))
+          : mediaUrl;
+        const st = statSync(filePath);
+        if (st.size > MAX_UPLOAD_SIZE) {
+          throw new Error(`File too large (${st.size} bytes, max ${MAX_UPLOAD_SIZE})`);
+        }
+        localFilePath = filePath;
+        bodyPath = filePath;
+        fileSize = st.size;
+        filename = path.basename(filePath);
+        contentType = inferContentType(filename);
+      } else {
+        // HTTP(S) URL — stream download to temp file to avoid buffering in memory
+        const urlPath = new URL(mediaUrl).pathname;
+        const rawFilename = path.basename(urlPath) || "file";
+        try {
+          filename = decodeURIComponent(rawFilename);
+        } catch {
+          filename = rawFilename;
+        }
+        const dl = await downloadToTempFile(mediaUrl, filename);
+        tempPath = dl.tempPath;
+        localFilePath = dl.tempPath;
+        contentType = dl.contentType;
+        if (!contentType || contentType === "application/octet-stream") contentType = inferContentType(filename);
+        const st = statSync(tempPath);
+        bodyPath = tempPath;
+        fileSize = st.size;
+      }
+
+      contentType = contentType || "application/octet-stream";
+
+      let sendResult: SendMessageResult | undefined;
+      try {
+        // 2. Upload via the server's backend-agnostic presigned PUT URL.
+        //    fileSize is the exact body byte count (statSync / buffer length);
+        //    it is signed into the SigV4 Content-Length (403 on mismatch).
+        const presign = await getUploadPresign({
+          apiUrl: account.config.apiUrl,
+          botToken: account.config.botToken,
+          filename,
+          fileSize,
+          contentType: ensureTextCharset(contentType),
+        });
+        // Open the read stream lazily (after presign succeeds) so a presign
+        // failure never leaves a dangling open() against an unlinked temp file.
+        const fileBody: Buffer | NodeJS.ReadableStream =
+          fileBuffer ?? createReadStream(bodyPath!);
+        const { url: cdnUrl } = await uploadFileToPresignedUrl({
+          uploadUrl: presign.uploadUrl,
+          downloadUrl: presign.downloadUrl,
+          fileBody,
+          fileSize,
+          // Replay the server-signed contentType / contentDisposition verbatim
+          // (both folded into the SigV4 canonical headers, 403 otherwise).
+          contentType: presign.contentType,
+          contentDisposition: presign.contentDisposition,
+        });
+
+        // 4. Determine message type and send
+        // (target already resolved + validated up front, before upload — #138)
+        const msgType = contentType.startsWith("image/")
+          ? MessageType.Image
+          : MessageType.File;
+
+        if (msgType === MessageType.Image) {
+          // For images, parse dimensions from file or buffer
+          const dims = localFilePath
+            ? await parseImageDimensionsFromFile(localFilePath, contentType)
+            : Buffer.isBuffer(fileBody)
+              ? parseImageDimensions(fileBody, contentType)
+              : null;
+          sendResult = await sendMediaMessage({
+            apiUrl: account.config.apiUrl,
+            botToken: account.config.botToken,
+            channelId,
+            channelType,
+            type: msgType,
+            url: cdnUrl,
+            width: dims?.width,
+            height: dims?.height,
+            name: filename,
+            size: fileSize,
+          });
+        } else {
+          sendResult = await sendMediaMessage({
+            apiUrl: account.config.apiUrl,
+            botToken: account.config.botToken,
+            channelId,
+            channelType,
+            type: msgType,
+            url: cdnUrl,
+            name: filename,
+            size: fileSize,
+          });
+        }
+      } finally {
+        // Cleanup temp file
+        if (tempPath) await unlink(tempPath).catch(() => {});
+      }
+
+      return toDeliveryResult(ctx.to, sendResult);
+    },
+  },
+  status: {
+    defaultRuntime: {
+      accountId: DEFAULT_ACCOUNT_ID,
+      running: false,
+      lastStartAt: null,
+      lastStopAt: null,
+      lastError: null,
+    },
+    buildAccountSnapshot: ({ account, runtime }) => ({
+      accountId: account.accountId,
+      name: account.name,
+      enabled: account.enabled,
+      configured: account.configured,
+      apiUrl: account.config.apiUrl,
+      running: runtime?.running ?? false,
+      lastStartAt: runtime?.lastStartAt ?? null,
+      lastStopAt: runtime?.lastStopAt ?? null,
+      lastError: runtime?.lastError ?? null,
+      lastInboundAt: runtime?.lastInboundAt ?? null,
+      lastOutboundAt: runtime?.lastOutboundAt ?? null,
+    }),
+  },
+  gateway: {
+    startAccount: async (ctx) => {
+      // Ensure cleanup timer is running (singleton pattern for hot reload safety)
+      ensureCleanupTimer();
+
+      const account = ctx.account;
+      if (!account.configured || !account.config.botToken) {
+        throw new Error(
+          `Octo not configured for account "${account.accountId}" (missing botToken)`,
+        );
+      }
+
+      const log = ctx.log;
+      const statusSink: OctoStatusSink = (patch) =>
+        ctx.setStatus({ accountId: account.accountId, ...patch });
+
+      // Operator-facing one-shot audit: if any configured accountId contains
+      // uppercase characters, log the count (NOT the IDs themselves — avoids
+      // leaking bot identifiers). All internal storage is normalized so this
+      // is informational only; it helps operators decide whether to clean up
+      // legacy disk dirs or notify users to rotate to lowercase bots. See
+      // issue #33 / octo-server#302.
+      try {
+        const allIds = listOctoAccountIds(ctx.cfg);
+        const mixedCount = allIds.filter((id) => id !== id.toLowerCase()).length;
+        if (mixedCount > 0) {
+          log?.info?.(
+            `octo: detected ${mixedCount} mixed-case Octo accountId(s); internal storage normalized (see openclaw-channel-octo#33)`,
+          );
+        }
+      } catch { /* config snapshot inaccessible — non-fatal */ }
+
+      // `commands.fork.scope` accepts four values in
+      // the schema, but v1's fork hook only honors the default "owner-mentioned"
+      // (wiring inbound to a configured value is a v1.1 TODO). Warn once per
+      // account at startup if an operator set a non-default value, so it is not
+      // silently ignored. Same one-shot granularity as the mixed-case audit above.
+      try {
+        const warning = forkScopeStartupWarning(
+          getChannelConfig<OctoConfig>(ctx.cfg).commands?.fork?.scope,
+        );
+        if (warning) log?.warn?.(warning);
+      } catch { /* config snapshot inaccessible — non-fatal */ }
+
+      log?.info?.(`[${account.accountId}] registering Octo bot...`);
+
+      // 1. Register bot (first attempt uses cached token)
+      let credentials: {
+        robot_id: string;
+        im_token: string;
+        ws_url: string;
+        owner_uid: string;
+      };
+      try {
+        credentials = await registerBot({
+          apiUrl: account.config.apiUrl,
+          botToken: account.config.botToken,
+          agentPlatform: "OpenClaw",
+          agentVersion: getAgentVersion(),
+          pluginVersion: PLUGIN_VERSION,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log?.error?.(`octo: bot registration failed: ${message}`);
+        statusSink({ lastError: message });
+        throw err;
+      }
+
+      // Track this bot's uid for bot-to-bot loop prevention
+      _knownBotUids.add(credentials.robot_id);
+
+      // Register owner_uid for permission checks
+      if (credentials.owner_uid) {
+        registerOwnerUid(account.accountId, credentials.owner_uid);
+      }
+
+      log?.info?.(
+        `[${account.accountId}] bot registered as ${credentials.robot_id}`,
+      );
+
+      // Preload member cache for cross-session permission checks (fire-and-forget)
+      preloadGroupMemberCache({
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken!,
+        log,
+      }).catch(() => {});
+
+      // Preload group-level 免@偏好 for this bot (fire-and-forget). Optional
+      // warm-up; the inbound mention gate works lazily without it.
+      preloadMentionPrefs({
+        accountId: account.accountId,
+        apiUrl: account.config.apiUrl,
+        botToken: account.config.botToken!,
+        log,
+      }).catch(() => {});
+
+      // Start persona_prompt cache refresh loop for persona-clone bots
+      // (GH octo-adapters#68). No-op for regular bots. Polls
+      // GET /v1/bot/obo-grant so persona_prompt edits propagate without
+      // requiring a fan-out copy or process restart.
+      initPersonaPromptCache(
+        {
+          accountId: account.accountId,
+          apiUrl: account.config.apiUrl,
+          botToken: account.config.botToken!,
+          onBehalfOf: account.config.onBehalfOf,
+        },
+        log,
+      );
+
+      // NOTE: ACP thread-binding adapter is NOT registered here. The canonical
+      // wiring is via `octoPlugin.conversationBindings.createManager`, which
+      // OpenClaw runtime calls on demand and whose returned `{stop}` it owns.
+      // See the plugin declaration above and `src/thread-binding-adapter.ts`.
+
+      // Prefetch GROUP.md and group members for all groups (fire-and-forget)
+      const groupMdCache = getOrCreateGroupMdCache(account.accountId);
+      (async () => {
+        try {
+          const groups = await fetchBotGroups({ apiUrl: account.config.apiUrl, botToken: account.config.botToken!, log });
+          registerBotGroupIds(groups.map(g => g.group_no));
+          let mdCount = 0;
+          let memberCount = 0;
+          for (const g of groups) {
+            // Register group → account mapping for outbound accountId resolution
+            registerGroupToAccount(g.group_no, account.accountId);
+
+            // Prefetch GROUP.md
+            try {
+              const md = await getGroupMd({ apiUrl: account.config.apiUrl, botToken: account.config.botToken!, groupNo: g.group_no, log });
+              if (md.content) {
+                groupMdCache.set(g.group_no, { content: md.content, version: md.version });
+                writeGroupMdToDisk({
+                  accountId: account.accountId,
+                  groupNo: g.group_no,
+                  content: md.content,
+                  meta: {
+                    version: md.version,
+                    updated_at: null,
+                    updated_by: "prefetch",
+                    fetched_at: new Date().toISOString(),
+                    account_id: account.accountId,
+                  },
+                });
+                mdCount++;
+              }
+            } catch {
+              // Ignore per-group failures (group may not have GROUP.md)
+            }
+            // Prefetch group members → fill uidToNameMap for SenderName resolution
+            // Uses cache so preloadGroupMemberCache() results are reused
+            try {
+              const members = await getGroupMembersFromCache({ apiUrl: account.config.apiUrl, botToken: account.config.botToken!, groupNo: g.group_no, log });
+              const prefetchMemberMap = getOrCreateMemberMap(account.accountId);
+              const prefetchUidMap = getOrCreateUidToNameMap(account.accountId);
+              for (const m of members) {
+                if (m.uid && m.name) {
+                  prefetchMemberMap.set(m.name, m.uid);
+                  prefetchUidMap.set(m.uid, m.name);
+                  memberCount++;
+                }
+              }
+            } catch {
+              // Ignore per-group failures
+            }
+          }
+          if (mdCount > 0) {
+            log?.info?.(`octo: prefetched GROUP.md for ${mdCount} groups`);
+          }
+          if (memberCount > 0) {
+            log?.info?.(`octo: prefetched ${memberCount} member names from ${groups.length} groups`);
+          }
+        } catch (err) {
+          log?.error?.(`octo: group prefetch failed: ${String(err)}`);
+        }
+      })();
+
+      ctx.setStatus({
+        accountId: account.accountId,
+        running: true,
+        lastStartAt: Date.now(),
+        lastError: null,
+      });
+
+      // 2. Resolve WebSocket URL
+      const wsUrl = account.config.wsUrl || credentials.ws_url;
+
+      // 3. Account-scoped liveness and reconnect coordination.
+      //
+      // The heartbeat is wired further down, once `socket` exists for it to consult. It is
+      // no longer started or stopped by connection events: it used to be restartable only
+      // from onConnected, so a reconnect that never completed left the beat stopped for
+      // good, and its failures used to tear down the socket even though a REST beat says
+      // nothing about whether the socket is healthy.
+      let stopped = false;
+
+      // 4. Group history map — persists across auto-restarts (module-level)
+      const groupHistories = getOrCreateHistoryMap(account.accountId);
+
+      // 4a. Last bot reply seq map — for history segmentation
+      const lastBotReplySeqMap = getOrCreateLastBotReplySeqMap(account.accountId);
+
+      // 4b. Member name->uid map — for resolving @mentions in replies
+      const memberMap = getOrCreateMemberMap(account.accountId);
+
+      // 4c. Reverse map uid->name — for showing display names in replies
+      const uidToNameMap = getOrCreateUidToNameMap(account.accountId);
+
+      // 4d. Group cache timestamps — track when each group's members were last fetched
+      const groupCacheTimestamps = getOrCreateGroupCacheTimestamps(account.accountId);
+
+      // 4e. Robot flags map — server-authoritative sender classification for the 免@ gate
+      const memberRobotMap = getOrCreateMemberRobotMap(account.accountId);
+
+      // 4f. Current-group roster — current group's members only (per-group),
+      // for the [Group Members] / member-count prompt context (#125)
+      const currentGroupMembersMap = getOrCreateCurrentGroupMembersMap(account.accountId);
+
+      // 5. Token refresh state — time-based cooldown to prevent refresh storms
+      let lastTokenRefreshAt = 0;
+      const TOKEN_REFRESH_COOLDOWN_MS = 60_000; // 60 seconds
+      // Guard against concurrent refreshes (#43). A unit rather than a bare boolean because
+      // the lowering has to survive the inner call declining to run — see
+      // createSingleFlightFlag.
+      const refreshGuard = createSingleFlightFlag();
+
+      // 5c. Serialises the reconnect sequences so the watchdog can tell that one is already
+      // running — including during the awaits, when nothing else shows it.
+      const reconnectSequencer = createReconnectSequencer({ log });
+
+      const dispatchInboundMessage = (
+        msg: BotMessage,
+        routeOverride?: { sessionKey: string; agentId?: string },
+        // 合成消息(文档任务)用 queueScope 脱离「按消息字段派生」的默认分区,
+        // docTask 则关闭 IM 出站并把答复改投评论区。
+        extra?: {
+          queueScope?: string;
+          docTask?: Parameters<typeof handleInboundMessage>[0]["docTask"];
+        },
+      ): Promise<"completed" | "dropped"> =>
+        enqueueInbound(getInboundQueueKey(account.accountId, msg, extra?.queueScope), async () => {
+          try {
+            await runWithSessionInitRetry(
+              () =>
+                handleInboundMessage({
+                  account,
+                  message: msg,
+                  botUid: credentials.robot_id,
+                  groupHistories,
+                  lastBotReplySeqMap,
+                  memberMap,
+                  uidToNameMap,
+                  groupCacheTimestamps,
+                  memberRobotMap,
+                  currentGroupMembersMap,
+                  groupMdCache,
+                  log,
+                  statusSink,
+                  routeOverride,
+                  ...(extra?.docTask ? { docTask: extra.docTask } : {}),
+                }),
+              { ...SESSION_INIT_RETRY, log },
+            );
+          } catch (err) {
+            if (isSessionInitConflict(err)) {
+              if (extra?.docTask) {
+                // 第五处 IM 出口:该回执按合成消息解析目标,会发进发起人的私聊。
+                // 文档任务改投评论区 —— 与 inbound 的出站收口同一条原则。
+                // 每次重试都会由 handleInboundMessage.finally 上报一次;handler 会
+                // 累计各 attempt 的事实。这里再补 notice-only:留了痕,但本次冲突
+                // 没产出,不再补一条通用兜底(否则用户连着看两句废话)。
+                try {
+                  await extra.docTask.postComment(
+                    "⚠️ 上一轮任务尚未结束，本次请求已跳过。请稍后重试。",
+                    AbortSignal.timeout(DOC_TASK_NOTICE_TIMEOUT_MS),
+                    // ★ 必须显式 "notice":本次冲突根本没碰文档,缺省会回落 applied。
+                    "notice",
+                  );
+                  extra.docTask.reportTurn({
+                    finalDelivered: false,
+                    delivered: true,
+                    lost: false,
+                    noticed: true,
+                  });
+                } catch (postErr) {
+                  extra.docTask.reportTurn({
+                    finalDelivered: false,
+                    delivered: false,
+                    lost: false,
+                    noticed: false,
+                  });
+                  log?.error?.(`octo: doc task conflict notice failed: ${String(postErr)}`);
+                }
+              } else {
+                await notifyInboundConflictDropped({
+                  err,
+                  msg,
+                  accountId: account.accountId,
+                  apiUrl: account.config.apiUrl,
+                  botToken: account.config.botToken,
+                  log,
+                });
+              }
+              return "dropped" as const;
+            }
+            throw err;
+          }
+          return "completed" as const;
+        });
+
+      // 文档评论 @Bot 任务。持久去重:轮询器先执行后存游标,server 侧也可能在
+      // enqueue 后 confirm 前崩溃重投,两条路径都靠 idempotency_key 收敛。
+      const docTasksEnabled = account.config.docTasks === true;
+      // 配置写错类型时说清楚。解析器只兜底 nullish,所以非布尔值(典型是 JSON 里写成
+      // 字符串 "true")原样透传到这里,被下面的严格 `=== true` 拒掉 —— 得到的是**默认值
+      // 的反面**:本想开,结果比不写还少。这条门禁本身是对的(不能让写错的配置静默半开),
+      // 但不出声就成了运维查不出来的坑,所以在这儿说明白。
+      if (account.config.docTasks !== undefined && typeof account.config.docTasks !== "boolean") {
+        console.warn(
+          `[octo:doc-tasks] [${account.accountId}] docTasks 必须是布尔值,收到 ` +
+            `${typeof account.config.docTasks} —— 文档评论 @Bot 任务**已关闭**(门禁只认布尔 true)。` +
+            `想开就写 docTasks: true(不带引号);想关就写 docTasks: false。`,
+        );
+      }
+      // log 必须传:去重表读不出来时(EACCES / JSON 截断)会退化成空表,
+      // 已完成的事件全部变回可重放 —— 这是必须能在日志里看见的降级,不是静默的。
+      const docMentionDedupe = createFileDocMentionDedupeStore({ accountId: account.accountId, log });
+      // 死信:只在「答复与兜底通知都没送达」时落一条,给运维一个可查的记录。
+      // 不重投 —— 改文档的任务重放不幂等。见 doc-task-deadletter.ts 顶部。
+      const docTaskDeadLetter = createFileDocTaskDeadLetterStore({ accountId: account.accountId, log });
+      const handleDocMention = createDocMentionHandler({
+        botUid: credentials.robot_id,
+        // 整篇取回地址由这里的**已解析配置**拼,不让 agent 从载荷 url= 推域名。
+        docsBaseUrl: account.config.docsApiUrl,
+        dedupe: docMentionDedupe,
+        deadLetter: docTaskDeadLetter,
+        dispatch: dispatchInboundMessage,
+        postComment: async (mention, text, signal, intent) => {
+          // HTML 文档的评论存在 octo-doc,且 mention.docId 是它的 slug ——
+          // docs-backend 的 `/v1/bot/docs/<docId>/comments` 按 docId 查,拿 slug 去打
+          // 每条都是 404。所以这里按类型分流,而不是靠「先试一次再回退」:那个 404
+          // 跟「文档真的不存在」没法区分,回退只会把后者也误当 HTML 再失败一次。
+          if (mention.docKind === "html") {
+            await postHtmlDocReply({
+              apiUrl: account.config.docsApiUrl,
+              botToken: account.config.botToken ?? "",
+              slug: mention.docId,
+              // HTML 的 parent_id 是字符串 id,不能走 docCommentParentId(它按数字解析)。
+              // 回帖必须挂在**串根**上,threadId 已由 server 按 parent_id→comment_id 派生。
+              parentId: mention.threadId,
+              body: text,
+              // 失败/超时/兜底通知不能打 applied 徽章:那三种都是没碰文档就失败了。
+              intent,
+              signal,
+            });
+            return;
+          }
+          await postDocComment({
+            // 文档域,不是 IM 域:apiUrl 指向 IM server,而 `/v1/bot/docs/**` 由
+            // docs-backend 提供。同一个网关前置两者时 docsApiUrl 就等于 apiUrl;
+            // 拆开部署时用它指向 docs-backend,否则每条回帖都是 404(见 accounts.ts)。
+            apiUrl: account.config.docsApiUrl,
+            botToken: account.config.botToken ?? "",
+            docId: mention.docId,
+            body: text,
+            parentId: docCommentParentId(mention),
+            signal,
+          });
+        },
+        log,
+      });
+
+      let cardEventPoller: EventPoller | undefined;
+      const startCardEventPoller = (): void => {
+        if (cardEventPoller || stopped) return;
+        cardEventPoller = startEventPoller({
+          apiUrl: account.config.apiUrl,
+          botToken: account.config.botToken ?? "",
+          intervalMs: account.config.pollIntervalMs,
+          waitSeconds: account.config.eventWaitSeconds,
+          cursorStore: createFileEventCursorStore({ accountId: account.accountId }),
+          log,
+          ...(docTasksEnabled ? { onDocMention: handleDocMention } : {}),
+          // 本地 cardInteraction 已废弃(服务端 per-Bot interaction_enabled 权威),
+          // 这里无条件注册,与 main 保持一致。
+          onCardAction: async (action) => {
+            await handleCardAction({
+              action,
+              accountId: account.accountId,
+              apiUrl: account.config.apiUrl,
+              botToken: account.config.botToken ?? "",
+              operatorName: uidToNameMap.get(action.operatorUid),
+              log,
+              dispatch: async (session) => {
+                const message = synthesizeCardActionMessage(action, credentials.robot_id);
+                const routeOverride = session.sessionKey
+                  ? {
+                      sessionKey: session.sessionKey,
+                      ...(session.agentId ? { agentId: session.agentId } : {}),
+                    }
+                  : undefined;
+                const result = await dispatchInboundMessage(message, routeOverride);
+                return result === "completed" ? "completed" : "rejected";
+              },
+            });
+          },
+        });
+        log?.info?.(
+          `octo: [${account.accountId}] bot event poller started (doc_tasks=${docTasksEnabled})`,
+        );
+      };
+      // 保留 main 的形态:轮询器仍是懒启动,但注册不再被本地 cardInteraction 门控 —— 任何
+      // card-profile 消费者都可以启动它,好让 bot_setting_updated 能作废该 Bot 的缓存策略。
+      setCardEventPollStarter(account.accountId, startCardEventPoller);
+      if (process.env.OCTO_CARD_POLL_FORCE === "1") startCardEventPoller();
+      // 文档任务必须常驻轮询:上面是「发过卡片才懒启动」的,而 doc bot 可能从不发卡片,
+      // 不常驻就永远收不到 doc_comment_mention。
+      if (docTasksEnabled) startCardEventPoller();
+
+      // 6. Connect WebSocket — pure real-time
+      const socket = new WKSocket({
+        wsUrl,
+        uid: credentials.robot_id,
+        token: credentials.im_token,
+
+        onMessage: (msg: BotMessage) => {
+          // Allow structured event messages (e.g. group_md_updated) even from self/bots
+          const isEvent = !!(msg.payload as any)?.event?.type; // TODO: remove when SDK types support this
+          if (msg.payload?.type === 1 && (msg.payload as any)?.event) { // TODO: remove when SDK types support this
+          }
+          // Skip self messages (but not events — bot needs to know about its own GROUP.md updates)
+          if (msg.from_uid === credentials.robot_id && !isEvent) return;
+          // Skip messages from any other bot in this plugin instance (prevent bot-to-bot loops)
+          // But allow group messages through — bot-to-bot @mention in groups is legitimate;
+          // mention gating in inbound.ts ensures only @-targeted messages trigger AI.
+          // Also allow event messages (e.g. group_md_updated) from any source.
+          if (_knownBotUids.has(msg.from_uid) && msg.channel_type === ChannelType.DM && !isEvent) return;
+          // Skip unsupported message types (Location, Card), but allow event messages through
+          const supportedTypes = [MessageType.Text, MessageType.Image, MessageType.GIF, MessageType.Voice, MessageType.Video, MessageType.File, MessageType.MultipleForward, MessageType.RichText, MessageType.InteractiveCard];
+          if (!msg.payload || (!supportedTypes.includes(msg.payload.type) && !isEvent)) return;
+
+          // Defense-in-depth DM filter (kept for safety, though v0.2.28+ uses independent
+          // WebSocket connections per bot so server-side routing is already correct).
+          // DM channel_id is typically "uid1@uid2", but may also be a plain uid
+          // when channel_type === 1 without '@'. The plain-uid case needs no extra filter
+          // since each bot has its own WS connection.
+          if (msg.channel_type === ChannelType.DM && msg.channel_id && msg.channel_id.includes("@")) {
+            const parts = msg.channel_id.split("@");
+            if (!parts.includes(credentials.robot_id)) {
+              log?.info?.(
+                `octo: [${account.accountId}] skipping DM not for this bot: channel=${msg.channel_id} bot=${credentials.robot_id}`,
+              );
+              return;
+            }
+          }
+
+          log?.info?.(
+            `octo: [${account.accountId}] recv message from=${msg.from_uid} channel=${msg.channel_id ?? "DM"} type=${msg.channel_type ?? 1}`,
+          );
+
+          // Track cache activity for cleanup
+          if (msg.channel_id) {
+            touchCache(account.accountId, msg.channel_id);
+            if (msg.channel_type === ChannelType.Group || msg.channel_type === ChannelType.CommunityTopic) {
+              const groupId = msg.channel_type === ChannelType.CommunityTopic
+                ? msg.channel_id.split("____")[0]
+                : msg.channel_id;
+              registerGroupToAccount(groupId, account.accountId);
+            }
+          }
+
+          void dispatchInboundMessage(msg).catch((err) => {
+            log?.error?.(
+              `octo: inbound handler failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`,
+            );
+          });
+        },
+
+        onConnected: () => {
+          log?.info?.(`octo: [${account.accountId}] WebSocket connected to ${wsUrl}`);
+          statusSink({ lastError: null });
+        },
+
+        onDisconnected: () => {
+          log?.warn?.(`octo: [${account.accountId}] WebSocket disconnected, will reconnect...`);
+          statusSink({ lastError: "disconnected" });
+        },
+
+        onError: async (err: Error) => {
+          log?.error?.(`octo: [${account.accountId}] WebSocket error: ${err.message}`);
+          statusSink({ lastError: err.message });
+
+          // If kicked or connect failed, try refreshing the IM token with a cooldown
+          // to prevent refresh storms (e.g. 9000+ refreshes across 11 bots).
+          // refreshGuard prevents concurrent refresh attempts (#43)
+          const cooldownElapsed = Date.now() - lastTokenRefreshAt > TOKEN_REFRESH_COOLDOWN_MS;
+          if (cooldownElapsed && !refreshGuard.isRaised() && !stopped &&
+              (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
+            lastTokenRefreshAt = Date.now();
+            await refreshGuard.run(async () => {
+              log?.warn?.(`octo: [${account.accountId}] connection rejected — refreshing IM token...`);
+              await reconnectSequencer.run("token-refresh", async () => {
+                try {
+                  await socket.disconnectAndWait();
+                  if (stopped) return; // the account can stop during any of these awaits
+                  const fresh = await registerBot({
+                    apiUrl: account.config.apiUrl,
+                    botToken: account.config.botToken!,
+                    forceRefresh: true,
+                    agentPlatform: "OpenClaw",
+                    agentVersion: getAgentVersion(),
+                    pluginVersion: PLUGIN_VERSION,
+                  });
+                  if (stopped) return;
+                  credentials = fresh;
+                  log?.info?.(`octo: [${account.accountId}] got fresh IM token, reconnecting WS...`);
+                  socket.updateCredentials(fresh.robot_id, fresh.im_token);
+                  // Stagger reconnect to avoid thundering herd when multiple bots
+                  // refresh tokens simultaneously after server-wide token expiry
+                  const staggerMs = Math.floor(Math.random() * 5000);
+                  log?.info?.(`octo: [${account.accountId}] staggering reconnect by ${staggerMs}ms`);
+                  await new Promise(r => setTimeout(r, staggerMs));
+                  if (stopped) return; // account was stopped during stagger delay
+                  socket.stopReconnectTimer();
+                  socket.connect();
+                } catch (refreshErr) {
+                  log?.error?.(`octo: [${account.accountId}] token refresh failed: ${String(refreshErr)}`);
+                  // Returning here used to end the story: needReconnect was already false and
+                  // disconnectAndWait had cleared the socket's own timer, so nothing was left
+                  // to try again and the account stayed dark until someone restarted the
+                  // process. Under a rate-limit storm /v1/bot/register is exactly as likely to
+                  // fail as the call that got us here, so this path is not hypothetical.
+                  deferredReconnect.schedule("post-register-retry");
+                }
+              });
+            });
+          } else if (!refreshGuard.isRaised() && !stopped &&
+              (err.message.includes("Kicked") || err.message.includes("Connect failed"))) {
+            // Cooldown active — skip token refresh but still reconnect with current credentials.
+            log?.warn?.(`octo: [${account.accountId}] cooldown active, scheduling reconnect with current credentials...`);
+            deferredReconnect.schedule("cooldown");
+          }
+        },
+      });
+
+      // Must stay above socket.connect(): the onError closure defined earlier captures this
+      // binding, and connect() is what can trigger onError. Moving the start-up sequence
+      // (connect / heartbeat.start / watchdog.start) above this const turns that capture into
+      // a temporal-dead-zone throw, and the else-branch call site is not inside a try.
+      const deferredReconnect = createDeferredReconnect({
+        isStopped: () => stopped,
+        sequencer: reconnectSequencer,
+        run: async () => {
+          // The wait is 5-10s, which is long enough for the connection to have come back on
+          // its own. Tearing down a socket that is already carrying traffic is the very
+          // thing this change set out to stop doing.
+          if (socket.isConnected()) return;
+          await socket.disconnectAndWait();
+          if (stopped) return; // the account can stop while the teardown above runs
+          socket.stopReconnectTimer();
+          socket.connect();
+        },
+      });
+
+      const heartbeat = createHeartbeatLoop({
+        intervalMs: account.config.heartbeatIntervalMs,
+        accountId: account.accountId,
+        send: (signal) =>
+          sendHeartbeat({
+            apiUrl: account.config.apiUrl,
+            botToken: account.config.botToken!,
+            signal,
+          }),
+        // The post-CONNACK predicate, not the readyState one: a beat sent while the socket
+        // is merely OPEN would claim a liveness the connection cannot yet deliver.
+        isConnected: () => socket.isConnected(),
+        log,
+      });
+
+      const watchdog = createConnectionWatchdog({
+        accountId: account.accountId,
+        log,
+        shouldReconnect: buildWatchdogPredicate({
+          isStopped: () => stopped,
+          isReconnectInFlight: () => reconnectSequencer.isInFlight(),
+          isConnectingOrConnected: () => socket.isConnectingOrConnected(),
+          hasPendingReconnect: () => socket.hasPendingReconnect(),
+          isRefreshingToken: () => refreshGuard.isRaised(),
+          hasDeferredReconnect: () => deferredReconnect.isPending(),
+        }),
+        reconnect: () =>
+          reconnectSequencer.run("watchdog", async () => {
+            await socket.disconnectAndWait();
+            if (stopped) return;
+            socket.stopReconnectTimer();
+            socket.connect();
+          }),
+      });
+
+      socket.connect();
+      heartbeat.start();
+      watchdog.start();
+
+      // Keep Promise pending until stopped — gateway treats resolve as "account stopped"
+      return new Promise((resolve) => {
+        const cleanup = () => {
+          if (stopped) return;
+          stopped = true;
+          socket.disconnect();
+          cardEventPoller?.stop();
+          setCardEventPollStarter(account.accountId, undefined);
+          heartbeat.stop();
+          watchdog.stop();
+          deferredReconnect.cancel();
+          stopPersonaPromptCache(account.accountId);
+          ctx.setStatus({
+            accountId: account.accountId,
+            running: false,
+            lastStopAt: Date.now(),
+          });
+          resolve({
+            stop: () => { /* already cleaned up */ },
+          });
+        };
+
+        if (ctx.abortSignal.aborted) {
+          cleanup();
+        } else {
+          ctx.abortSignal.addEventListener("abort", cleanup, { once: true });
+        }
+      });
+    },
+  },
+};

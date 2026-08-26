@@ -1,0 +1,9 @@
+/**
+ * Timestamp 组件样式
+ */
+
+.wk-msg-timestamp {
+  font-size: var(--wk-text-size-sm);
+  color: var(--wk-text-legacy-tertiary);
+  user-select: none;
+}

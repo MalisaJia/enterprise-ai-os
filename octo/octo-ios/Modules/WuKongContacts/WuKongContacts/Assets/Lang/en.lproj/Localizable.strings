@@ -1,0 +1,92 @@
+
+"联系人"="Contacts";
+"新的朋友"="New Friends";
+"保存的群聊"="Groups";
+
+"确认"="Confirm";
+"已确认"="Confirmed";
+
+"取消"="Cancel";
+
+"%ld个朋友"="%ld friends";
+
+
+// WKContactsAddMyShortCell
+
+"我的%@号：%@"="%@ ID: %@";
+
+// WKContactsAddVC
+
+"添加朋友"="Add Contacts";
+"搜索"="Search";
+"刚刚"="Just";
+"%0.0f分钟"="%0.0f Min";
+
+// WKContactsInfoVC
+
+"用户详情"="Details";
+"添加好友"="Add Contacts";
+"你需要发送验证码申请，等对方通过"="You need to send a verification code application and wait for the other party to pass";
+"我是%@"="I'm %@";
+
+// WKContactsSearchVC
+
+"用户不存在！"="User does not exist!";
+
+
+// WKContactsVM
+
+"扫一扫"="Scan";
+"扫描二维码名片"="Scan QR code business card";
+
+// WKMyGroupListVC
+
+"保存的群聊"="Saved Group";
+
+
+// WKContactsSync
+
+"同步联系人"="Sync Contacts";
+
+"手机联系人"="Address book";
+"添加通讯录中的朋友"="Add friends from address book";
+"新建群聊"="New group";
+
+// ============================================================
+// MARK: - i18n batch 2026-05: WuKongContacts 收尾
+// ============================================================
+
+// 入口 / Tab
+"AI广场"="AI Square";
+"我的AI"="My AI";
+"我的群聊"="My groups";
+"我的群组"="My groups";
+"通讯录好友"="Address book friends";
+"组织内联系人"="Organization contacts";
+"新朋友"="New friends";
+"全部"="All";
+"人类"="Human";
+
+// 列表 / 计数
+"位"=" "; // 中文计数后缀, 英文置空; 调用方拼接 "%ld位成员" 等
+"共"="Total";
+
+// 操作
+"添加"="Add";
+"已添加"="Added";
+"已添加 AI"="AI added";
+"邀请"="Invite";
+
+// 搜索 / 提示
+"搜索联系人、AI、群聊"="Search contacts, AI, groups";
+"您的通讯录暂未允许访问，是否前往设置"="Address book access not granted. Open Settings?";
+
+// MARK: - 通用 / 操作 (LLang 路由按调用方所在模块, 通用词在 WuKongBase 已有, 但联系人模块调用时必须在本模块也加)
+"提示"="Tip";
+"确定"="OK";
+"设置"="Settings";
+"修改备注"="Edit alias";
+"发送成功！"="Sent";
+
+// PR #51: Me 页"通讯录"入口在 WKContactsModule 注册, 走本模块 bundle 取词
+"通讯录"="Contacts";

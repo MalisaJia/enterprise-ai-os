@@ -1,0 +1,623 @@
+//
+//  NIMKitPhotoFetcher.m
+//  NIMKit
+//
+//  Created by chris on 2016/11/12.
+//  Copyright © 2016年 NetEase. All rights reserved.
+//
+
+#import "WKMediaPickerController.h"
+#import <MobileCoreServices/MobileCoreServices.h>
+#import <TZImagePickerController/TZImagePickerController.h>
+//#import "NIMKitProgressHUD.h"
+#import "WKFileLocationHelper.h"
+#import "WKConstant.h"
+#import "WKProgressHUD.h"
+#import "WuKongBase.h"
+#import "LBXPermissionSetting.h"
+#import "NSData+ImageFormat.h"
+#import "UIImage+Compression.h"
+//#import <ZLPhotoBrowser/ZLPhotoBrowser.h>
+
+@interface WKMediaPickerController : TZImagePickerController <UINavigationControllerDelegate>
+
+@end
+
+@implementation WKMediaPickerController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.delegate = self; // 监听 push/show，兜底覆盖 leftBarButtonItem
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    [UIApplication sharedApplication].statusBarStyle =  UIStatusBarStyleDefault;
+}
+
+#pragma mark - UINavigationControllerDelegate
+
+// 兜底覆盖：每次 push/show 完成后，强制给非 root 的 child VC 设 leftBarButtonItem
+// 这一步独立于 navLeftBarButtonSettingBlock，无论 TZ 内部走哪条 backBarButton 分支都能稳定显示。
+- (void)navigationController:(UINavigationController *)navigationController
+       didShowViewController:(UIViewController *)viewController
+                    animated:(BOOL)animated {
+    if (self.viewControllers.firstObject == viewController) {
+        return; // root vc 不显示返回按钮
+    }
+    UIButton *leftBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    leftBtn.frame = CGRectMake(0, 0, 44, 44);
+    UIImage *icon = nil;
+    if (@available(iOS 13.0, *)) {
+        icon = [UIImage systemImageNamed:@"chevron.backward"];
+    }
+    UIColor *tint = self.navigationBar.tintColor ?: ([WKApp shared].config.themeColor ?: [UIColor systemBlueColor]);
+    if (icon) {
+        [leftBtn setImage:[icon imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+        leftBtn.imageView.contentMode = UIViewContentModeScaleAspectFit;
+        leftBtn.contentEdgeInsets = UIEdgeInsetsMake(8, 0, 8, 12);
+    } else {
+        [leftBtn setTitle:LLang(@"返回") forState:UIControlStateNormal];
+        [leftBtn setTitleColor:tint forState:UIControlStateNormal];
+        leftBtn.titleLabel.font = [UIFont systemFontOfSize:16.0f];
+    }
+    leftBtn.tintColor = tint;
+    [leftBtn addTarget:self action:@selector(_wkPickerBackTapped) forControlEvents:UIControlEventTouchUpInside];
+    viewController.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:leftBtn];
+}
+
+- (void)_wkPickerBackTapped {
+    if (self.viewControllers.count > 1) {
+        [self popViewControllerAnimated:YES];
+    } else {
+        [self dismissViewControllerAnimated:YES completion:nil];
+    }
+}
+
+- (void)dealloc
+{
+}
+
+@end
+
+@interface WKMediaFetcher()<TZImagePickerControllerDelegate,UINavigationControllerDelegate,UIImagePickerControllerDelegate>
+
+@property (nonatomic,copy)   WKLibraryFetchResult libraryResultHandler;
+
+@property (nonatomic,copy)   WKCameraFetchResult  cameraResultHandler;
+
+@property (nonatomic,strong) UIImagePickerController  *imagePicker;
+
+@property (nonatomic,weak) WKMediaPickerController  *assetsPicker;
+
+@end
+
+@implementation WKMediaFetcher
+
+- (instancetype)init
+{
+    self = [super init];
+    if (self) {
+        _mediaTypes = @[(NSString *)kUTTypeMovie,(NSString *)kUTTypeImage];
+        _limit = 9;
+        _allowTakePicture = YES;
+    }
+    return self;
+}
+
+-(void) dealloc {
+}
+
+
+- (void)fetchPhotoFromLibrary:(WKLibraryFetchResult)result cancel:(void (^)(void))cancel
+{
+    
+
+    __weak typeof(self) weakSelf = self;
+    [self setUpPhotoLibrary:^(WKMediaPickerController * _Nullable picker) {
+        if (picker && weakSelf) {
+            weakSelf.assetsPicker = picker;
+            weakSelf.assetsPicker.imagePickerControllerDidCancelHandle = ^{
+                if(cancel) {
+                    cancel();
+                }
+            };
+            weakSelf.libraryResultHandler = result;
+            [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:picker animated:YES completion:nil];
+            
+        }else{
+            result(nil,nil,nil,PHAssetMediaTypeUnknown,0);
+        }
+    }];
+}
+
+- (void)fetchPhotoFromLibrary:(WKLibraryFetchResult)result {
+    [self fetchPhotoFromLibrary:result cancel:nil];
+}
+
+- (void)fetchPhotoFromLibraryOfCompress:(void(^)(NSData *imageData,NSString *path,bool isSelectOriginalPhoto, PHAssetMediaType type,NSInteger left))result cancel:(void (^)(void))cancel {
+    
+    __weak typeof(self) weakSelf = self;
+    [self fetchPhotoFromLibrary:^(UIImage *img, NSString *path,bool isSelectOriginalPhoto, PHAssetMediaType type, NSInteger left) {
+        NSData *imageData;
+        switch (type) {
+            case PHAssetMediaTypeImage:{
+                if (path) {
+                    imageData = [[NSData alloc] initWithContentsOfFile:path];
+                    if(isSelectOriginalPhoto) {
+                        if ([path.pathExtension isEqualToString:@"HEIC"]){
+                            if (@available(iOS 13.0, *)) {
+                                UIImage * originImage =  [[SDImageHEICCoder sharedCoder] decodedImageWithData:[[NSData alloc] initWithContentsOfFile:path] options:@{SDImageCoderEncodeCompressionQuality:@(0.9)}];
+                                result(UIImagePNGRepresentation(originImage),path,isSelectOriginalPhoto,type,left);
+                                return;
+                            }
+                        }else{
+                            result(imageData,path,isSelectOriginalPhoto,type,left);
+                        }
+                        
+                    }else {
+                        JLImageFormat format = [NSData jl_imageFormatWithImageData:imageData];
+                        UIImage *image = [[UIImage alloc] initWithData:imageData];
+                        if(format == JLImageFormatGIF)  {
+                            [UIImage jl_compressWithImageGIF:imageData targetSize:image.size targetByte:[WKApp shared].config.imageMaxLimitBytes handler:^(NSData * _Nullable compressedData, CGSize gifImageSize, NSError * _Nullable error) {
+                                if(error) {
+                                    [[WKNavigationManager shared].topViewController.view showMsg:LLangW(@"图片压缩错误！",weakSelf)];
+                                    return;
+                                }
+                                result(imageData,path,isSelectOriginalPhoto,type,left);
+                                
+                            }];
+                        }else {
+                            NSData *imgData = [UIImage jl_compressImageSize:image toByte:[WKApp shared].config.imageMaxLimitBytes];
+                            result(imgData,path,isSelectOriginalPhoto,type,left);
+                        }
+                    }
+                    
+                }else if(img) {
+                    NSData *imgData  = [UIImage jl_compressImageSize:img toByte:[WKApp shared].config.imageMaxLimitBytes];
+                    result(imgData,path,isSelectOriginalPhoto,type,left);
+                }
+                break;
+            }
+            default:{
+                result(imageData,path,isSelectOriginalPhoto,type,left);
+            }
+        }
+    } cancel:cancel];
+}
+
+
+
+- (void)fetchMediaFromCamera:(WKCameraFetchResult)result
+{
+    if ([self initCamera]) {
+        self.cameraResultHandler = result;
+#if TARGET_IPHONE_SIMULATOR
+        NSAssert(0, @"not supported");
+#elif TARGET_OS_IPHONE
+        self.imagePicker.cameraCaptureMode = UIImagePickerControllerCameraCaptureModePhoto;
+        self.imagePicker.videoQuality = UIImagePickerControllerQualityTypeHigh;
+        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:self.imagePicker animated:YES completion:nil];
+#endif
+    }
+}
+
+
+- (void)setUpPhotoLibrary:(void(^)(WKMediaPickerController * _Nullable picker)) handler
+{
+    __weak typeof(self) weakSelf = self;
+
+    void (^showPicker)(void) = ^{
+        WKMediaPickerController *vc = [[WKMediaPickerController alloc] initWithMaxImagesCount:weakSelf.limit delegate:weakSelf];
+
+        // 配色策略（同步深浅模式）：
+        //   bg     = systemBackground（浅色白 / 深色黑）
+        //   title  = label（浅色黑 / 深色白）
+        //   item   = app 主题紫，紫色对黑/白底都有足够对比，深浅模式下都看得清
+        // 之前只设了 barItemTextColor 没设 navigationBar.tintColor，
+        // 导致左上角系统 cancel 按钮颜色跟随系统默认 tint，跟背景容易"几乎一样"。
+        UIColor *navBg;
+        UIColor *navTitle;
+        if (@available(iOS 13.0, *)) {
+            navBg = [UIColor systemBackgroundColor];
+            navTitle = [UIColor labelColor];
+        } else {
+            navBg = [UIColor whiteColor];
+            navTitle = [UIColor blackColor];
+        }
+        UIColor *itemColor = [WKApp shared].config.themeColor ?: [UIColor systemBlueColor];
+
+        // TZImagePickerController.bundle 在当前集成方式下没被复制到 app（resources.sh 里没它），
+        // 所以 [NSBundle tz_imagePickerBundle] 返回 nil，内部所有 tz_localizedStringForKey: 都返回空串
+        // → 左上角 backBarButton 的 title 是 ""，系统只画 chevron 图标但 normal 状态下经常看不清，
+        //    必须长按高亮才能看到 → 这里显式覆盖按钮文案 + 用 navLeftBarButtonSettingBlock 自绘左按钮。
+        vc.cancelBtnTitleStr     = LLangW(@"取消", weakSelf);
+        vc.doneBtnTitleStr       = LLangW(@"完成", weakSelf);
+        vc.previewBtnTitleStr    = LLangW(@"预览", weakSelf);
+        vc.fullImageBtnTitleStr  = LLangW(@"原图", weakSelf);
+
+        // 自绘左上角按钮：图片网格页是 child[1]，TZ 会在 navLeftBarButtonSettingBlock 存在时
+        // 用 customView 替换系统 backBarButton；click 默认走 navLeftBarButtonClick → pop 回相册分类列表
+        UIColor *leftBtnColor = itemColor;
+        vc.navLeftBarButtonSettingBlock = ^(UIButton *leftButton) {
+            UIImage *icon = nil;
+            if (@available(iOS 13.0, *)) {
+                icon = [UIImage systemImageNamed:@"chevron.backward"];
+            }
+            if (icon) {
+                [leftButton setImage:[icon imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+                leftButton.tintColor = leftBtnColor;
+                leftButton.imageView.contentMode = UIViewContentModeScaleAspectFit;
+                leftButton.contentEdgeInsets = UIEdgeInsetsMake(8, 0, 8, 12); // 左对齐 + 增加点击区
+            } else {
+                // iOS 12 fallback：用文字
+                [leftButton setTitle:LLangW(@"返回", weakSelf) forState:UIControlStateNormal];
+                [leftButton setTitleColor:leftBtnColor forState:UIControlStateNormal];
+                leftButton.titleLabel.font = [UIFont systemFontOfSize:16.0f];
+            }
+        };
+
+        vc.naviBgColor = navBg;
+        vc.naviTitleColor = navTitle;
+        vc.barItemTextColor = itemColor;
+        vc.navigationBar.tintColor = itemColor; // system bar items（cancel/back）走 tintColor
+        vc.navigationBar.barStyle = UIBarStyleDefault;
+
+        vc.allowTakePicture = weakSelf.allowTakePicture;
+        vc.allowPickingVideo = [weakSelf.mediaTypes containsObject:(NSString *)kUTTypeMovie];
+        if(handler) handler(vc);
+    };
+
+    void (^showDenied)(void) = ^{
+        [LBXPermissionSetting showAlertToDislayPrivacySettingWithTitle:LLangW(@"提示",weakSelf) msg:LLangW(@"没有相册权限，是否前往设置",weakSelf) cancel:LLangW(@"取消",weakSelf) setting:LLangW(@"设置",weakSelf)];
+        if(handler) handler(nil);
+    };
+
+    if (@available(iOS 14, *)) {
+        [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelReadWrite handler:^(PHAuthorizationStatus status) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (status == PHAuthorizationStatusAuthorized || status == PHAuthorizationStatusLimited) {
+                    showPicker();
+                } else {
+                    showDenied();
+                }
+            });
+        }];
+    } else {
+        [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus status) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (status == PHAuthorizationStatusAuthorized) {
+                    showPicker();
+                } else {
+                    showDenied();
+                }
+            });
+        }];
+    }
+}
+
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary *)info
+{
+    __weak typeof(self) weakSelf = self;
+    NSString *mediaType = info[UIImagePickerControllerMediaType];
+    if ([mediaType isEqualToString:(NSString *)kUTTypeMovie]) {
+        
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            NSURL *inputURL  = [info objectForKey:UIImagePickerControllerMediaURL];
+            NSString *outputFileName = [WKFileLocationHelper genFilenameWithExt:@"mp4"];
+            NSString *outputPath = [WKFileLocationHelper filepathForVideo:outputFileName];
+            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:inputURL options:nil];
+            AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:asset
+                                                                             presetName:AVAssetExportPresetMediumQuality];
+            session.outputURL = [NSURL fileURLWithPath:outputPath];
+            session.outputFileType = AVFileTypeMPEG4;   // 支持安卓某些机器的视频播放
+            session.shouldOptimizeForNetworkUse = YES;
+            session.videoComposition = [weakSelf getVideoComposition:asset];  //修正某些播放器不识别视频Rotation的问题
+            [session exportAsynchronouslyWithCompletionHandler:^(void)
+             {
+                 dispatch_async(dispatch_get_main_queue(), ^{
+                     if (session.status == AVAssetExportSessionStatusCompleted)
+                     {
+                         weakSelf.cameraResultHandler(outputPath,nil);
+                     }
+                     else
+                     {
+                         weakSelf.cameraResultHandler(nil,nil);
+                     }
+                     weakSelf.cameraResultHandler = nil;
+                 });
+             }];
+            
+        });
+        
+    }else{
+        UIImage *image = info[UIImagePickerControllerOriginalImage];
+        weakSelf.cameraResultHandler(nil,image);
+        weakSelf.cameraResultHandler = nil;
+    }
+    [picker dismissViewControllerAnimated:YES completion:nil];
+}
+
+
+#pragma mark - 相册回调
+- (void)imagePickerController:(TZImagePickerController *)picker didFinishPickingPhotos:(NSArray<UIImage *> *)photos sourceAssets:(NSArray *)assets isSelectOriginalPhoto:(BOOL)isSelectOriginalPhoto infos:(NSArray<NSDictionary *> *)infos
+{
+    
+    __weak typeof(self) weakSelf = self;
+    [self requestAssets:[assets mutableCopy] isSelectOriginalPhoto:isSelectOriginalPhoto result:^(UIImage *img,NSString *path, bool isSelectOriginalPhoto, PHAssetMediaType type, NSInteger left) {
+        if(weakSelf.libraryResultHandler) {
+            PHAssetMediaType mediaType = type;
+            if(photos && photos.count>0) {
+                mediaType = PHAssetMediaTypeImage;
+            }
+            weakSelf.libraryResultHandler(photos&& photos.count>=assets.count-left?photos[assets.count-left-1]:nil,path,isSelectOriginalPhoto,mediaType,left);
+           
+        }
+    }];
+}
+
+- (void)imagePickerController:(TZImagePickerController *)picker didFinishPickingVideo:(UIImage *)coverImage sourceAssets:(id)asset{
+    NSMutableArray *items = [[NSMutableArray alloc] initWithArray:@[asset]];
+    [self requestAssets:items isSelectOriginalPhoto:false result:self.libraryResultHandler];
+}
+
+- (void)requestAssets:(NSMutableArray *)assets isSelectOriginalPhoto:(BOOL) isSelectOriginalPhoto result:(WKLibraryFetchResult)result
+{
+    if (!assets.count) {
+        return;
+    }
+    
+    __weak typeof(self) weakSelf = self;
+    [WKProgressHUD show];
+    [self requestAsset:assets.firstObject handler:^(NSString *path, PHAssetMediaType type) {
+        [WKProgressHUD dismiss];
+        if (result)
+        {
+            result(nil,path,isSelectOriginalPhoto,type,assets.count-1);
+        }
+        WK_Dispatch_Async_Main(^{
+            [assets removeObjectAtIndex:0];
+            [weakSelf requestAssets:assets isSelectOriginalPhoto:isSelectOriginalPhoto result:result];
+        })
+        
+    }];
+}
+
+
+- (void)requestAsset:(PHAsset *)asset  handler:(void(^)(NSString *,PHAssetMediaType)) handler
+{
+    if (asset.mediaType == PHAssetMediaTypeVideo) {
+        
+        PHVideoRequestOptions *options = [[PHVideoRequestOptions alloc] init];
+        options.version = PHVideoRequestOptionsVersionCurrent;
+        options.deliveryMode = PHVideoRequestOptionsDeliveryModeFastFormat;
+        options.networkAccessAllowed = YES;
+        
+        [[PHImageManager defaultManager] requestExportSessionForVideo:asset options:options exportPreset:AVAssetExportPreset640x480 resultHandler:^(AVAssetExportSession * _Nullable exportSession, NSDictionary * _Nullable info) {
+            
+            NSString *outputFileName = [WKFileLocationHelper genFilenameWithExt:@"mp4"];
+            NSString *outputPath = [WKFileLocationHelper filepathForVideo:outputFileName];
+            
+            exportSession.outputURL = [NSURL fileURLWithPath:outputPath];
+            exportSession.outputFileType = AVFileTypeMPEG4;
+            exportSession.shouldOptimizeForNetworkUse = YES;
+            [exportSession exportAsynchronouslyWithCompletionHandler:^(void)
+             {
+                 dispatch_async(dispatch_get_main_queue(), ^{
+                     if (exportSession.status == AVAssetExportSessionStatusCompleted)
+                     {
+                         handler(outputPath, PHAssetMediaTypeVideo);
+                     }
+                     else
+                     {
+                         handler(nil,PHAssetMediaTypeVideo);
+                     }
+                 });
+             }];
+        }];
+    }
+    
+    if (asset.mediaType == PHAssetMediaTypeImage)
+    {
+        [asset requestContentEditingInputWithOptions:nil completionHandler:^(PHContentEditingInput * _Nullable contentEditingInput, NSDictionary * _Nonnull info) {
+            NSString *path = contentEditingInput.fullSizeImageURL.relativePath;
+            handler(path,contentEditingInput.mediaType);
+        }];
+    }
+    
+}
+
+#pragma mark - Private
+
+- (void)setMediaTypes:(NSArray *)mediaTypes
+{
+    _mediaTypes = mediaTypes;
+    _imagePicker.mediaTypes = mediaTypes;
+    _assetsPicker.allowPickingVideo = [mediaTypes containsObject:(NSString *)kUTTypeMovie];
+}
+
+- (AVMutableVideoComposition *)getVideoComposition:(AVAsset *)asset
+{
+    AVAssetTrack *videoTrack = [[asset tracksWithMediaType:AVMediaTypeVideo] objectAtIndex:0];
+    AVMutableComposition *composition = [AVMutableComposition composition];
+    AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
+    CGSize videoSize = videoTrack.naturalSize;
+    BOOL isPortrait_ = [self isVideoPortrait:asset];
+    if(isPortrait_) {
+        videoSize = CGSizeMake(videoSize.height, videoSize.width);
+    }
+    composition.naturalSize     = videoSize;
+    videoComposition.renderSize = videoSize;
+    
+    videoComposition.frameDuration = CMTimeMakeWithSeconds( 1 / videoTrack.nominalFrameRate, 600);
+    AVMutableCompositionTrack *compositionVideoTrack;
+    compositionVideoTrack = [composition addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
+    [compositionVideoTrack insertTimeRange:CMTimeRangeMake(kCMTimeZero, asset.duration) ofTrack:videoTrack atTime:kCMTimeZero error:nil];
+    AVMutableVideoCompositionLayerInstruction *layerInst;
+    layerInst = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:videoTrack];
+    [layerInst setTransform:videoTrack.preferredTransform atTime:kCMTimeZero];
+    AVMutableVideoCompositionInstruction *inst = [AVMutableVideoCompositionInstruction videoCompositionInstruction];
+    inst.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
+    inst.layerInstructions = [NSArray arrayWithObject:layerInst];
+    videoComposition.instructions = [NSArray arrayWithObject:inst];
+    return videoComposition;
+}
+
+- (BOOL) isVideoPortrait:(AVAsset *)asset
+{
+    BOOL isPortrait = NO;
+    NSArray *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+    if([tracks    count] > 0) {
+        AVAssetTrack *videoTrack = [tracks objectAtIndex:0];
+        
+        CGAffineTransform t = videoTrack.preferredTransform;
+        // Portrait
+        if(t.a == 0 && t.b == 1.0 && t.c == -1.0 && t.d == 0)
+        {
+            isPortrait = YES;
+        }
+        // PortraitUpsideDown
+        if(t.a == 0 && t.b == -1.0 && t.c == 1.0 && t.d == 0)  {
+            
+            isPortrait = YES;
+        }
+        // LandscapeRight
+        if(t.a == 1.0 && t.b == 0 && t.c == 0 && t.d == 1.0)
+        {
+            isPortrait = NO;
+        }
+        // LandscapeLeft
+        if(t.a == -1.0 && t.b == 0 && t.c == 0 && t.d == -1.0)
+        {
+            isPortrait = NO;
+        }
+    }
+    return isPortrait;
+}
+
+- (BOOL)initCamera{
+    if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeCamera]) {
+        [[[UIAlertView alloc] initWithTitle:nil
+                                    message:LLang(@"检测不到相机设备")
+                                   delegate:nil
+                          cancelButtonTitle:LLang(@"确定")
+                          otherButtonTitles:nil] show];
+        return NO;
+    }
+    NSString *mediaType = AVMediaTypeVideo;
+    AVAuthorizationStatus authStatus = [AVCaptureDevice authorizationStatusForMediaType:mediaType];
+    if(authStatus == AVAuthorizationStatusRestricted || authStatus == AVAuthorizationStatusDenied){
+        [[[UIAlertView alloc] initWithTitle:nil
+                                    message:LLang(@"相机权限受限")
+                                   delegate:nil
+                          cancelButtonTitle:LLang(@"确定")
+                          otherButtonTitles:nil] show];
+        return NO;
+        
+    }
+    self.imagePicker = [[UIImagePickerController alloc] init];
+    self.imagePicker.delegate = self;
+    self.imagePicker.sourceType = UIImagePickerControllerSourceTypeCamera;
+    self.imagePicker.mediaTypes = self.mediaTypes;
+    return YES;
+}
+
+- (void)originalPhotoWithAsset:(id)asset completion:(void (^)(UIImage *photo,NSDictionary *info,BOOL isDegraded))completion {
+    PHImageRequestOptions *option = [[PHImageRequestOptions alloc]init];
+    option.networkAccessAllowed = YES;
+    option.synchronous = YES;
+    [[PHImageManager defaultManager] requestImageForAsset:asset targetSize:PHImageManagerMaximumSize contentMode:PHImageContentModeAspectFit options:option resultHandler:^(UIImage * _Nullable result, NSDictionary * _Nullable info) {
+        BOOL downloadFinined = (![[info objectForKey:PHImageCancelledKey] boolValue] && ![info objectForKey:PHImageErrorKey]);
+        if (downloadFinined && result) {
+            result = [self fixOrientation:result];
+            BOOL isDegraded = [[info objectForKey:PHImageResultIsDegradedKey] boolValue];
+            if (completion) completion(result,info,isDegraded);
+        }
+    }];
+}
+
+
+/// 修正图片转向
+- (UIImage *)fixOrientation:(UIImage *)aImage {
+    
+    // No-op if the orientation is already correct
+    if (aImage.imageOrientation == UIImageOrientationUp)
+        return aImage;
+    
+    // We need to calculate the proper transformation to make the image upright.
+    // We do it in 2 steps: Rotate if Left/Right/Down, and then flip if Mirrored.
+    CGAffineTransform transform = CGAffineTransformIdentity;
+    
+    switch (aImage.imageOrientation) {
+        case UIImageOrientationDown:
+        case UIImageOrientationDownMirrored:
+            transform = CGAffineTransformTranslate(transform, aImage.size.width, aImage.size.height);
+            transform = CGAffineTransformRotate(transform, M_PI);
+            break;
+            
+        case UIImageOrientationLeft:
+        case UIImageOrientationLeftMirrored:
+            transform = CGAffineTransformTranslate(transform, aImage.size.width, 0);
+            transform = CGAffineTransformRotate(transform, M_PI_2);
+            break;
+            
+        case UIImageOrientationRight:
+        case UIImageOrientationRightMirrored:
+            transform = CGAffineTransformTranslate(transform, 0, aImage.size.height);
+            transform = CGAffineTransformRotate(transform, -M_PI_2);
+            break;
+        default:
+            break;
+    }
+    
+    switch (aImage.imageOrientation) {
+        case UIImageOrientationUpMirrored:
+        case UIImageOrientationDownMirrored:
+            transform = CGAffineTransformTranslate(transform, aImage.size.width, 0);
+            transform = CGAffineTransformScale(transform, -1, 1);
+            break;
+            
+        case UIImageOrientationLeftMirrored:
+        case UIImageOrientationRightMirrored:
+            transform = CGAffineTransformTranslate(transform, aImage.size.height, 0);
+            transform = CGAffineTransformScale(transform, -1, 1);
+            break;
+        default:
+            break;
+    }
+    
+    // Now we draw the underlying CGImage into a new context, applying the transform
+    // calculated above.
+    CGContextRef ctx = CGBitmapContextCreate(NULL, aImage.size.width, aImage.size.height,
+                                             CGImageGetBitsPerComponent(aImage.CGImage), 0,
+                                             CGImageGetColorSpace(aImage.CGImage),
+                                             CGImageGetBitmapInfo(aImage.CGImage));
+    CGContextConcatCTM(ctx, transform);
+    switch (aImage.imageOrientation) {
+        case UIImageOrientationLeft:
+        case UIImageOrientationLeftMirrored:
+        case UIImageOrientationRight:
+        case UIImageOrientationRightMirrored:
+            // Grr...
+            CGContextDrawImage(ctx, CGRectMake(0,0,aImage.size.height,aImage.size.width), aImage.CGImage);
+            break;
+            
+        default:
+            CGContextDrawImage(ctx, CGRectMake(0,0,aImage.size.width,aImage.size.height), aImage.CGImage);
+            break;
+    }
+    
+    // And now we just create a new UIImage from the drawing context
+    CGImageRef cgimg = CGBitmapContextCreateImage(ctx);
+    UIImage *img = [UIImage imageWithCGImage:cgimg];
+    CGContextRelease(ctx);
+    CGImageRelease(cgimg);
+    return img;
+}
+#pragma clang diagnostic pop
+
+@end
+
+
+

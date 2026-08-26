@@ -1,0 +1,495 @@
+# CI pipeline for octo-server
+# Runs on every pull request targeting main or release/** branches.
+# Designed to be used as required status checks in branch rulesets.
+
+name: CI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
+    # converted_to_draft is kept intentionally: it creates "skipped" check entries
+    # that satisfy required-check branch-protection rules when a PR is demoted
+    # back to draft, preventing stale "pending" statuses from the last real push.
+    branches:
+      - main
+      - 'release/**'
+    # paths-ignore is intentionally NOT set here — workflow-level path filtering
+    # prevents GitHub from creating any check run, which deadlocks required-status
+    # checks on docs-only PRs. Path-based skipping is handled by the `changes`
+    # preflight job below instead (dorny/paths-filter produces "skipped" statuses
+    # that GitHub counts as passing for required checks).
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".github/ISSUE_TEMPLATE/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.25.x'
+
+jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      # code=true when at least one changed file matches the code filter.
+      # predicate-quantifier:every + negation patterns (no bare '**'):
+      # a file matches 'code' iff ALL negation patterns are satisfied
+      # (file is not a doc/template). code=false only when all changed files
+      # are docs/templates. Push events default to 'true'.
+      code: ${{ github.event_name == 'pull_request' && steps.filter.outputs.code || 'true' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@6852f92c20ea7fd3b0c25de3b5112db3a98da050 # v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # predicate-quantifier: every — a file matches 'code' only when ALL
+          # negation patterns are satisfied (file is NOT a doc/template file).
+          #
+          # Validated by picomatch v4 unit test (same library used internally):
+          #   README.md:    !**/*.md=false → every=false → not match → code=false ✅
+          #   main.go:      all negations=true → every=true → match → code=true ✅
+          #   mixed PR:     main.go matches → code=true (some over changed files) ✅
+          #   .golangci.yml: all negations=true → every=true → CI runs ✅
+          #   Dockerfile:   all negations=true → CI runs ✅
+          #
+          # Do NOT add '**': picomatch('**') doesn't match dotfiles (.golangci.yml)
+          # causing them to incorrectly skip CI with the 'every' quantifier.
+          # Do NOT use 'some' + negation: '**' short-circuits some to true always.
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '!**/*.md'
+              - '!docs/**'
+              - '!.github/ISSUE_TEMPLATE/**'
+
+
+  build:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build
+        run: CGO_ENABLED=0 go build -v ./...
+
+  unit-test:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: Unit Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            go.sum
+            .github/go-cache-key/unit-test
+
+      - name: Run unit tests
+        run: ci/run-unit-tests.sh
+
+  e2e-test:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: E2E Test (${{ matrix.shard }}/${{ matrix.total }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+        total: [4]
+    # MySQL, Redis, and WuKongIM are required by E2E/integration-style tests.
+    # Tests hardcode 127.0.0.1:3306 (root/demo/test), 127.0.0.1:6379, and
+    # octo-lib's default WuKongIM API URL http://127.0.0.1:5001 — see
+    # github.com/Mininglamp-OSS/octo-lib/testutil.NewTestServer and config.New.
+    # Each matrix shard gets an independent runner and service set.
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: demo
+          MYSQL_DATABASE: test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pdemo"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      wukongim:
+        # Keep this pinned. WuKongIM tags have changed manager-token and
+        # tokenAuthOn behavior across releases; this tag is the docker
+        # stack's validated baseline.
+        image: wukongim/wukongim:v2.2.4-20260313
+        env:
+          WK_MODE: debug
+          # Tests use octo-lib's default empty manager token. Disable IM
+          # token auth explicitly so /channel and /health are reachable
+          # from the runner without test-specific config files.
+          WK_TOKENAUTHON: "false"
+          WK_EXTERNAL_IP: 127.0.0.1
+          WK_EXTERNAL_WSADDR: ws://127.0.0.1:5200
+        ports:
+          - 5001:5001
+          - 5100:5100
+          - 5200:5200
+        options: >-
+          --health-cmd="wget -q -O - http://127.0.0.1:5001/health >/dev/null 2>&1 || wget -q -O - http://127.0.0.1:5001/varz >/dev/null 2>&1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+          --health-start-period=40s
+    env:
+      # common.Setup (post 2026-05) refuses to boot without a 32-byte master
+      # key; see modules/user/main_test.go for the same pattern. Use a fixed
+      # 32-char value here so re-runs are reproducible (the value is
+      # ephemeral CI-only and never used outside tests).
+      OCTO_MASTER_KEY: 0123456789abcdef0123456789abcdef
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: |
+            go.sum
+            .github/go-cache-key/e2e-test
+
+      - name: Wait for MySQL
+        # mysql:8.0 defaults the server collation to utf8mb4_0900_ai_ci, but
+        # we recreate the `test` database with utf8mb4_general_ci before
+        # every package below — that is the canonical collation in
+        # db/sqls (see modules/base/sql/20260512000001_base_oss_compat_repair.sql,
+        # which proactively ALTERs sixteen tables to general_ci to escape
+        # the 8.0 default). Tables created without explicit COLLATE inherit
+        # the database default; using general_ci keeps them aligned with
+        # the rest of the schema and avoids "Illegal mix of collations".
+        #
+        # The client runs inside the service container rather than on the
+        # runner. mysql:8.0 ships mysqladmin, so there is nothing to install
+        # and no network dependency between the runner and a package mirror.
+        #
+        # Two probes, because the in-container ping alone would be a weaker gate
+        # than the runner-side client it replaced: it proves mysqld is up, but
+        # the Go tests connect from the runner to the published 127.0.0.1:3306,
+        # and a ping on the container's own loopback can pass while that mapping
+        # is not serving yet. The bash /dev/tcp probe covers the published port
+        # without reintroducing a client on the runner.
+        env:
+          MYSQL_CID: ${{ job.services.mysql.id }}
+        run: |
+          # This is the first consumer of the id, so it has to be the one that
+          # names an unresolved one. A service rename empties the context
+          # property silently, and `docker exec "" ...` fails instantly, so
+          # without this the loop would burn its full 60s and then report
+          # "mysql did not become ready" — the wrong cause, which is the exact
+          # diagnose-the-symptom failure this lane was cleaned up to stop.
+          [ -n "$MYSQL_CID" ] || {
+            echo "::error title=Missing service container id::MYSQL_CID is empty; job.services.mysql.id did not resolve" >&2
+            exit 1
+          }
+          for _ in $(seq 1 30); do
+            if docker exec "$MYSQL_CID" mysqladmin ping -h 127.0.0.1 -uroot -pdemo --silent \
+              && timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3306' 2>/dev/null; then
+              echo "mysql ready (server up, published port reachable)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "mysql did not become ready" >&2
+          exit 1
+
+      - name: Raise MySQL max_connections
+        # Flaky "Error 1040: Too many connections" guard (#419).
+        #
+        # testutil.NewTestServer (octo-lib) builds a fresh *config.Context per
+        # call, each lazily opening its own *sql.DB pool sized 100 max / 10 idle
+        # (config.New() default — hardcoded, NOT env-tunable) with a 4h conn
+        # lifetime and no idle-reap. Nothing closes those pools, so a heavy
+        # package that calls NewTestServer dozens of times (modules/user ≈ 34)
+        # accumulates ~8 lingering connections per call and intermittently
+        # exhausts the mysql:8.0 default max_connections=151 — whichever test is
+        # unlucky under -shuffle=on then panics. Reproduced locally: the suite
+        # crosses 151 around the 19th NewTestServer call; at a 1000 ceiling it
+        # plateaus near the observed peak (~300) and stays green.
+        #
+        # max_connections is a dynamic GLOBAL, so set it at runtime (root is
+        # available inside the service container). This unblocks every package
+        # at once; the proper O(1) fix — idle-reap in octo-lib testutil — is
+        # tracked upstream.
+        env:
+          MYSQL_CID: ${{ job.services.mysql.id }}
+        run: |
+          [ -n "$MYSQL_CID" ] || {
+            echo "::error title=Missing service container id::MYSQL_CID is empty; job.services.mysql.id did not resolve" >&2
+            exit 1
+          }
+          docker exec "$MYSQL_CID" mysql -h 127.0.0.1 -uroot -pdemo -e "SET GLOBAL max_connections = 1000;"
+
+      - name: Wait for WuKongIM
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5001/health >/dev/null || curl -fsS http://127.0.0.1:5001/varz >/dev/null; then
+              echo "wukongim ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "wukongim did not become ready" >&2
+          exit 1
+
+      - name: Run E2E shard
+        # NOTE (issue #557 / integration build tag): this lane runs the DEFAULT
+        # build (NO `-tags integration`). It intentionally does NOT enable the
+        # `//go:build integration` suite, and here is the load-bearing reason —
+        # do not "just add -tags integration" without addressing it first:
+        #   The integration-tagged tests (modules/conversation_ext/*, and the
+        #   modules/message/*_integration/e2e files that call newSidebarIntegCtx)
+        #   connect to a SEPARATE database `conv_ext_test` with `Migration=false`
+        #   and assume its schema is pre-baked (they run `DeleteFrom(table)`
+        #   before any CREATE — see conversation_ext/service_test.go). This job
+        #   provisions and (re)creates only the `test` database below; it never
+        #   creates `conv_ext_test`, so `go test -tags integration ./...` would
+        #   fail at connect/DeleteFrom. Enabling the full integration suite
+        #   therefore requires FIRST provisioning `conv_ext_test` with its schema
+        #   loaded (the dmworkim `make env-test` path) — a maintainer decision,
+        #   flagged for human confirmation, NOT a blind flag flip here.
+        #   The #557 read-side regression is instead covered WITHOUT the tag by
+        #   modules/message/issue557_creator_thread_e2e_test.go, which creates
+        #   its own isolated DB from this job's MySQL and thus runs in THIS lane
+        #   (it skips cleanly when WuKongIM is unreachable).
+        #
+        # `testutil.NewTestServer` runs sql-migrate against the shared `test`
+        # database during module.Setup, registering each migration in
+        # gorp_migrations. When `go test ./...` walks packages sequentially,
+        # the next package's module set may NOT include some migrations
+        # registered by the previous package — sql-migrate then aborts with
+        # `unknown migration in database`. The cleanest fix is to drop and
+        # recreate the database between packages so each one starts from a
+        # clean migration ledger. We also force utf8mb4_general_ci so legacy
+        # CREATE TABLE statements that omit COLLATE inherit the canonical
+        # collation (mysql:8.0 server default is utf8mb4_0900_ai_ci, which
+        # would mix-collation-crash JOINs in space migrations).
+        #
+        # Individual tests known broken by the OCTO migration carry a
+        # `t.Skip("OCTO migration TODO: ...issues/17")` marker in-source
+        # — see issue #17 for the cleanup tracker. Grep for `OCTO migration
+        # TODO` to find the suppressed tests.
+        #
+        # The per-package reset reaches mysql/redis through these container
+        # ids instead of runner-local clients; see ci/run-e2e-shard.sh.
+        env:
+          MYSQL_CID: ${{ job.services.mysql.id }}
+          REDIS_CID: ${{ job.services.redis.id }}
+        run: ci/run-e2e-shard.sh "${{ matrix.shard }}" "${{ matrix.total }}"
+
+  test:
+    needs: [changes, unit-test, e2e-test]
+    if: always()
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CHANGES_RESULT: ${{ needs.changes.result }}
+      CODE_CHANGED: ${{ needs.changes.outputs.code }}
+      IS_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft || false }}
+      UNIT_RESULT: ${{ needs.unit-test.result }}
+      E2E_RESULT: ${{ needs.e2e-test.result }}
+    steps:
+      - name: Aggregate split test results
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error title=Test preflight failed::changes job result was $CHANGES_RESULT"
+            exit 1
+          fi
+          if [ "$IS_DRAFT" = "true" ] || [ "$CODE_CHANGED" != "true" ]; then
+            echo "Split tests intentionally skipped: draft=$IS_DRAFT code_changed=$CODE_CHANGED"
+            exit 0
+          fi
+          if [ "$UNIT_RESULT" != "success" ] || [ "$E2E_RESULT" != "success" ]; then
+            echo "::error title=Split tests failed::Unit Test=$UNIT_RESULT E2E Test=$E2E_RESULT"
+            exit 1
+          fi
+          echo "Unit Test and E2E Test passed"
+
+  vet:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: Vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Vet
+        run: go vet ./...
+
+  lint:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
+        with:
+          version: v2.12.2
+          args: --timeout=5m
+
+  personal-msgsendreq-lint:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    # Mininglamp-OSS/octo-server#37: defense-in-depth wrapper for PERSONAL
+    # MsgSendReq construction. The lint AST-walks modules/ and rejects any
+    # composite literal of MsgSendReq{ChannelType: ChannelTypePerson...}, since
+    # PERSONAL DM dispatchers MUST go through octo-lib's
+    # config.NewPersonalMsgSendReq builder so payload.space_id authoritative
+    # semantics are uniformly applied.
+    name: Personal MsgSendReq Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Reject direct PERSONAL MsgSendReq literals
+        run: go run ./tools/lint-personal-msgsendreq ./modules
+
+  card-dispatch-lint:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    # Internal card producers must use the producer-bound carddispatch sender.
+    # This AST guard is a review backstop for recognizable type-17 construction
+    # and transport flows; runtime payload passthrough is guarded at ingress.
+    name: Card Dispatch Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Reject unreviewed internal type-17 transport owners
+        run: make card-dispatch-lint
+
+  i18n-extract-check:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    # Phase 0.8/0.10 #1: the committed i18n marker files
+    # (tools/i18nmarkers/{shared,server}/active.en-US.toml) must stay in sync
+    # with the codes.Register / errcode.register call sites. A PR that adds or
+    # edits a Code without re-running `make i18n-extract` would otherwise ship
+    # a code with no translation marker (runtime DefaultMessage fallback). The
+    # extractor's -check mode exits non-zero when on-disk markers diverge from
+    # what extraction would emit.
+    name: i18n Extract Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Verify i18n markers are up to date
+        run: make i18n-extract-check
+
+  i18n-lint:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    # Phase 0.10 i18n migration gates:
+    #   #5 (D23): no NEW c.AbortWithStatusJSON / c.AbortWithStatus beyond the
+    #             committed per-file baseline — a ratchet toward zero as
+    #             modules migrate to httperr.ResponseErrorL.
+    #   #3:       no inline codes.Code{...} literals passed to ResponseErrorL,
+    #             which would bypass the registry (no translation marker, silent
+    #             runtime downgrade to err.shared.internal).
+    name: i18n Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: No new direct error responses (D23)
+        run: go run ./tools/lint-direct-error-response
+
+      - name: No unregistered codes in ResponseErrorL
+        run: go run ./tools/lint-unregistered-code

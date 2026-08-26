@@ -1,0 +1,209 @@
+package user
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	appauth "github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestManagerCapabilities pins the /v1/manager/me capability map: superAdmin-only
+// features must be false for a plain admin, while admin∪superAdmin features are
+// true for both. Pure function — no server / DB needed.
+func TestManagerCapabilities(t *testing.T) {
+	super := managerCapabilities(string(wkhttp.SuperAdmin))
+	admin := managerCapabilities(string(wkhttp.Admin))
+	reader := managerCapabilities(appauth.ManagerRoleDashboardReader)
+
+	// Keys that superAdmin has and neither admin nor dashboardReader does. NOT
+	// "superAdmin-only" any more: the six market keys are also held by
+	// marketAdmin, which this test never constructs — see
+	// TestManagerCapabilities_MarketAdmin for that tier.
+	aboveAdminTier := []string{
+		"system_setting", "backup", "appversion.write", "dashboard.trigger", "space.destructive",
+		"users.write", "users.manage_admin", "groups.write", "skill.write", "skill.read", "mcp.write", "mcp.read",
+		"expert.write", "expert.read",
+	}
+	adminTier := []string{
+		"appversion.read", "dashboard.read", "users.read", "groups.read", "space.read", "space.write",
+	}
+
+	for _, k := range aboveAdminTier {
+		if !super[k] {
+			t.Errorf("superAdmin must have capability %q", k)
+		}
+		if admin[k] {
+			t.Errorf("admin must NOT have above-admin-tier capability %q", k)
+		}
+		if reader[k] {
+			t.Errorf("dashboardReader must NOT have above-admin-tier capability %q", k)
+		}
+	}
+	for _, k := range adminTier {
+		if !super[k] || !admin[k] {
+			t.Errorf("admin-tier capability %q must be true for both admin and superAdmin", k)
+		}
+		wantReader := k == "dashboard.read"
+		if reader[k] != wantReader {
+			t.Errorf("dashboardReader capability %q = %v, want %v", k, reader[k], wantReader)
+		}
+	}
+
+	// Guard against a key being silently dropped/renamed out of the contract.
+	if got, want := len(super), len(aboveAdminTier)+len(adminTier); got != want {
+		t.Errorf("capability map has %d keys, want %d (update this test if the contract changed)", got, want)
+	}
+}
+
+// TestManagerCapabilities_MarketAdmin pins the whole point of the marketAdmin
+// role: exactly the six platform-market keys and nothing else. Iterating the
+// whole map rather than spot-checking is deliberate — any capability that leaks
+// into this role fails here rather than shipping.
+func TestManagerCapabilities_MarketAdmin(t *testing.T) {
+	market := managerCapabilities(appauth.ManagerRoleMarketAdmin)
+
+	granted := map[string]bool{
+		"mcp.read": true, "mcp.write": true,
+		"skill.read": true, "skill.write": true,
+		"expert.read": true, "expert.write": true,
+	}
+	for k, v := range market {
+		if want := granted[k]; v != want {
+			t.Errorf("marketAdmin capability %q = %v, want %v", k, v, want)
+		}
+	}
+	for k := range granted {
+		if _, ok := market[k]; !ok {
+			t.Errorf("capability map is missing key %q", k)
+		}
+	}
+}
+
+func TestManagerMe_DashboardReaderGetsOnlyDashboardRead(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	loginAsRole(t, ctx, appauth.ManagerRoleDashboardReader)
+	w := getManagerMe(route)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var resp meResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, appauth.ManagerRoleDashboardReader, resp.Role)
+	for capability, enabled := range resp.Capabilities {
+		assert.Equalf(t, capability == "dashboard.read", enabled,
+			"dashboardReader capability %q must be least privilege", capability)
+	}
+
+	blocked := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/manager/user/list", nil)
+	req.Header.Set("token", testutil.Token)
+	route.ServeHTTP(blocked, req)
+	assert.Equal(t, http.StatusBadRequest, blocked.Code)
+	assert.Contains(t, blocked.Body.String(), "err.shared.auth.forbidden")
+}
+
+// meResponse mirrors managerMeResp for decoding the HTTP body.
+type meResponse struct {
+	UID          string          `json:"uid"`
+	Name         string          `json:"name"`
+	Role         string          `json:"role"`
+	Capabilities map[string]bool `json:"capabilities"`
+}
+
+func getManagerMe(h http.Handler) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/manager/me", nil)
+	req.Header.Set("token", testutil.Token)
+	h.ServeHTTP(w, req)
+	return w
+}
+
+// loginAsRole logs testutil.UID in with the given system role via the token
+// cache (uid@name[@role]). The route-only harness does not wire a RoleResolver
+// (only main.go does), so the token's baked role is authoritative here — matching the
+// setPlainUserToken / setAdminToken helpers in the opanalytics tests. role == ""
+// omits the role segment → no system role → CheckLoginRole rejects.
+func loginAsRole(t *testing.T, ctx *config.Context, role string) {
+	t.Helper()
+	val := testutil.UID + "@test"
+	if role != "" {
+		val += "@" + role
+	}
+	require.NoError(t, ctx.Cache().Set(ctx.GetConfig().Cache.TokenCachePrefix+testutil.Token, val))
+}
+
+// TestManagerMe_RejectsPlainUser pins the gate at the HTTP layer: a logged-in but
+// non-manager user (passes auth, fails CheckLoginRole) must NOT reach /v1/manager/me.
+// Complements the pure-function TestManagerCapabilities, which cannot catch a
+// regression in the handler's role check.
+func TestManagerMe_RejectsPlainUser(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	loginAsRole(t, ctx, "") // no system role
+	w := getManagerMe(route)
+	// Assert the specific forbidden outcome, not merely "not 200": respondManagerForbidden
+	// renders err.shared.auth.forbidden, pinned to wire 400 (D14) with the shared
+	// permission message. This rejects a 500/panic, 404 (route regression) or 401
+	// masquerading as a passing auth test.
+	assert.Equal(t, http.StatusBadRequest, w.Code, "forbidden is pinned to wire 400 (D14)")
+	assert.Contains(t, w.Body.String(), "err.shared.auth.forbidden",
+		"plain user must be rejected for the role reason (forbidden), not some other failure")
+}
+
+// TestManagerMe_AdminGetsReadCapsNotWrite verifies an admin is admitted and the
+// echoed capability map reflects the read/write split: read tiers true, the
+// superAdmin-only write tiers false — so the console won't render write buttons
+// that the backend would 403.
+func TestManagerMe_AdminGetsReadCapsNotWrite(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	loginAsRole(t, ctx, string(wkhttp.Admin))
+	w := getManagerMe(route)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp meResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, string(wkhttp.Admin), resp.Role)
+	assert.True(t, resp.Capabilities["users.read"], "admin should have users.read")
+	assert.True(t, resp.Capabilities["groups.read"], "admin should have groups.read")
+	assert.True(t, resp.Capabilities["space.write"], "admin should have space.write (admin-allowed space writes)")
+	assert.False(t, resp.Capabilities["users.write"], "admin must NOT have users.write")
+	assert.False(t, resp.Capabilities["users.manage_admin"], "admin must NOT have users.manage_admin")
+	assert.False(t, resp.Capabilities["groups.write"], "admin must NOT have groups.write")
+	assert.False(t, resp.Capabilities["space.destructive"], "admin must NOT have space.destructive")
+	assert.False(t, resp.Capabilities["skill.read"], "admin must NOT have skill.read (system Skill list/detail is superAdmin-only)")
+	assert.False(t, resp.Capabilities["skill.write"], "admin must NOT have skill.write (system Skill create/edit/delete/category management)")
+	assert.False(t, resp.Capabilities["mcp.read"], "admin must NOT have mcp.read (system MCP list/detail is superAdmin-only)")
+	assert.False(t, resp.Capabilities["mcp.write"], "admin must NOT have mcp.write (system MCP create/edit/delete)")
+	assert.False(t, resp.Capabilities["system_setting"], "admin must NOT have system_setting")
+}
+
+// TestManagerMe_SuperAdminGetsWriteCaps verifies a superAdmin is admitted and the
+// write/destructive tiers come back true.
+func TestManagerMe_SuperAdminGetsWriteCaps(t *testing.T) {
+	route, ctx, _ := newManagerRouteOnly(t)
+
+	loginAsRole(t, ctx, string(wkhttp.SuperAdmin))
+	w := getManagerMe(route)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp meResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, string(wkhttp.SuperAdmin), resp.Role)
+	assert.True(t, resp.Capabilities["users.write"], "superAdmin should have users.write")
+	assert.True(t, resp.Capabilities["users.manage_admin"], "superAdmin should have users.manage_admin")
+	assert.True(t, resp.Capabilities["groups.write"], "superAdmin should have groups.write")
+	assert.True(t, resp.Capabilities["system_setting"], "superAdmin should have system_setting")
+	assert.True(t, resp.Capabilities["users.read"], "superAdmin should have users.read")
+	assert.True(t, resp.Capabilities["skill.write"], "superAdmin should have skill.write")
+	assert.True(t, resp.Capabilities["skill.read"], "superAdmin should have skill.read")
+	assert.True(t, resp.Capabilities["mcp.write"], "superAdmin should have mcp.write")
+	assert.True(t, resp.Capabilities["mcp.read"], "superAdmin should have mcp.read")
+}

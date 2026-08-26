@@ -1,0 +1,129 @@
+name: Publish create-openclaw-octo
+
+# Triggered on package-scoped tag pushes:
+#   create-openclaw-octo/v1.0.1
+#   create-openclaw-octo/v1.0.1-rc.1
+#   create-openclaw-octo/v1.0.1-beta.2
+#
+# The slash prefix is intentional — it scopes the tag to this package so that
+# future adapters in the same repo can each define their own `<package>/v*`
+# workflows without collision.
+#
+# Also supports manual dispatch with a custom tag for dry-runs.
+#
+# Tag → npm dist-tag mapping:
+#   create-openclaw-octo/v1.0.1       → @latest      (matches /^v\d+\.\d+\.\d+$/)
+#   create-openclaw-octo/v1.0.1-rc.1  → @next        (any tag containing "-")
+#   create-openclaw-octo/v1.0.1-beta  → @next
+#
+# Sequence:
+#   1. test          — npm ci + type-check + build + test
+#   2. publish_octo  — npm publish create-openclaw-octo
+#
+# Note: the previous npm package name `openclaw-channel-octo` will be republished
+# once as a redirect-only shim via a separate workflow that lands in a future PR.
+# New users go to `npx -y create-openclaw-octo`.
+
+on:
+  push:
+    tags:
+      # Package-scoped tags so other future packages in this repo don't trigger
+      # this workflow. Push as: create-openclaw-octo/v1.0.1
+      - 'create-openclaw-octo/v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version to publish (without leading v), e.g. 1.0.1"
+        required: true
+        type: string
+      dry_run:
+        description: "Run npm publish with --dry-run (no actual upload)"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish-octo-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  PKG_DIR: create-openclaw-octo
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.PKG_DIR }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: npm ci
+        run: npm ci --ignore-scripts
+      - name: type-check
+        run: npx tsc --noEmit
+      - name: test
+        run: npm test
+      - name: build
+        run: npm run build
+
+  publish_octo:
+    name: publish create-openclaw-octo
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.PKG_DIR }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+      - name: resolve version
+        id: version
+        # Strip prefix `create-openclaw-octo/v` from a push tag, or use the
+        # workflow_dispatch `tag` input directly.
+        # Output: VERSION (no prefix), DIST_TAG (next | latest), DRY_RUN (--dry-run | "")
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.tag }}"
+            DRY="${{ inputs.dry_run && '--dry-run' || '' }}"
+          else
+            VERSION="${GITHUB_REF_NAME#create-openclaw-octo/v}"
+            DRY=""
+          fi
+          if [[ "$VERSION" == *-* ]]; then
+            DIST_TAG="next"
+          else
+            DIST_TAG="latest"
+          fi
+          {
+            echo "VERSION=$VERSION"
+            echo "DIST_TAG=$DIST_TAG"
+            echo "DRY_RUN=$DRY"
+          } >> "$GITHUB_OUTPUT"
+          echo "[publish_octo] version=$VERSION dist-tag=$DIST_TAG dry_run='$DRY'"
+      - name: npm ci
+        run: npm ci --ignore-scripts
+      - name: npm version
+        # Must run BEFORE build: prebuild script writes package.json.version
+        # into cli/version.ts, which is bundled into the published tarball.
+        # --allow-same-version: when the tag matches the checked-in
+        # package.json version (the normal case for rc/stable cuts),
+        # `npm version` would otherwise exit with EBADCHANGE.
+        run: npm version "${{ steps.version.outputs.VERSION }}" --no-git-tag-version --allow-same-version
+      - name: build
+        run: npm run build
+      - name: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish --access public \
+            --tag "${{ steps.version.outputs.DIST_TAG }}" \
+            ${{ steps.version.outputs.DRY_RUN }}

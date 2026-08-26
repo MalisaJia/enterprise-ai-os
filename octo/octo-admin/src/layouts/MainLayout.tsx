@@ -1,0 +1,386 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import { Outlet, useNavigate, useLocation } from 'react-router-dom'
+import { Layout, Menu, Avatar, Dropdown, Tooltip, Breadcrumb, message, Spin, Button } from 'antd'
+import type { MenuProps } from 'antd'
+import { useTranslation } from 'react-i18next'
+import {
+  UserOutlined,
+  TeamOutlined,
+  AppstoreOutlined,
+  CloudUploadOutlined,
+  DownloadOutlined,
+  LogoutOutlined,
+  DashboardOutlined,
+  BellOutlined,
+  QuestionCircleOutlined,
+  SunOutlined,
+  MoonOutlined,
+  DesktopOutlined,
+  RobotOutlined,
+  SettingOutlined,
+  ApiOutlined,
+  ShopOutlined,
+} from '@ant-design/icons'
+import { useAuthStore } from '../store/auth'
+import { useFeatureStore } from '../store/feature'
+import { getManagerMe } from '../api/auth'
+import { firstManagerPath, hasManagerCapability } from '../auth/capabilities'
+import LanguageSwitcher from '../components/LanguageSwitcher'
+import { useTheme } from '../hooks/useTheme'
+import type { Theme } from '../hooks/useTheme'
+
+const { Header, Sider, Content } = Layout
+
+type MenuItem = { key: string; icon: React.ReactNode; label: string }
+
+const themeIcon: Record<Theme, React.ReactNode> = {
+  light: <SunOutlined />,
+  dark: <MoonOutlined />,
+  auto: <DesktopOutlined />,
+}
+
+const MainLayout: React.FC = () => {
+  const [collapsed, setCollapsed] = useState(false)
+  const navigate = useNavigate()
+  const location = useLocation()
+  const {
+    name,
+    token,
+    scope,
+    managerCapabilities,
+    managerProfileStatus,
+    setManagerProfileLoading,
+    setManagerMe,
+    setManagerProfileError,
+    logout,
+  } = useAuthStore()
+  const { theme, effective, setTheme } = useTheme()
+  const appBotsAvailable = useFeatureStore((s) => s.appBotsAvailable)
+  const probeAppBots = useFeatureStore((s) => s.probeAppBots)
+  const { t } = useTranslation(['nav', 'layout'])
+
+  useEffect(() => {
+    void probeAppBots()
+  }, [probeAppBots])
+
+  const loadManagerProfile = useCallback(async () => {
+    if (scope !== 'super' || !token) return
+    setManagerProfileLoading()
+    try {
+      setManagerMe(await getManagerMe())
+    } catch (error) {
+      setManagerProfileError()
+      message.error((error as Error).message)
+    }
+  }, [
+    scope,
+    setManagerMe,
+    setManagerProfileError,
+    setManagerProfileLoading,
+    token,
+  ])
+
+  useEffect(() => {
+    if (scope !== 'super' || !token) return
+    if (managerCapabilities !== null || managerProfileStatus !== 'idle') return
+    void loadManagerProfile()
+  }, [
+    loadManagerProfile,
+    managerCapabilities,
+    managerProfileStatus,
+    scope,
+    token,
+  ])
+
+  const themeLabel = useMemo<Record<Theme, string>>(
+    () => ({
+      light: t('layout:theme.light'),
+      dark: t('layout:theme.dark'),
+      auto: t('layout:theme.auto'),
+    }),
+    [t],
+  )
+
+  // 扁平菜单项(带 group 归属):既用于派生分组菜单,也用于面包屑按路径反查标题。
+  const flatMenuItems = useMemo<Array<MenuItem & { group: string }>>(() => {
+    if (managerCapabilities === null) return []
+    const list: Array<MenuItem & { group: string }> = []
+    if (hasManagerCapability(managerCapabilities, 'dashboard.read')) {
+      list.push({ key: '/dashboard', icon: <DashboardOutlined />, label: t('nav:dashboard'), group: 'overview' })
+    }
+    if (hasManagerCapability(managerCapabilities, 'users.read')) {
+      list.push({ key: '/users', icon: <UserOutlined />, label: t('nav:users'), group: 'management' })
+    }
+    if (hasManagerCapability(managerCapabilities, 'groups.read')) {
+      list.push({ key: '/groups', icon: <TeamOutlined />, label: t('nav:groups'), group: 'management' })
+    }
+    if (hasManagerCapability(managerCapabilities, 'space.read')) {
+      list.push({ key: '/spaces', icon: <AppstoreOutlined />, label: t('nav:spaces'), group: 'management' })
+    }
+    if (appBotsAvailable === true) {
+      list.push({ key: '/app-bots', icon: <RobotOutlined />, label: t('nav:appBots'), group: 'management' })
+    }
+    if (hasManagerCapability(managerCapabilities, 'system_setting')) {
+      list.push({ key: '/system-setting', icon: <SettingOutlined />, label: t('nav:systemSetting'), group: 'system' })
+    }
+    if (hasManagerCapability(managerCapabilities, 'mcp.read')) {
+      list.push({ key: '/system-mcp', icon: <ApiOutlined />, label: t('nav:systemMcp'), group: 'system' })
+    }
+    if (hasManagerCapability(managerCapabilities, 'skill.read')) {
+      list.push({ key: '/skill-market', icon: <ShopOutlined />, label: t('nav:skillMarket'), group: 'system' })
+    }
+    if (hasManagerCapability(managerCapabilities, 'expert.read')) {
+      list.push({ key: '/expert-market', icon: <TeamOutlined />, label: t('nav:expertMarket'), group: 'system' })
+    }
+    if (hasManagerCapability(managerCapabilities, 'backup')) {
+      list.push({ key: '/backup', icon: <CloudUploadOutlined />, label: t('nav:backup'), group: 'system' })
+    }
+    if (hasManagerCapability(managerCapabilities, 'appversion.read')) {
+      list.push({ key: '/download', icon: <DownloadOutlined />, label: t('nav:download'), group: 'system' })
+    }
+    return list
+  }, [appBotsAvailable, managerCapabilities, t])
+
+  // 按「概览 / 管理 / 系统」分组渲染;某组无任何有权限的菜单项时整组隐藏(不留空标题)。
+  const menuItems = useMemo<MenuProps['items']>(() => {
+    const groupDefs = [
+      { key: 'overview', label: t('nav:groupOverview') },
+      { key: 'management', label: t('nav:groupManagement') },
+      { key: 'system', label: t('nav:groupSystem') },
+    ]
+    return groupDefs
+      .map((g) => ({
+        g,
+        children: flatMenuItems
+          .filter((i) => i.group === g.key)
+          .map(({ group: _group, ...item }) => item),
+      }))
+      .filter((x) => x.children.length > 0)
+      .map((x) => ({ type: 'group' as const, key: x.g.key, label: x.g.label, children: x.children }))
+  }, [flatMenuItems, t])
+
+  const handleMenuClick = ({ key }: { key: string }) => {
+    navigate(key)
+  }
+
+  const handleLogout = () => {
+    logout()
+    navigate('/login')
+  }
+
+  const activeItem = flatMenuItems.find((item) => item.key === location.pathname)
+  const homePath = firstManagerPath(managerCapabilities)
+  const managerProfilePending =
+    scope === 'super' && managerCapabilities === null && managerProfileStatus !== 'error'
+  const managerProfileFailed =
+    scope === 'super' && managerCapabilities === null && managerProfileStatus === 'error'
+
+  const isDark = effective === 'dark'
+  const surface = isDark ? '#14171f' : '#ffffff'
+  const border = isDark ? '#262b38' : '#e5e7eb'
+  const canvas = isDark ? '#0b0d12' : '#f7f8fa'
+  const textPrimary = isDark ? '#e6e8ec' : '#0f172a'
+
+  const themeMenu: MenuProps['items'] = (['light', 'dark', 'auto'] as Theme[]).map((t) => ({
+    key: t,
+    icon: themeIcon[t],
+    label: themeLabel[t],
+    onClick: () => setTheme(t),
+  }))
+
+  return (
+    <Layout className="admin-shell" style={{ minHeight: '100vh', background: canvas }}>
+      <Sider
+        collapsible
+        collapsed={collapsed}
+        onCollapse={setCollapsed}
+        theme="light"
+        width={220}
+        style={{ background: surface, borderRight: `1px solid ${border}` }}
+      >
+        <div
+          style={{
+            height: 56,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: collapsed ? 'center' : 'flex-start',
+            padding: collapsed ? 0 : '0 16px',
+            borderBottom: `1px solid ${border}`,
+          }}
+        >
+          <div
+            style={{
+              width: 28,
+              height: 28,
+              borderRadius: 6,
+              background: isDark ? '#6366f1' : '#4f46e5',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: '#fff',
+              fontWeight: 700,
+              fontSize: 13,
+              flexShrink: 0,
+            }}
+          >
+            O
+          </div>
+          {!collapsed && (
+            <span style={{ marginLeft: 10, fontSize: 15, fontWeight: 600, color: textPrimary, letterSpacing: '-0.01em' }}>
+              Octo
+            </span>
+          )}
+        </div>
+        <Menu
+          mode="inline"
+          selectedKeys={[location.pathname]}
+          items={menuItems}
+          onClick={handleMenuClick}
+          style={{ borderRight: 0, paddingTop: 8, background: 'transparent' }}
+        />
+      </Sider>
+      <Layout style={{ background: canvas }}>
+        <Header
+          style={{
+            height: 56,
+            lineHeight: '56px',
+            padding: '0 20px',
+            background: surface,
+            display: 'flex',
+            alignItems: 'center',
+            borderBottom: `1px solid ${border}`,
+          }}
+        >
+          <Breadcrumb
+            items={[
+              {
+                title: (
+                  <a
+                    onClick={(e) => {
+                      e.preventDefault()
+                      navigate(homePath)
+                    }}
+                    href={homePath}
+                  >
+                    {t('layout:breadcrumb.admin')}
+                  </a>
+                ),
+              },
+              { title: activeItem?.label ?? '' },
+            ]}
+          />
+          <div style={{ flex: 1 }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <LanguageSwitcher />
+            <Dropdown
+              menu={{ items: themeMenu, selectedKeys: [theme] }}
+              trigger={['click']}
+              placement="bottomRight"
+            >
+              <Tooltip title={t('layout:theme.tooltip', { name: themeLabel[theme] })}>
+                <button className="admin-header-action" aria-label={t('layout:theme.label')}>
+                  <span style={{ fontSize: 18 }}>{themeIcon[theme]}</span>
+                </button>
+              </Tooltip>
+            </Dropdown>
+            <span
+              aria-hidden
+              style={{
+                width: 1,
+                height: 18,
+                background: border,
+                margin: '0 6px',
+              }}
+            />
+            <Tooltip title={t('layout:header.notifications')}>
+              <button className="admin-header-action" aria-label={t('layout:header.notifications')}>
+                <BellOutlined style={{ fontSize: 18 }} />
+              </button>
+            </Tooltip>
+            <Tooltip title={t('layout:header.help')}>
+              <button className="admin-header-action" aria-label={t('layout:header.help')}>
+                <QuestionCircleOutlined style={{ fontSize: 18 }} />
+              </button>
+            </Tooltip>
+            <Dropdown
+              menu={{
+                items: [
+                  {
+                    key: 'logout',
+                    icon: <LogoutOutlined />,
+                    label: t('layout:header.logout'),
+                    onClick: handleLogout,
+                  },
+                ],
+              }}
+            >
+              <div
+                style={{
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 10,
+                  padding: '4px 10px',
+                  borderRadius: 6,
+                  marginLeft: 6,
+                }}
+              >
+                <Avatar
+                  size={28}
+                  style={{
+                    background: isDark ? '#6366f1' : '#4f46e5',
+                    fontSize: 13,
+                    fontWeight: 600,
+                  }}
+                >
+                  {name ? name.trim().charAt(0) : <UserOutlined />}
+                </Avatar>
+                <span style={{ fontWeight: 500, color: textPrimary, fontSize: 13 }}>{name}</span>
+              </div>
+            </Dropdown>
+          </div>
+        </Header>
+        <Content
+          style={{
+            margin: 16,
+            padding: 24,
+            background: surface,
+            borderRadius: 12,
+            overflow: 'auto',
+            border: `1px solid ${border}`,
+            boxShadow: isDark
+              ? '0 1px 2px rgba(0,0,0,0.3)'
+              : '0 1px 2px rgba(16,24,40,0.05)',
+          }}
+        >
+          {managerProfilePending ? (
+            <div style={{ minHeight: 320, display: 'grid', placeItems: 'center' }}>
+              <Spin />
+            </div>
+          ) : managerProfileFailed ? (
+            <div
+              style={{
+                minHeight: 320,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexDirection: 'column',
+                gap: 12,
+                color: 'var(--a-text-secondary)',
+              }}
+            >
+              <span>{t('layout:managerProfile.loadFailed')}</span>
+              <Button onClick={() => void loadManagerProfile()}>
+                {t('layout:managerProfile.retry')}
+              </Button>
+            </div>
+          ) : (
+            <Outlet />
+          )}
+        </Content>
+      </Layout>
+    </Layout>
+  )
+}
+
+export default MainLayout

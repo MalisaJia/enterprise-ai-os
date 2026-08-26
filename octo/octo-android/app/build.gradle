@@ -1,0 +1,134 @@
+plugins {
+    id 'com.android.application'
+    id 'kotlin-parcelize'
+    id 'kotlin-android'
+    id 'com.google.gms.google-services' apply false
+}
+
+if (file('google-services.json').exists()) {
+    apply plugin: 'com.google.gms.google-services'
+}
+
+// 读取 local.properties 中的 applicationId
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+    localProperties.load(new FileInputStream(localPropertiesFile))
+}
+
+def appId = localProperties.getProperty('applicationId', 'com.example.app.octo')
+
+android {
+    signingConfigs {
+        release {
+            storeFile file(localProperties.getProperty('RELEASE_STORE_FILE', 'release.jks'))
+            storePassword localProperties.getProperty('RELEASE_STORE_PASSWORD', '')
+            keyAlias localProperties.getProperty('RELEASE_KEY_ALIAS', 'release')
+            keyPassword localProperties.getProperty('RELEASE_KEY_PASSWORD', '')
+        }
+    }
+    namespace 'com.octoim.app'
+    compileSdk rootProject.ext.compileSdkVersion
+    aaptOptions.cruncherEnabled = false
+    aaptOptions.useNewCruncher = false
+
+
+    defaultConfig {
+        applicationId appId
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode 38
+        versionName "1.3.7"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables {
+            useSupportLibrary true
+        }
+        vectorDrawables.useSupportLibrary = true
+        multiDexEnabled true
+        ndk {
+            //根据需要 自行选择添加的对应cpu类型的.so库。
+            abiFilters "armeabi-v7a", "arm64-v8a"
+//            abiFilters 'armeabi', 'armeabi-v7a', 'arm64-v8a', 'x86'
+        }
+        compileSdkPreview = "UpsideDownCake"
+
+        buildConfigField "String", "TERMS_URL", "\"${localProperties.getProperty('TERMS_URL', '')}\""
+        buildConfigField "String", "PRIVACY_URL", "\"${localProperties.getProperty('PRIVACY_URL', '')}\""
+    }
+
+    flavorDimensions "env"
+    productFlavors {
+        dev {
+            dimension "env"
+            buildConfigField "String", "API_BASE_URL", "\"${localProperties.getProperty('DEV_API_BASE_URL', 'https://api.example.com')}\""
+            buildConfigField "String", "WEB_BASE_URL", "\"${localProperties.getProperty('DEV_WEB_BASE_URL', 'https://web.example.com/')}\""
+        }
+        prod {
+            dimension "env"
+            buildConfigField "String", "API_BASE_URL", "\"${localProperties.getProperty('PROD_API_BASE_URL', 'https://api.example.com')}\""
+            buildConfigField "String", "WEB_BASE_URL", "\"${localProperties.getProperty('PROD_WEB_BASE_URL', 'https://web.example.com/')}\""
+        }
+    }
+
+    buildTypes {
+        release {
+            jniDebuggable true
+            //  zipAlignEnabled true   //Zipalign优化
+            minifyEnabled true  // 是否混淆
+            shrinkResources true  // 是否去除无效的资源文件
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
+        }
+        debug {
+            // 仅当签名文件存在时才使用 release 签名配置
+            def keystoreFile = localProperties.getProperty('RELEASE_STORE_FILE', 'release.jks')
+            if (file(keystoreFile).exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+    applicationVariants.all { variant ->
+        variant.outputs.all {
+            outputFileName = "octoim-${variant.flavorName}-${variant.buildType.name}-v${variant.versionName}.apk"
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlin {
+        jvmToolchain(17)
+    }
+    buildFeatures {
+        viewBinding true
+        dataBinding true
+        buildConfig true
+    }
+    composeOptions {
+        kotlinCompilerExtensionVersion '1.3.2'
+    }
+    packagingOptions {
+        resources {
+            excludes += '/META-INF/{AL2.0,LGPL2.1}'
+        }
+    }
+}
+
+dependencies {
+    api project(':wkbase')
+    implementation project(path: ':wkuikit')
+    implementation project(path: ':wklogin')
+    implementation project(path: ':wkscan')
+    implementation project(path: ':wkpush')
+
+    // 性能监控（仅 debug 包）
+    debugImplementation('io.github.didi.dokit:dokitx:3.7.11') {
+        exclude group: 'com.android.volley', module: 'volley'
+    }
+    debugImplementation 'com.android.volley:volley:1.2.1'
+    debugImplementation 'com.squareup.leakcanary:leakcanary-android:2.14'
+
+    // host-side 单测（ExampleUnitTest）需要显式挂载 junit（与 wkscan 同处理）。
+    testImplementation 'junit:junit:4.13.2'
+}

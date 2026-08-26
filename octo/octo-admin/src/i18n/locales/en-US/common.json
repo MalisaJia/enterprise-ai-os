@@ -1,0 +1,22 @@
+{
+  "app": {
+    "name": "OCTO Admin"
+  },
+  "language": {
+    "label": "Language",
+    "en-US": "English",
+    "zh-CN": "简体中文"
+  },
+  "action": {
+    "search": "Search",
+    "refresh": "Refresh",
+    "confirm": "Confirm",
+    "cancel": "Cancel"
+  },
+  "column": {
+    "id": "ID"
+  },
+  "table": {
+    "total": "{{count}} total"
+  }
+}

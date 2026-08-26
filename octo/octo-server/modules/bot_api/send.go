@@ -1,0 +1,1816 @@
+package bot_api
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/http"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
+	"github.com/Mininglamp-OSS/octo-server/internal/msgextraseq"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/robot"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardrevision"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	aireasoningprocess "github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl/ai_reasoning_process"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/Mininglamp-OSS/octo-server/pkg/mentionrewrite"
+	"github.com/Mininglamp-OSS/octo-server/pkg/richtext"
+	"github.com/go-sql-driver/mysql"
+	"github.com/gocraft/dbr/v2"
+	"go.uber.org/zap"
+)
+
+// BotSendMessageReq is the request for sendMessage.
+type BotSendMessageReq struct {
+	ChannelID   string `json:"channel_id"`
+	ChannelType uint8  `json:"channel_type"`
+	StreamNo    string `json:"stream_no"`
+	// OnBehalfOf — YUJ-1166 / Mininglamp-OSS/octo-server#81 (Persona Clone v0).
+	// When non-empty the bot is asking to dispatch as the real user
+	// `OnBehalfOf`. Server validates an active OBO grant
+	// (grantor=OnBehalfOf, grantee=robotID) AND a per-channel scope row
+	// (channel_id, channel_type) before substituting FromUID. Empty / absent
+	// preserves legacy behavior (FromUID = robotID). See RFC §5.1 / §5.2.
+	OnBehalfOf string                 `json:"on_behalf_of,omitempty"`
+	Payload    map[string]interface{} `json:"payload"`
+}
+
+// sendMessage handles POST /v1/bot/sendMessage.
+
+func (ba *BotAPI) sendMessage(c *wkhttp.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardmsg.MaxSendBodyBytes)
+	var req BotSendMessageReq
+	if err := c.BindJSON(&req); err != nil {
+		respondBotAPIRequestInvalid(c, "")
+		return
+	}
+	if strings.TrimSpace(req.ChannelID) == "" {
+		respondBotAPIRequestInvalid(c, "channel_id")
+		return
+	}
+	if req.ChannelType == 0 {
+		respondBotAPIRequestInvalid(c, "channel_type")
+		return
+	}
+	if len(req.Payload) == 0 {
+		respondBotAPIRequestInvalid(c, "payload")
+		return
+	}
+	// PR#82 review #2 P1-2 + PR#121 R2 + PR#121 R3 — reject any
+	// inbound payload that carries a reserved server-only key. Three
+	// overlapping namespaces are reserved:
+	//   - `__obo_*` (double-underscore prefix): home of the fan-out
+	//     gate-3 marker `__obo_processed__` and any future
+	//     server-injected OBO field;
+	//   - explicit `obo_*` keys injected by buildFanoutCopyReq
+	//     (obo_respond_as, obo_grantor_uid, obo_fanout, obo_origin_*,
+	//     obo_system_hint);
+	//   - `actual_sender_uid` — the prefix-less server-injected
+	//     "real bot behind an OBO send" identity set below in the
+	//     fan-out marker block (PR#121 R3).
+	// Allowing a bot client to set any of them would let a malicious
+	// bot suppress its own fan-out copy, spoof the OBO grantor /
+	// fan-out routing context downstream, or forge the
+	// authenticated-by-server sender identity downstream consumers
+	// trust. Membership is owned by pkg/obopayload so this site
+	// cannot drift from the user / robot ingress strip or the
+	// fan-out listener's gate-3 check. Reject before
+	// checkSendPermission / checkOBO so the error is fast and the
+	// auth path doesn't run on poisoned input.
+	if payloadHasReservedOBOKey(req.Payload) {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOReservedField, nil, nil)
+		return
+	}
+
+	_, templateMode := req.Payload["template_ref"]
+	cardIntent := cardmsg.IsCardPayload(req.Payload) || templateMode
+	if templateMode && !cardmsg.IsCardPayload(req.Payload) {
+		ba.Warn("Bot Registry 卡片请求 type 非 17", zap.String("channelID", req.ChannelID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
+
+	// card-message-protocol P1：InteractiveCard(=17) 入站 gate。排序在
+	// checkSendPermission / checkOBO 之前：(a) Decision 2b 要求 OBO 卡片按
+	// 「请求意图」拦截、先于 grant 校验，且覆盖 grantorReplyBypass 子路径
+	// （该子路径 fromUID 仍是 bot —— 拒绝是刻意的过度拒绝，P2 复议）；
+	// (b) 脏卡片 fail-fast，鉴权路径不跑在毒输入上（与上方 OBO 保留键同序）。
+	if cardIntent {
+		if !cardmsg.BotEnabled() {
+			// bot 侧有效门禁：总开关 OCTO_CARD_MESSAGE_ENABLED（Decision 2 rollout
+			// gate）AND bot 子开关 OCTO_BOT_CARD_ENABLED。与 /v1/bot/card/profile 的
+			// enabled 同源，故 profile 报什么、这里就受理什么。
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
+			return
+		}
+		if strings.TrimSpace(req.OnBehalfOf) != "" {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardOBOForbidden, nil, nil)
+			return
+		}
+		if templateMode {
+			// Model A 与 Model B 是 total XOR。完整 Registry 字段校验和 schema
+			// render 在授权完成后执行；这里先拒绝最明显的双模式请求，避免让脏
+			// raw card 进入权限/Space 查询路径。
+			if _, hasRawCard := req.Payload["card"]; hasRawCard {
+				ba.Warn("Bot 卡片 raw/Registry 双模式同时出现", zap.String("channelID", req.ChannelID))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+				return
+			}
+		} else {
+			// PR-C D3：catalog_provenance 是 server-only 顶层键，raw Bot 卡片按
+			// 键存在显式拒绝（不依赖形状校验，也不依赖客户端"不会传"）。
+			// template_ref 由上方 XOR 覆盖：出现即进 Registry 模式，raw card 共存
+			// 已被拒绝。
+			if _, forged := req.Payload[cardmsg.CatalogProvenanceKey]; forged {
+				ba.Warn("raw Bot 卡片试图伪造 catalog_provenance", zap.String("channelID", req.ChannelID))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+				return
+			}
+			if err := cardmsg.Validate(req.Payload); err != nil {
+				ba.Warn("InteractiveCard payload 校验失败", zap.Error(err), zap.String("channelID", req.ChannelID))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+				return
+			}
+			// Raw Bot callers own the card/profile capability payload, but the
+			// deployment owns the visual host compatibility generation. Validate
+			// any explicit inbound value first for backward-compatible fail-close,
+			// then author the stable outbound key so callers do not need to send it.
+			req.Payload["render_profile"] = cardmsg.RenderProfileOctoChatV1
+		}
+		// per-Bot 卡片策略门（task bot-setting-store）。排在形状校验之后，因为
+		// raw 分支要用已校验过的 profile 决定查 display 还是 interaction。
+		if ba.rejectByBotCardPolicy(c, req.Payload, templateMode) {
+			return
+		}
+	}
+
+	robotID := getRobotIDFromContext(c)
+	botKind := getBotKindFromContext(c)
+
+	// PR#82 R7 — the OBO friend-gate bypass is conditional on a
+	// validated OBO context. We pledge that here based on the
+	// `on_behalf_of` field; checkOBO below independently validates the
+	// grant + scope + grantor channel access. If the pledge is false
+	// (bot sends as itself) the friend gate falls back to plain
+	// IsFriend with no bypass — preventing a bot that holds any
+	// unrelated grant from skipping the user opt-in.
+	hasOBOContext := strings.TrimSpace(req.OnBehalfOf) != ""
+
+	// Permission check based on bot kind
+	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, req.ChannelType, hasOBOContext); err != nil {
+		respondSendPermissionError(c, err)
+		return
+	}
+
+	channelID := ba.resolveSpaceChannelID(robotID, req.ChannelID, req.ChannelType)
+
+	// YUJ-1166 / Mininglamp-OSS#81 Persona Clone OBO:
+	// Resolve the dispatch identity. Default = the calling bot. If the bot
+	// asks to act on behalf of a real user, validate the grant + scope
+	// BEFORE we touch the payload (so a 403 short-circuits the dispatch).
+	// Note the order: OBO check runs AFTER checkSendPermission — a bot that
+	// can't legitimately reach this channel can't bypass that check by
+	// invoking OBO.
+	fromUID := robotID
+	if strings.TrimSpace(req.OnBehalfOf) != "" {
+		// YUJ-1418 — managed-persona DM grantor-reply bypass.
+		//
+		// When admin (the OBO grantor) DMs the persona-clone bot, the
+		// persona service generates an AI reply and naturally calls
+		// /v1/bot/sendMessage with on_behalf_of=admin (the persona IS
+		// admin). The recipient (channel_id) is also admin — admin's own
+		// DM with the bot. Running the standard OBO scope check on this
+		// shape rejects: no scope row covers a "grantor speaks to
+		// themselves" DM, and creating one would be semantic noise (it
+		// would route admin→admin self-DM, not bot→admin reply). Without
+		// this bypass every persona reply to its own grantor would 400
+		// with `obo not authorized`.
+		//
+		// Detection: DM channel AND on_behalf_of == channel_id AND the
+		// bot has an active grant from this user. When all three hold we
+		// fall through to the legacy (non-OBO) bot send path — fromUID
+		// stays as the bot, no OBO substitution, no `__obo_processed__`
+		// marker, no fan-out machinery — exactly what the grantor would
+		// expect when their persona "talks back" to them. Any other
+		// shape (on_behalf_of != channel_id, channel is not a DM, no
+		// active grant from the recipient) falls through to the strict
+		// checkOBO below — the OBO scope check for third-party sends
+		// MUST remain strict (issue YUJ-1418 explicitly forbids
+		// loosening it).
+		grantorReplyBypass := false
+		if req.ChannelType == common.ChannelTypePerson.Uint8() && req.OnBehalfOf == req.ChannelID {
+			hasGrant, err := ba.botHasActiveGrantFrom(robotID, req.OnBehalfOf)
+			if err != nil {
+				ba.Error("OBO grantor-reply bypass lookup failed",
+					zap.String("bot", robotID),
+					zap.String("grantor", req.OnBehalfOf),
+					zap.Error(err))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
+				return
+			}
+			grantorReplyBypass = hasGrant
+		}
+
+		if !grantorReplyBypass {
+			if err := ba.checkOBO(robotID, req.OnBehalfOf, req.ChannelID, req.ChannelType); err != nil {
+				if errors.Is(err, ErrOBONotAuthorized) {
+					ba.Warn("OBO denied: no active grant or scope",
+						zap.String("bot", robotID),
+						zap.String("on_behalf_of", req.OnBehalfOf),
+						zap.String("channel_id", req.ChannelID),
+						zap.Uint8("channel_type", req.ChannelType))
+					httperr.ResponseErrorL(c, errcode.ErrBotAPIOBONotAuthorized, nil, nil)
+					return
+				}
+				ba.Error("OBO check failed", zap.Error(err),
+					zap.String("bot", robotID), zap.String("on_behalf_of", req.OnBehalfOf))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIOBOInternal, nil, nil)
+				return
+			}
+			fromUID = req.OnBehalfOf
+		} else {
+			ba.Info("OBO grantor-reply bypass: bot is replying to its own grantor in DM, sending as bot",
+				zap.String("bot", robotID),
+				zap.String("grantor", req.OnBehalfOf),
+				zap.String("channel_id", req.ChannelID))
+		}
+	}
+
+	// YUJ-644 / Mininglamp-OSS#33: PERSONAL DM 服务端权威 space_id 注入。
+	// WuKongIM 对 DM 仅按裸 uid 路由（无 Space 概念），收端 SpaceFilter 只能依赖
+	// payload.space_id；客户端上送任何值（包括缺省 / 伪造）都不可信。
+	// 优先使用 gin-context 里 authAppBot 写入的 SpaceID（O(1)，无 DB 调用）；
+	// 用户 Bot / 平台级 App Bot 落 querySpaceIDByRobotID。
+	//
+	// space_id 解析始终基于 robotID (bot)，而不是 OBO 替身的 fromUID。
+	// 理由：grant 仅授权身份替换，不应改变租户隔离边界 — bot 的 Space 归属
+	// 是部署时确定的，与 grantor 的 Space 归属解耦。
+	payload := req.Payload
+	if templateMode {
+		if ba.cardTemplates == nil {
+			ba.Error("Bot Registry 模板 catalog 未注入", zap.String("channelID", channelID))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		spaceID := ""
+		if req.ChannelType == common.ChannelTypePerson.Uint8() {
+			spaceID = ba.resolveBotActiveSpaceID(c, robotID)
+		}
+		webLoginURL := ""
+		if ba.ctx != nil && ba.ctx.GetConfig() != nil {
+			webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
+		}
+		rendered, renderErr := ba.cardTemplates.RenderPayloadForPrincipal(c.Request.Context(), robotID, req.Payload, cardtmpl.BuildEnv{
+			WebLoginURL: webLoginURL,
+			Lang:        i18n.OutboundLanguage(c.Request.Context()),
+			SpaceID:     spaceID,
+		})
+		if renderErr != nil {
+			if errors.Is(renderErr, errBotTemplateRequestInvalid) {
+				ba.Warn("Bot Registry 模板请求非法", zap.Error(renderErr), zap.String("channelID", channelID))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+				return
+			}
+			ba.Error("Bot Registry 模板渲染失败", zap.Error(renderErr), zap.String("channelID", channelID))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		payload = rendered
+		if req.ChannelType == common.ChannelTypePerson.Uint8() {
+			payload = ba.enrichBotPayloadWithResolvedSpaceID(robotID, payload, spaceID)
+		}
+	} else if req.ChannelType == common.ChannelTypePerson.Uint8() {
+		payload = ba.enrichBotPayloadWithSpaceID(c, robotID, payload)
+	}
+
+	// YUJ-202 / Mininglamp-OSS#94 / #142 — mention pass-through
+	// chokepoint. Same contract as modules/message/api.go: post-#142
+	// the helper no longer infers `mention.ais=1` from legacy
+	// `mention.all=1` (legacy `@所有人` MUST NOT trigger bots). The
+	// helper is now a pass-through that forwards `mention.all`,
+	// `mention.humans`, `mention.ais`, and `mention.uids` untouched.
+	// The call site is preserved so any future re-introduction of
+	// chokepoint normalization (and the symmetric ingress on
+	// modules/message/api.go + modules/robot/api.go) lands in one
+	// place. ⚠️ F2 (PR#70 Jerry-Xin correctness-critical review): this
+	// MUST stay OUTSIDE the `ChannelTypePerson` conditional above —
+	// otherwise group / community-topic mention payloads would bypass
+	// the chokepoint should we ever need to reinstate the rewrite.
+	// Helper is idempotent and safe on nil — see pkg/mentionrewrite.
+	payload = mentionrewrite.RewriteMention(payload)
+
+	// card-message-protocol P1 Decision 8：server 权威 plain 收尾。排在信封级
+	// enrich（space_id 注入 / mention 顶层键改写）之后，使 512KiB 复检覆盖真实
+	// 出站 payload（与 richtext 的 PR#232 口径一致）。Decision 9 保证 enrich 只
+	// 触碰信封顶层键、card 树永不被改写；下方 OBO 标记 enrich 对卡片不可达
+	// （OBO 卡片已在入站 gate 拒绝）。非 type=17 为 no-op。
+	if err := cardmsg.Finalize(payload); err != nil {
+		ba.Error("InteractiveCard finalize 失败", zap.Error(err), zap.String("channelID", channelID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
+
+	// 模板发送的列宽预检（PR#712 review lml2468 P1-2）。send 侧原本只查 512 KiB，而编辑
+	// 侧查 TEXT 列宽 65,535 B，两者不一致就能造出「发得出去、第一次编辑就被拒」的卡。
+	//
+	// 量的是**最坏的首次编辑信封**，不是发送帧本身：编辑路径会在渲染结果上追加 card_seq
+	// （必然）和 transient（进度帧）。card_seq 取 int64 上界、transient 取 true，两者都是最坏
+	// 取值，实测合计 48 字节。按发送帧长度放行会留下一个同宽的窗口 —— 落在其中的帧发得出去、
+	// 第一次编辑就被写入侧的闸拒掉，而字段长度是连续可变的，所以这个区间可达
+	// （follow-up review；具体字节数由 TestTemplateSendPrecheckAccountsForTheFirstEditEnvelope
+	// 实测并打印，不写死在这里当魔数）。
+	//
+	// 用 carddispatch.NormalizeFrameForPersistence 而不是自己比长度：宽度判据只有一份，
+	// 编辑路径以后再多加一个信封键，这里不会因为漏改一个魔数而重新裂开。代价是每次模板
+	// 发送多跑一次 Validate+Finalize+marshal —— 一张卡只在首帧付一次，后续帧走编辑路径。
+	//
+	// 这道检查**只覆盖第一帧**，仍不是那个不一致的通解（review P2-3）：推理卡的后续帧数据
+	// 更多（phases 从 1 累积到 6），首帧装得下推不出第 N 帧装得下。它能挡住的是那种发出去
+	// 就注定动不了的卡。真正的通解是迁 MEDIUMTEXT 或给 tool/detail 上截断，见 brief D3a。
+	//
+	// 只作用于**模板**分支，刻意不管 raw 发送：模板帧的尺寸由服务端产物 + schema 有界输入
+	// 决定（实测出厂样本 10.3–18.3 KB，占列宽 15.7%–27.9%），所以这道检查只会在病态输入上
+	// 触发；而 raw 卡片是调用方自己作者的一次性内容，对外承诺的就是 512 KiB，收紧它会拒掉
+	// 今天能发、且从不被编辑因而永远不碰 content_edit 的卡。
+	if templateMode {
+		// 浅拷贝：只往顶层加键，card 子树不动，且**不能**污染真正出站的 payload。
+		probe := make(map[string]interface{}, len(payload)+2)
+		for k, v := range payload {
+			probe[k] = v
+		}
+		probe["card_seq"] = int64(math.MaxInt64)
+		probe["transient"] = true
+
+		// fail-closed：marshal 失败必须拒绝，不能跳过尺寸检查。实践上不可达
+		// （payload 是 JSON 解出来的 map，上面 cardmsg.Finalize 刚 marshal 过一次），
+		// 但一个 fail-open 的条件不该出现在这个位置（review P2-4）。
+		probeFrame, mErr := json.Marshal(probe)
+		if mErr != nil {
+			ba.Error("模板渲染帧 marshal 失败,无法做列宽预检", zap.Error(mErr),
+				zap.String("channelID", channelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		if _, pErr := carddispatch.NormalizeFrameForPersistence(string(probeFrame)); pErr != nil {
+			ba.Warn("模板渲染帧的首次编辑信封超出持久化列宽,拒绝发送(否则卡片发出后无法编辑)",
+				zap.Error(pErr), zap.String("channelID", channelID),
+				zap.Int("sendFrameBytes", len(probeFrame)),
+				zap.Int("columnBytes", carddispatch.MaxPersistedFrameBytes))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+	}
+
+	// YUJ-1166 fan-out loop guard #3: mark this message so the fan-out
+	// listener (see obo_fanout.go) skips it on the way back through the
+	// listener pipeline. Marker key lives in the reserved `__obo_*`
+	// namespace (see oboProcessedMarkerKey) which the inbound payload
+	// validator above strips off client requests — so the marker is
+	// server-only state that a bot cannot forge or suppress. Stored in
+	// payload (= message_extra in the persisted MessageResp) so the
+	// messages table itself doesn't need an ALTER (out-of-scope row).
+	if fromUID != robotID {
+		payload = ensureMap(payload)
+		payload[oboProcessedMarkerKey] = true
+		payload["actual_sender_uid"] = robotID
+	}
+
+	// Mininglamp-OSS/octo-server#144 + PR#145 review follow-up:
+	// second-pass mention chokepoint (sister call to the user and
+	// robot ingresses). When mention.ais=1 in a GROUP channel, expand
+	// mention.uids to every bot member of the channel so legacy
+	// adapter bots (#137) on the WuKongIM websocket recognise the
+	// broadcast. PR #138 only rewrites the /v1/bot/events queue path;
+	// this helper covers the websocket dispatch path. channelID uses
+	// the space-resolved value so a multi-Space group still hits the
+	// right member roster.
+	//
+	// ⚠️ PR#145 review (Jerry-Xin / lml2468 / yujiawei 2026-05-23):
+	// the expansion MUST run on a clone of `payload`, not on `payload`
+	// itself. ExpandAisToBotUIDs mutates the inner `mention` sub-map
+	// in place, and the in-memory `payload` flows into the persisted
+	// MessageResp + the listener pipeline (obo_fanout, reminder
+	// writer at modules/message/api_reminders.go) — mutating it here
+	// would create one human-visible `[有人@我]` reminder per
+	// server-expanded bot member of the group. The clone is used ONLY
+	// for the wire bytes; `payload` retains the original
+	// caller-supplied `mention.uids`. See pkg/mentionrewrite/clone.go
+	// for the clone contract.
+	wirePayload := mentionrewrite.CloneForExpansion(payload)
+	wirePayload = mentionrewrite.ExpandAisToBotUIDs(wirePayload, req.ChannelType, channelID, ba.fetchBotMemberUIDs)
+
+	// card-message-protocol P1 Decision 3a：ExpandAisToBotUIDs 是 Finalize 之后
+	// 唯一会增大 payload 的 mutation（追加频道 bot 成员 UID 到 mention 子表）。
+	// Finalize 的 512KiB 复检发生在展开之前，覆盖不到真实出站字节，故对最终
+	// wirePayload 再复检一次（PR#543 review：与 richtext PR#232「最后一次 mutation
+	// 后复检」不变量对齐）。非 type=17 为 no-op。
+	if err := cardmsg.RecheckPayloadSize(wirePayload); err != nil {
+		ba.Error("InteractiveCard 出站 payload 超限", zap.Error(err), zap.String("channelID", channelID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
+
+	msgReq := &config.MsgSendReq{
+		Header: config.MsgHeader{
+			RedDot: 1,
+		},
+		StreamNo:    req.StreamNo,
+		ChannelID:   channelID,
+		ChannelType: req.ChannelType,
+		FromUID:     fromUID,
+		Payload:     []byte(util.ToJson(wirePayload)),
+	}
+	result, err := ba.dispatchMsgSendReq(msgReq)
+	if err != nil {
+		ba.Error("发送消息失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPISendFailed, nil, nil)
+		return
+	}
+
+	// Reset typing throttle state
+	ba.clearTypingThrottle(robotID, channelID, req.ChannelType)
+
+	c.Response(result)
+}
+
+// ensureMap returns a non-nil map, allocating one if needed. Used by the
+// OBO marker logic in sendMessage so we never NPE on a payload that arrived
+// nil (validation above rejects len==0 but not nil-vs-empty after enrich).
+func ensureMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return map[string]interface{}{}
+	}
+	return m
+}
+
+// checkSendPermission verifies the bot has permission to send to the target channel.
+//
+// PR#82 R7 — `hasOBOContext` signals that the inbound request carries a
+// validated `on_behalf_of` field. Only sendMessage can set this true
+// (it's the only handler whose request schema has the field, and the
+// dispatch path validates it via `checkOBO` immediately after this
+// returns). typing / readReceipt / messages-sync must pass false: they
+// dispatch AS the bot, never AS a grantor, so they cannot legitimately
+// take the OBO friend-gate bypass.
+func (ba *BotAPI) checkSendPermission(c *wkhttp.Context, botKind, robotID, channelID string, channelType uint8, hasOBOContext bool) error {
+	switch botKind {
+	case BotKindApp:
+		// Rule 1: App Bot only supports DM
+		if channelType != common.ChannelTypePerson.Uint8() {
+			return errBotSendPermAppBotDMOnly
+		}
+		// Rule 2: Must have friend relationship (user opt-in via /v1/robot/apply)
+		isFriend, err := ba.isFriend(robotID, channelID)
+		if err != nil {
+			ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageFriend, sendPermissionReasonQueryError)
+			return errBotSendPermCheckFailed
+		}
+		if !isFriend {
+			return errBotSendPermConvNotStarted
+		}
+		// Rule 3: Space bot — user must still be a space member (fail-closed)
+		if scope, _ := c.Get(CtxKeyAppBotScope); scope == "space" {
+			spaceIDStr, _ := c.Get(CtxKeyAppBotSpaceID)
+			sid, _ := spaceIDStr.(string)
+			if sid == "" {
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageSpaceContext, sendPermissionReasonMissingContext)
+				return errBotSendPermCheckFailed
+			}
+			isMember, memberErr := ba.isSpaceMember(channelID, sid)
+			if memberErr != nil {
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageSpaceMember, sendPermissionReasonQueryError)
+				return errBotSendPermCheckFailed
+			}
+			if !isMember {
+				return errBotSendPermNotSpaceMember
+			}
+		}
+		return nil
+
+	case BotKindUser:
+		if channelType == common.ChannelTypeGroup.Uint8() {
+			// Disband guard (WeChat-Work style read-only): once the group is
+			// disbanded everyone is read-only, bots included — even an OBO send
+			// on behalf of the (former) owner. The deployed WuKongIM
+			// /message/send returns HTTP 200 with no failure signal on a disband
+			// rejection, so the bot would otherwise believe its send succeeded.
+			// We self-check group.status here and return an explicit error.
+			// Placed BEFORE the OBO/membership branch so it applies regardless
+			// of OBO context.
+			if disbanded, err := ba.isGroupDisbanded(channelID); err != nil {
+				if errors.Is(err, dbr.ErrNotFound) {
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonNotFound)
+					return errBotSendPermGroupNotFound
+				}
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonQueryError)
+				return errBotSendPermCheckFailed
+			} else if disbanded {
+				return errBotSendPermGroupDisbanded
+			}
+			// OBO bypass: when the bot acts on behalf of a grantor who IS a
+			// group member, skip the bot's own membership check. The downstream
+			// checkOBO validates that the grantor has a legitimate grant+scope
+			// (or implicit scope via global_enabled) for this channel.
+			if !hasOBOContext {
+				// Group: check bot is a group member
+				count, err := ba.queryBotGroupMemberCount(channelID, robotID)
+				if err != nil {
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupMember, sendPermissionReasonQueryError)
+					return errBotSendPermCheckFailed
+				}
+				if count == 0 {
+					return errBotSendPermNotGroupMember
+				}
+			}
+		} else if channelType == common.ChannelTypeCommunityTopic.Uint8() {
+			// Thread: extract parent group_no and verify membership.
+			//
+			// Disband guard (parity with ChannelTypeGroup above): a disbanded
+			// parent group makes its threads read-only too. Parse the parent
+			// group_no and self-check status BEFORE the OBO/membership branch so
+			// it applies regardless of OBO context.
+			topicParts := strings.SplitN(channelID, threadChannelIDSeparator, 2)
+			if len(topicParts) != 2 {
+				return errBotSendPermBadThreadChan
+			}
+			if disbanded, err := ba.isGroupDisbanded(topicParts[0]); err != nil {
+				if errors.Is(err, dbr.ErrNotFound) {
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonNotFound)
+					return errBotSendPermGroupNotFound
+				}
+				ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupStatus, sendPermissionReasonQueryError)
+				return errBotSendPermCheckFailed
+			} else if disbanded {
+				return errBotSendPermGroupDisbanded
+			}
+			//
+			// PR#121 R7 (YUJ-1671) — OBO bypass parity with Group above.
+			// CommunityTopic fan-out (`obo_fanout.go` / mention-gated)
+			// already delivers topic messages to clone bots that are
+			// NOT parent-group members; the bot must be allowed to reply
+			// on behalf of a grantor who IS a member. Without this
+			// bypass, `checkSendPermission` rejects the OBO reply with
+			// "bot is not a member of this group" before `checkOBO`
+			// gets the chance to authorize the grantor. Mirrors the
+			// `if !hasOBOContext` skip used by ChannelTypeGroup just
+			// above. Live grantor membership is still re-verified by
+			// `checkOBO` → `grantorCanReadChannel`, so the bypass does
+			// not widen access (the grantor must currently be in the
+			// parent group, or the implicit-scope membership branch
+			// will fail).
+			if !hasOBOContext {
+				parts := strings.SplitN(channelID, threadChannelIDSeparator, 2)
+				if len(parts) != 2 {
+					return errBotSendPermBadThreadChan
+				}
+				count, err := ba.queryBotGroupMemberCount(parts[0], robotID)
+				if err != nil {
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageGroupMember, sendPermissionReasonQueryError)
+					return errBotSendPermCheckFailed
+				}
+				if count == 0 {
+					return errBotSendPermNotGroupMember
+				}
+			}
+		} else if channelType == common.ChannelTypePerson.Uint8() {
+			// DM: creator can always talk to their bot; otherwise check friend
+			// OR the OBO managed-persona implicit bypass (PR#82 R6 P0).
+			robot := getRobotFromContext(c)
+			isCreator := robot != nil && robot.CreatorUID == channelID
+			if !isCreator {
+				// isFriendOrOBOBypass tries the friend lookup first; if
+				// the bot isn't a friend of the target AND the caller
+				// signals OBO context, it falls back to the OBO bypass —
+				// "any active grant covering this channel where the
+				// grantor still has a relation with the target". The
+				// bypass is required by the managed-persona path: admin
+				// grants the clone bot james OBO over admin↔bob; james
+				// MUST be able to send (as admin) to bob even though
+				// james and bob are not friends. PR#82 R7 — the bypass
+				// is GATED on hasOBOContext so plain bot sends, typing,
+				// readReceipt, and messages-sync (which dispatch AS the
+				// bot, not AS the grantor) cannot piggy-back on an
+				// unrelated grant to skip the user opt-in friend gate.
+				// See modules/bot_api/obo_friend_gate.go for the
+				// rationale and the regression that motivated R7.
+				allowed, err := ba.isFriendOrOBOBypass(robotID, channelID, channelType, hasOBOContext)
+				if err != nil {
+					ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageFriend, sendPermissionReasonQueryError)
+					if errors.Is(err, errBotSendPermOBOCheckFailed) {
+						return errBotSendPermNotFriend
+					}
+					return errBotSendPermCheckFailed
+				}
+				if !allowed {
+					return errBotSendPermNotFriend
+				}
+			}
+		}
+		return nil
+
+	default:
+		ba.observeSendPermissionFailure(c, botKind, channelType, sendPermissionStageBotKind, sendPermissionReasonUnknown)
+		return errBotSendPermCheckFailed
+	}
+}
+
+func (ba *BotAPI) queryBotGroupMemberCount(groupNo, robotID string) (int, error) {
+	if ba.groupMemberCountOverride != nil {
+		return ba.groupMemberCountOverride(groupNo, robotID)
+	}
+	var count int
+	err := ba.db.session.SelectBySql(
+		"SELECT COUNT(*) FROM group_member WHERE group_no=? AND uid=? AND is_deleted=0",
+		groupNo, robotID,
+	).LoadOne(&count)
+	if err != nil {
+		return 0, fmt.Errorf("query bot group membership: %w", err)
+	}
+	return count, nil
+}
+
+// isSpaceMember checks if a user is a member of the given space.
+func (ba *BotAPI) isSpaceMember(uid, spaceID string) (bool, error) {
+	if ba.spaceMemberQueryOverride != nil {
+		return ba.spaceMemberQueryOverride(uid, spaceID)
+	}
+	var count int
+	err := ba.db.session.SelectBySql(
+		"SELECT COUNT(*) FROM space_member WHERE space_id=? AND uid=? AND status=1",
+		spaceID, uid,
+	).LoadOne(&count)
+	if err != nil {
+		return false, fmt.Errorf("query space membership: %w", err)
+	}
+	return count > 0, nil
+}
+
+// isGroupDisbanded reports whether the group identified by groupNo is in the
+// disbanded (read-only) state. Used by checkSendPermission to block bot sends
+// to disbanded groups/threads — the deployed WuKongIM /message/send gives no
+// failure signal on a disband rejection, so octo-server must self-check.
+// The raw lookup error is preserved for errors.Is classification. Callers stay
+// fail-closed and decide whether dbr.ErrNotFound is a business not-found result
+// or whether another error is an internal query failure.
+func (ba *BotAPI) isGroupDisbanded(groupNo string) (bool, error) {
+	if ba.groupStatusQueryOverride != nil {
+		status, err := ba.groupStatusQueryOverride(groupNo)
+		if err != nil {
+			return false, fmt.Errorf("query group status: %w", err)
+		}
+		return status == group.GroupStatusDisband, nil
+	}
+	// db 未初始化时（如单元测试 stub 不注入 db），无法查询群状态。
+	// 跳过 disband 检查而非 fail-closed：调用方（fanoutForMessage）在没有
+	// 完整 DB 的环境下不应被 disband guard 阻断。生产环境 db 始终已初始化。
+	if ba.db == nil || ba.db.session == nil {
+		return false, nil
+	}
+	var status int
+	err := ba.db.session.SelectBySql(
+		"SELECT status FROM `group` WHERE group_no=?",
+		groupNo,
+	).LoadOne(&status)
+	if err != nil {
+		return false, fmt.Errorf("query group status: %w", err)
+	}
+	return status == group.GroupStatusDisband, nil
+}
+
+// ==================== Read Receipt ====================
+
+// BotReadReceiptReq is the request for readReceipt.
+type BotReadReceiptReq struct {
+	ChannelID   string   `json:"channel_id"`
+	ChannelType uint8    `json:"channel_type"`
+	MessageIDs  []string `json:"message_ids"`
+}
+
+// readReceipt handles POST /v1/bot/readReceipt.
+func (ba *BotAPI) readReceipt(c *wkhttp.Context) {
+	var req BotReadReceiptReq
+	if err := c.BindJSON(&req); err != nil {
+		respondBotAPIRequestInvalid(c, "")
+		return
+	}
+	if strings.TrimSpace(req.ChannelID) == "" {
+		respondBotAPIRequestInvalid(c, "channel_id")
+		return
+	}
+
+	robotID := getRobotIDFromContext(c)
+	channelType := uint8(common.ChannelTypePerson)
+	if req.ChannelType > 0 {
+		channelType = req.ChannelType
+	}
+
+	// Permission check: bot must have access to this channel.
+	// PR#82 R7 — readReceipt has no `on_behalf_of` field and always
+	// dispatches AS the bot, so the OBO friend-gate bypass MUST NOT
+	// apply here (hasOBOContext=false).
+	botKind := getBotKindFromContext(c)
+	if err := ba.checkSendPermission(c, botKind, robotID, req.ChannelID, channelType, false); err != nil {
+		respondSendPermissionError(c, err)
+		return
+	}
+
+	// If channel_type was defaulted (0) for an App Bot, verify the channel_id is
+	// not actually a group — otherwise callers could bypass the DM-only restriction.
+	if req.ChannelType == 0 && botKind == BotKindApp {
+		var groupCount int
+		grpErr := ba.db.session.SelectBySql(
+			"SELECT COUNT(*) FROM `group` WHERE group_no=? AND is_deleted=0", req.ChannelID,
+		).LoadOne(&groupCount)
+		if grpErr != nil {
+			ba.Error("verify channel type failed", zap.Error(grpErr), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if groupCount > 0 {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotDMOnly, nil, nil)
+			return
+		}
+	}
+
+	channelID := ba.resolveSpaceChannelID(robotID, req.ChannelID, channelType)
+
+	// 1. Clear conversation unread badge
+	err := ba.ctx.IMClearConversationUnread(config.ClearConversationUnreadReq{
+		UID:         robotID,
+		ChannelID:   channelID,
+		ChannelType: channelType,
+		Unread:      0,
+	})
+	if err != nil {
+		ba.Warn("清除未读计数失败", zap.Error(err))
+	}
+
+	// 2. Message-level read receipt
+	if len(req.MessageIDs) > 100 {
+		respondBotAPILimitExceeded(c, "message_ids", 100)
+		return
+	}
+	if len(req.MessageIDs) > 0 {
+		messageIDs := make([]int64, 0, len(req.MessageIDs))
+		for _, idStr := range req.MessageIDs {
+			mid, parseErr := strconv.ParseInt(idStr, 10, 64)
+			if parseErr != nil {
+				ba.Warn("解析消息ID失败", zap.String("id", idStr), zap.Error(parseErr))
+				continue
+			}
+			messageIDs = append(messageIDs, mid)
+		}
+		if len(messageIDs) == 0 {
+			c.ResponseOK()
+			return
+		}
+
+		fakeChannelID := channelID
+		if channelType == common.ChannelTypePerson.Uint8() {
+			fakeChannelID = common.GetFakeChannelIDWith(channelID, robotID)
+		}
+
+		searchChannelID := channelID
+		if channelType == common.ChannelTypePerson.Uint8() {
+			searchChannelID = robotID
+		}
+		syncMsg, err := ba.ctx.IMSearchMessages(&config.MsgSearchReq{
+			ChannelID:   searchChannelID,
+			ChannelType: channelType,
+			MessageIds:  messageIDs,
+			LoginUID:    robotID,
+		})
+		if err != nil {
+			ba.Error("查询消息失败", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if syncMsg != nil && len(syncMsg.Messages) > 0 {
+			valueStrings := make([]string, 0, len(syncMsg.Messages))
+			valueArgs := make([]interface{}, 0, len(syncMsg.Messages)*4)
+			for _, msg := range syncMsg.Messages {
+				valueStrings = append(valueStrings, "(?, ?, ?, ?)")
+				valueArgs = append(valueArgs, msg.MessageID, fakeChannelID, channelType, robotID)
+			}
+			stmt := fmt.Sprintf(`INSERT INTO member_readed (message_id, channel_id, channel_type, uid) VALUES %s ON DUPLICATE KEY UPDATE message_id=VALUES(message_id)`,
+				strings.Join(valueStrings, ","))
+			_, err = ba.db.session.InsertBySql(stmt, valueArgs...).Exec()
+			if err != nil {
+				ba.Error("插入已读记录失败", zap.Error(err))
+				httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
+				return
+			}
+
+			// Write Redis cache for read receipt aggregation
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						ba.Error("goroutine panic",
+							zap.Any("recover", r),
+							zap.String("stack", string(debug.Stack())),
+						)
+					}
+				}()
+				for _, msg := range syncMsg.Messages {
+					messageIDStr := strconv.FormatInt(msg.MessageID, 10)
+					cacheData := map[string]interface{}{
+						"MessageID":      msg.MessageID,
+						"MessageIDStr":   messageIDStr,
+						"MessageSeq":     msg.MessageSeq,
+						"FromUID":        msg.FromUID,
+						"ChannelID":      fakeChannelID,
+						"ChannelType":    channelType,
+						"LoginUID":       robotID,
+						"ReqChannelID":   channelID,
+						"ReqChannelType": channelType,
+					}
+					jsonStr, _ := json.Marshal(cacheData)
+					ba.ctx.GetRedisConn().SetAndExpire(
+						fmt.Sprintf("readedCount:%s", messageIDStr),
+						string(jsonStr),
+						time.Hour*24*7,
+					)
+				}
+			}()
+		}
+	}
+
+	c.ResponseOK()
+}
+
+// ==================== Message Edit ====================
+
+type botMessageEditReq struct {
+	MessageID   string         `json:"message_id"`
+	MessageSeq  uint32         `json:"message_seq"`
+	ChannelID   string         `json:"channel_id"`
+	ChannelType uint8          `json:"channel_type"`
+	ContentEdit string         `json:"content_edit"`
+	TemplateRef map[string]any `json:"template_ref"`
+	State       string         `json:"state"`
+	Data        map[string]any `json:"data"`
+	CardSeq     int64          `json:"card_seq"`
+	Transient   bool           `json:"transient"`
+	// Presence is tracked separately from decoded values so the raw/Registry
+	// XOR cannot be bypassed with content_edit:"" or template_ref:null.
+	contentEditSet bool
+	templateRefSet bool
+}
+
+func (r *botMessageEditReq) UnmarshalJSON(data []byte) error {
+	type wire botMessageEditReq
+	var decoded wire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*r = botMessageEditReq(decoded)
+	_, r.contentEditSet = fields["content_edit"]
+	_, r.templateRefSet = fields["template_ref"]
+	return nil
+}
+
+// botMessageEdit handles POST /v1/bot/message/edit.
+func (ba *BotAPI) botMessageEdit(c *wkhttp.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardmsg.MaxSendBodyBytes)
+	var req botMessageEditReq
+	if err := c.BindJSON(&req); err != nil {
+		respondBotAPIRequestInvalid(c, "")
+		return
+	}
+	if req.MessageID == "" {
+		respondBotAPIRequestInvalid(c, "message_id")
+		return
+	}
+	if req.ChannelID == "" {
+		respondBotAPIRequestInvalid(c, "channel_id")
+		return
+	}
+	rawMode := req.contentEditSet
+	templateMode := req.templateRefSet
+	if rawMode && templateMode {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
+	if !rawMode && !templateMode {
+		respondBotAPIRequestInvalid(c, "content_edit")
+		return
+	}
+	if rawMode && strings.TrimSpace(req.ContentEdit) == "" {
+		respondBotAPIRequestInvalid(c, "content_edit")
+		return
+	}
+	if templateMode && (strings.TrimSpace(req.State) == "" || req.Data == nil || req.CardSeq <= 0) {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
+
+	robotID := getRobotIDFromContext(c)
+	if robotID == "" {
+		ba.respondBotAPIIdentityMissing(c)
+		return
+	}
+
+	// 解散守卫（企业微信式只读）：群解散后禁止 bot 编辑历史消息。
+	if req.ChannelType == common.ChannelTypeGroup.Uint8() {
+		if disbanded, err := ba.isGroupDisbanded(req.ChannelID); err != nil {
+			ba.Error("查询群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
+			return
+		}
+	} else if req.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+		parts := strings.SplitN(req.ChannelID, "____", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			// fail-closed：畸形 thread channel_id 拒绝操作，
+			// 与 message/api.go 的 thread disband guard 保持一致。
+			ba.Error("解析子区频道ID失败（edit）", zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if disbanded, err := ba.isGroupDisbanded(parts[0]); err != nil {
+			ba.Error("查询父群是否已解散错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		} else if disbanded {
+			httperr.ResponseErrorLWithStatus(c, errcode.ErrBotAPIGroupDisbanded, nil, nil)
+			return
+		}
+	}
+
+	if templateMode {
+		ba.botMessageEditViaRegistry(c, &req, robotID)
+		return
+	}
+
+	// Permission: bot can only edit its own messages
+	var msgFromUID string
+	var msgPayload []byte // 原消息 payload（Decision 7 需要判定目标消息是否卡片）
+	if req.MessageSeq > 0 {
+		resp, err := ba.ctx.IMGetWithChannelAndSeqs(req.ChannelID, req.ChannelType, robotID, []uint32{req.MessageSeq})
+		if err != nil {
+			ba.Error("查询消息错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if resp == nil || len(resp.Messages) == 0 {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
+			return
+		}
+		if req.MessageID != strconv.FormatInt(resp.Messages[0].MessageID, 10) {
+			// P0（PR#548 review）：硬拒绝 message_id/message_seq 不匹配 —— 与用户编辑
+			// 路径 ErrMessageIDSeqMismatch 对称。所有权只在 (channel, seq) 上校验,而
+			// message_extra 写入按调用方另给的 message_id 落行（UNIQUE(message_id) 单
+			// 表,ON DUPLICATE KEY UPDATE 命中任意归属行）。warn-only 会形成 confused-
+			// deputy:攻击 bot 用自己拥有的 seq + 受害 message_id 覆盖他人卡片的
+			// content_edit,进而伪造该卡被点击时下发给受害 bot 的动作面。规范推荐 bot
+			// 省略 message_seq 由服务端解析（走下方 seq==0 安全分支）,合法调用方不受影响。
+			ba.Warn("message_id与message_seq不匹配,拒绝",
+				zap.String("req_message_id", req.MessageID),
+				zap.Int64("actual_message_id", resp.Messages[0].MessageID),
+				zap.Uint32("message_seq", req.MessageSeq),
+			)
+			respondBotAPIRequestInvalid(c, "message_id")
+			return
+		}
+		msgFromUID = resp.Messages[0].FromUID
+		msgPayload = resp.Messages[0].Payload
+	} else {
+		msgIDInt, parseErr := strconv.ParseInt(req.MessageID, 10, 64)
+		if parseErr != nil {
+			ba.Warn("message_id格式错误", zap.String("message_id", req.MessageID), zap.Error(parseErr))
+			respondBotAPIRequestInvalid(c, "message_id")
+			return
+		}
+		syncResp, err := ba.ctx.IMSearchMessages(&config.MsgSearchReq{
+			ChannelID:   req.ChannelID,
+			ChannelType: req.ChannelType,
+			MessageIds:  []int64{msgIDInt},
+			LoginUID:    robotID,
+		})
+		if err != nil {
+			ba.Error("查询消息错误", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if syncResp == nil || len(syncResp.Messages) == 0 {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
+			return
+		}
+		if syncResp.Messages[0].MessageSeq == 0 {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotDelivered, nil, nil)
+			return
+		}
+		msgFromUID = syncResp.Messages[0].FromUID
+		msgPayload = syncResp.Messages[0].Payload
+		req.MessageSeq = syncResp.Messages[0].MessageSeq
+	}
+	if msgFromUID != robotID {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageEditForbidden, nil, nil)
+		return
+	}
+
+	// App Bot: DM-only + must have friend relationship
+	botKind := getBotKindFromContext(c)
+	if botKind == BotKindApp {
+		if req.ChannelType != common.ChannelTypePerson.Uint8() {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotDMOnly, nil, nil)
+			return
+		}
+		isFriend, fErr := ba.userService.IsFriend(robotID, req.ChannelID)
+		if fErr != nil {
+			ba.Error("verify app bot friend failed", zap.Error(fErr), zap.String("robotID", robotID), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if !isFriend {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIConversationNotStarted, nil, nil)
+			return
+		}
+	}
+
+	// content_edit 收敛：编辑语义为整体替换正文，plain 服务端重算不信客户端。
+	// P2 D6：bot 卡片编辑路径解锁 —— 目标消息与编辑体的「是否卡片」必须一致
+	// （跨类型变异 card↔非card 双向拒绝，不变量 (a)）；两者皆卡片走 cardmsg 与 send
+	// 对称的 write-strict 校验 + 权威 plain 重算 + D9 card_seq；两者皆非卡片走
+	// richtext（=14）原有路径。user/robot 编辑路径对卡片仍永久拒绝（各自守卫）。
+	origIsCard := cardmsg.IsCardRawPayload(msgPayload)
+	editIsCard := cardmsg.IsCardContentEdit(req.ContentEdit)
+	if origIsCard && cardEnvelopeHasCatalogMarker(msgPayload) {
+		ba.Warn("raw card edit attempted to replace Registry-authored target", zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
+	if origIsCard != editIsCard {
+		ba.Warn("卡片编辑跨类型变异,拒绝", zap.String("messageID", req.MessageID),
+			zap.Bool("origIsCard", origIsCard), zap.Bool("editIsCard", editIsCard))
+		respondBotAPIRequestInvalid(c, "content_edit")
+		return
+	}
+	var (
+		err        error
+		cardSeq    int64
+		hasCardSeq bool
+	)
+	if editIsCard {
+		// bot 侧有效门禁：改卡与发卡（send.go 上方）、/v1/bot/card/profile.enabled 同源。
+		// 子开关 OCTO_BOT_CARD_ENABLED 关（或部署总开关关）时改卡一律拒绝——否则会出现
+		// 「profile 报 enabled:false、发卡被拒，却仍能经 /v1/bot/message/edit 改动已存在
+		// 卡片」的缺口，破坏「清单与实际门禁同源」不变量。排在撤回/删除与 normalize/CAS
+		// 之前 fail-fast。
+		if !cardmsg.BotEnabled() {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
+			return
+		}
+		if contentEditHasCatalogMarker(req.ContentEdit) {
+			ba.Warn("raw card edit attempted to forge Registry provenance", zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		// P2（PR#548 review）：撤回/删除门禁 —— 已撤回或全局删除的卡片不可再编辑,
+		// 与动作端点（api_card_action.go）的撤回门禁对称,避免在已回收的卡片上重填
+		// content_edit（该 content_edit 是动作端点信任的生效帧）。行不存在=未编辑过,
+		// 非撤回,放行。
+		var lifecycle struct {
+			Revoke    int `db:"revoke"`
+			IsDeleted int `db:"is_deleted"`
+		}
+		if lErr := ba.ctx.DB().SelectBySql("SELECT `revoke`, is_deleted FROM message_extra WHERE message_id=?", req.MessageID).LoadOne(&lifecycle); lErr != nil && lErr != dbr.ErrNotFound {
+			ba.Error("查询卡片撤回/删除状态失败", zap.Error(lErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if lifecycle.Revoke == 1 || lifecycle.IsDeleted == 1 {
+			ba.Warn("卡片已撤回/删除,拒绝编辑", zap.String("messageID", req.MessageID),
+				zap.Int("revoke", lifecycle.Revoke), zap.Int("isDeleted", lifecycle.IsDeleted))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
+			return
+		}
+		// P2 D6：type-17 content_edit 跑与 send 同一套 cardmsg 校验（白名单/大小/
+		// URL/profile 协商，v2 帧在此合法）+ Finalize 重算权威 plain，返回 canonical
+		// JSON 落库。card_seq（D9）随后做 CAS。
+		normalized, cErr := cardmsg.NormalizeContentEdit(req.ContentEdit)
+		if cErr != nil {
+			ba.Warn("InteractiveCard content_edit 校验失败", zap.Error(cErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		normalized, cErr = authorBotRawCardRenderProfile(normalized)
+		if cErr != nil {
+			ba.Warn("InteractiveCard content_edit render_profile 写入失败", zap.Error(cErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		// 落库列宽闸。必须在 render_profile 改写**之后**跑：改写会加一个顶层键并重跑
+		// Finalize，所以它之前量的不是最终字节。这条路径的两个写分支（带 card_seq 的
+		// CAS、不带的 LWW）和修订历史追加都消费下面这个 normalized，所以在这里查一次
+		// 就覆盖三者 —— 而 carddispatch.WriteCAS 里还有一道同口径的兜底。
+		//
+		// 为什么 raw 编辑也要查:cardmsg 只有 512 KiB 的 payload 上限,比承接它的
+		// TEXT 列宽 8 倍,所以一个 cardmsg 完全合法的帧照样存不下(PR#712 review:闸接了
+		// Mutate 与两个 CardUpdater 路径,漏了这条,超宽帧直达 INSERT)。
+		if _, cErr = carddispatch.NormalizeFrameForPersistence(normalized); cErr != nil {
+			ba.Warn("InteractiveCard content_edit 超出持久化列宽,拒绝编辑",
+				zap.Error(cErr), zap.String("messageID", req.MessageID),
+				zap.Int("frameBytes", len(normalized)))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		// per-Bot 策略门（task bot-setting-store）。**必须**加在 raw 编辑路径上：
+		// cardmsg.Validate 接受 acceptedProfiles 里的任意 profile，且不校验编辑帧与
+		// 原消息的档位是否一致，所以缺了这道门就有一条提权通道 —— 先用 octo/v1 发一张
+		// 展示卡（display 开着即放行），再把 content_edit 换成带 Action.Submit 的
+		// octo/v2 帧；该帧正是动作端点信任的生效帧，于是 interaction_enabled=false 的
+		// Bot 也能产出可点击的交互卡。这与上方 BotEnabled() 出现在本路径的理由同源。
+		//
+		// 只作用于 raw 分支。模板分支（下方 botMessageEditRegistry）刻意不加门 ——
+		// 流式推理卡必须能编辑到终态，否则线上残留「永久处理中」的卡。
+		if ba.rejectRawCardEditByPolicy(c, normalized) {
+			return
+		}
+		req.ContentEdit = normalized
+		cardSeq, hasCardSeq = cardmsg.CardSeqFromContentEdit(normalized)
+	} else {
+		// 图文混排 RichText(=14)：编辑写入口对 content_edit 做与 send 路径对称的
+		// write-strict 校验 + 权威 plain 重算。非 14 / 非 JSON 体为 no-op。MD5 去重
+		// hash 落在 normalize 后的 canonical 体上。
+		normalizedEdit, rErr := richtext.NormalizeContentEdit(req.ContentEdit)
+		if rErr != nil {
+			ba.Warn("RichText content_edit 校验失败", zap.Error(rErr), zap.String("messageID", req.MessageID))
+			respondBotAPIRequestInvalid(c, "content_edit")
+			return
+		}
+		req.ContentEdit = normalizedEdit
+	}
+
+	contentEdit := dbr.NewNullString(req.ContentEdit).String
+	contentMD5 := util.MD5(contentEdit)
+
+	// content_edit_hash 去重短路（发生在下方 D9 card_seq CAS 之前）。这**不会**掩盖
+	// D9 stale 冲突：card_seq 是信封字段，已包含在 normalize 后的 canonical 体里，
+	// 故也计入 contentMD5。因此去重命中 ⟺ 与已存最新帧逐字节相同（含相同 card_seq）
+	// = 幂等重发，返回 OK 正确；任何 stale/乱序帧（更低或同 seq 但不同内容）hash 必
+	// 不同 → 不命中 → 走下方 CAS 得到 409。（PR#548 review 非阻塞项，已加测试佐证。）
+	var existCount int
+	err = ba.ctx.DB().Select("count(*)").From("message_extra").Where("message_id=? and content_edit_hash=?", req.MessageID, contentMD5).LoadOne(&existCount)
+	if err != nil {
+		ba.Error("查询是否存在相同正文失败！", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+		return
+	}
+	if existCount > 0 {
+		c.ResponseOK()
+		return
+	}
+
+	fakeChannelID := req.ChannelID
+	if req.ChannelType == common.ChannelTypePerson.Uint8() {
+		fakeChannelID = common.GetFakeChannelIDWith(robotID, req.ChannelID)
+	}
+
+	editedAt := int(time.Now().Unix())
+	if hasCardSeq {
+		// P2 D9：带 card_seq 的卡片编辑走共享条件 CAS。生产 CardMutator 的 backend
+		// 已统一承担 InnoDB 死锁/锁等待的有界重试；这里单次委托，避免嵌套重试把
+		// 最坏事务次数从 5 放大到 25。
+		conflict, casErr := ba.cardSeqCASWrite(req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, editedAt, cardSeq)
+		if casErr != nil {
+			ba.Error("card_seq CAS 写入编辑内容失败！", zap.Error(casErr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
+			return
+		}
+		if conflict {
+			ba.Warn("card_seq 乱序/迟到帧,拒绝", zap.String("messageID", req.MessageID), zap.Int64("incoming", cardSeq))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardSeqConflict, nil, nil)
+			return
+		}
+	} else {
+		// 非 card_seq 帧:last-write-wins(D9,单写 bot 与既有编辑零行为变化)。仍须在
+		// 行锁内分配 version —— 锁外前置分配会让并发写(与 CAS 帧、或与另一非 CAS 帧)
+		// 的 version 分配序 ≠ 提交序:低 version 的 upsert 若后提交会覆盖已提交的高
+		// version,令 delta-sync(version>? 游标)永久漏掉终帧(PR#548 review P1，与 CAS
+		// 分支同一类单调性缺陷)。有界重试化解 InnoDB 死锁(与 CAS 写同口径)。
+		var werr error
+		for attempt := 0; attempt < cardSeqCASMaxAttempts; attempt++ {
+			werr = ba.cardVersionInLockWrite(req.MessageID, req.MessageSeq, fakeChannelID, req.ChannelType, contentEdit, contentMD5, editedAt)
+			if werr == nil || !isRetriableMySQLLockErr(werr) {
+				break
+			}
+			// Report the whole-transaction retry on the shared allocator metric
+			// (reserve_total result=retry). With the #627 D4 uniform lock order
+			// this is a backstop (1205 lock-wait under load); the transactional
+			// same-message deadlock is removed at the root.
+			ba.seqStore.ObserveReserveRetry()
+			time.Sleep(time.Duration(attempt+1) * 3 * time.Millisecond)
+		}
+		if werr != nil {
+			ba.Error("card 编辑(无 card_seq)写入失败！", zap.Error(werr), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
+			return
+		}
+	}
+
+	// P2 D10：非 transient 卡片帧追加修订历史（best-effort —— content_edit 已是
+	// 权威状态，history 是次级面，append 失败只记日志、不阻断编辑）。richtext 编辑
+	// 与 transient 进度帧不入历史。
+	if editIsCard && !cardmsg.TransientFromContentEdit(req.ContentEdit) {
+		rev := cardrevision.Revision{
+			MessageID:   req.MessageID,
+			ChannelID:   fakeChannelID,
+			ChannelType: req.ChannelType,
+			Content:     dbr.NewNullString(req.ContentEdit),
+			Plain:       cardmsg.PlainFromContentEdit(req.ContentEdit),
+			EditorUID:   robotID,
+			EditedAt:    int64(editedAt),
+		}
+		if hasCardSeq {
+			rev.CardSeq = dbr.NewNullInt64(cardSeq)
+		}
+		if rerr := ba.cardRevisions.AppendFrame(rev); rerr != nil {
+			ba.Error("卡片修订历史追加失败(不影响编辑)", zap.Error(rerr), zap.String("messageID", req.MessageID))
+		}
+	}
+
+	err = ba.ctx.SendCMD(config.MsgCMDReq{
+		NoPersist:   true,
+		ChannelID:   req.ChannelID,
+		ChannelType: req.ChannelType,
+		FromUID:     robotID,
+		CMD:         common.CMDSyncMessageExtra,
+	})
+	if err != nil {
+		ba.Error("发送 CMD 同步失败！", zap.Error(err))
+	}
+
+	c.ResponseOK()
+}
+
+// botMessageEditViaRegistry compiles one complete replacement frame and hands
+// it to the same CardMutator used by first-party card updates. The mutator owns
+// the second authoritative lookup plus ownership/lifecycle/CAS/revision/CMD
+// checks; Snapshot is used only to pin the effective stored template identity
+// before rendering.
+func (ba *BotAPI) botMessageEditViaRegistry(c *wkhttp.Context, req *botMessageEditReq, robotID string) {
+	if !cardmsg.BotEnabled() {
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardDisabled, nil, nil)
+		return
+	}
+	if ba.cardTemplates == nil || ba.cardMutator == nil {
+		ba.Error("Bot Registry edit wiring unavailable", zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+	ref, err := ba.cardTemplates.requireEditableRef(req.TemplateRef)
+	if err != nil {
+		if errors.Is(err, errBotTemplateRequestInvalid) {
+			ba.Warn("Bot Registry edit template_ref 非法或未开放", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		ba.Error("Bot Registry edit catalog 不可用", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+
+	snapshot, err := ba.cardMutator.Snapshot(c.Request.Context(), carddispatch.CardMutationTarget{
+		SenderUID: robotID, MessageID: req.MessageID, MessageSeq: req.MessageSeq,
+		ChannelID: req.ChannelID, ChannelType: req.ChannelType,
+	})
+	if err != nil {
+		ba.respondBotTemplateSnapshotError(c, req.MessageID, err)
+		return
+	}
+	if err := requireEffectiveCardTemplate(snapshot.Envelope, ref, robotID); err != nil {
+		ba.Warn("Bot Registry edit 目标模板不匹配", zap.Error(err), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return
+	}
+
+	// Preserve the existing App Bot edit contract after target ownership is
+	// established: App Bots remain DM-only and the peer must be a friend.
+	if getBotKindFromContext(c) == BotKindApp {
+		if req.ChannelType != common.ChannelTypePerson.Uint8() {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIAppBotDMOnly, nil, nil)
+			return
+		}
+		isFriend, friendErr := ba.userService.IsFriend(robotID, req.ChannelID)
+		if friendErr != nil {
+			ba.Error("verify app bot friend failed", zap.Error(friendErr), zap.String("robotID", robotID), zap.String("channelID", req.ChannelID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+			return
+		}
+		if !isFriend {
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIConversationNotStarted, nil, nil)
+			return
+		}
+	}
+
+	webLoginURL := ""
+	if ba.ctx != nil && ba.ctx.GetConfig() != nil {
+		webLoginURL = ba.ctx.GetConfig().External.WebLoginURL
+	}
+	spaceID := effectiveEnvelopeSpaceID(snapshot.Envelope)
+	rendered, err := ba.cardTemplates.RenderEditPayloadForPrincipal(c.Request.Context(), robotID, map[string]any{
+		"type":         cardmsg.InteractiveCard.Int(),
+		"template_ref": req.TemplateRef,
+		"state":        req.State,
+		"data":         req.Data,
+	}, cardtmpl.BuildEnv{
+		WebLoginURL: webLoginURL,
+		Lang:        i18n.OutboundLanguage(c.Request.Context()),
+		SpaceID:     spaceID,
+	})
+	if err != nil {
+		if errors.Is(err, errBotTemplateRequestInvalid) {
+			ba.Warn("Bot Registry edit 模板请求非法", zap.Error(err), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return
+		}
+		ba.Error("Bot Registry edit 模板渲染失败", zap.Error(err), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+	// Registry.Render owns card content but intentionally does not emit the
+	// envelope-level Space identity. Preserve only the server-authored value
+	// pinned by Snapshot; never re-resolve from the bot's current Space or accept
+	// a caller-supplied value, either of which could move an existing DM card
+	// across tenant views. Delete first so an empty authoritative value remains
+	// fail-closed even if a future renderer starts returning a space_id field.
+	delete(rendered, "space_id")
+	if spaceID != "" {
+		rendered["space_id"] = spaceID
+	}
+	rendered["card_seq"] = req.CardSeq
+	if req.Transient {
+		rendered["transient"] = true
+	}
+	raw, err := json.Marshal(rendered)
+	if err != nil {
+		ba.Error("Bot Registry edit marshal 失败", zap.Error(err), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+	contentEdit, err := cardmsg.NormalizeContentEdit(string(raw))
+	if err != nil {
+		ba.Error("Bot Registry edit normalize 失败", zap.Error(err), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return
+	}
+
+	_, err = ba.cardMutator.Mutate(c.Request.Context(), carddispatch.CardMutationRequest{
+		SenderUID: robotID, MessageID: req.MessageID, MessageSeq: req.MessageSeq,
+		ChannelID: req.ChannelID, ChannelType: req.ChannelType, ContentEdit: contentEdit,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, carddispatch.ErrCardMutationConflict):
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardSeqConflict, nil, nil)
+		case errors.Is(err, carddispatch.ErrCardMutationForbidden):
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageEditForbidden, nil, nil)
+		case errors.Is(err, carddispatch.ErrCardMutationNotFound):
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
+		case errors.Is(err, carddispatch.ErrCardMutationInvalid):
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		default:
+			ba.Error("Bot Registry edit mutation 失败", zap.Error(err), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPIStoreFailed, nil, nil)
+		}
+		return
+	}
+	c.ResponseOK()
+}
+
+func (ba *BotAPI) respondBotTemplateSnapshotError(c *wkhttp.Context, messageID string, err error) {
+	switch {
+	case errors.Is(err, carddispatch.ErrCardMutationForbidden):
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageEditForbidden, nil, nil)
+	case errors.Is(err, carddispatch.ErrCardMutationNotFound):
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIMessageNotFound, nil, nil)
+	case errors.Is(err, carddispatch.ErrCardMutationInvalid):
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+	default:
+		ba.Error("Bot Registry edit snapshot 失败", zap.Error(err), zap.String("messageID", messageID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPIQueryFailed, nil, nil)
+	}
+}
+
+func effectiveEnvelopeSpaceID(raw json.RawMessage) string {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	spaceID, _ := payload["space_id"].(string)
+	return spaceID
+}
+
+func contentEditHasCatalogMarker(contentEdit string) bool {
+	return cardEnvelopeHasCatalogMarker([]byte(contentEdit))
+}
+
+// cardEnvelopeHasCatalogMarker 报告一个信封是否携带任一 server-only catalog
+// 标记（template_ref / catalog_provenance，PR-C D3）。raw 编辑路径用它双向
+// 拒绝：目标是 Registry/internal 产出的帧 → raw 不能覆盖；编辑体携带标记 →
+// raw 不能伪造。
+func cardEnvelopeHasCatalogMarker(raw []byte) bool {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false
+	}
+	if _, exists := payload[cardmsg.CatalogTemplateRefKey]; exists {
+		return true
+	}
+	_, exists := payload[cardmsg.CatalogProvenanceKey]
+	return exists
+}
+
+// rejectByBotCardPolicy enforces the per-Bot card switches on the send path
+// (task bot-setting-store). Returns true when it has already written a
+// response and the caller must return.
+//
+// This is deliberately a second gate rather than trusting the manifest: a
+// producer can hold a stale /v1/bot/card/profile, or simply ignore it, so the
+// switch has to be enforced where the message is actually accepted. Both sides
+// read robot.IService.BotCardConfig, so what the manifest advertises and what
+// this accepts cannot drift.
+//
+// Every rejection collapses into the single generic ErrBotAPICardInvalid and
+// the specific reason goes to the log only. Splitting it into "reasoning is off
+// for you" vs "that template is not yours" would let a caller probe another
+// bot's configuration by差分 the error code.
+func (ba *BotAPI) rejectByBotCardPolicy(c *wkhttp.Context, payload map[string]interface{}, templateMode bool) bool {
+	robotID := getRobotIDFromContext(c)
+	if robotID == "" {
+		ba.respondBotAPIIdentityMissing(c)
+		return true
+	}
+	config, err := ba.resolveBotCardConfig(robotID)
+	if err != nil {
+		// Fail closed. Substituting defaults here would let a DB blip re-open a
+		// capability the owner switched off.
+		ba.Error("查询 Bot 卡片配置失败", zap.Error(err), zap.String("robot", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return true
+	}
+
+	if templateMode {
+		// 模板卡只看 reasoning 开关，**不看** display/interaction —— 推理卡自身
+		// 横跨两档（active/error 是 octo/v2、result 是 octo/v1），若让 interaction
+		// 参与判定，关掉交互卡会把推理卡砍成只剩终态。
+		ref, refErr := parseBotTemplateRef(payload["template_ref"])
+		if refErr != nil {
+			ba.Warn("Bot 模板 ref 形状非法", zap.Error(refErr), zap.String("robot", robotID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
+		}
+		allowed, mapped := botTemplateSwitchFor(ref.ID, config)
+		if !mapped {
+			// 未映射到任何开关的模板 id：**fail closed**。今天只广告推理卡一张，
+			// 但若日后往 AdvertisedSend 里加了模板却忘了给它配开关，放行会让它
+			// 完全绕过 per-Bot 策略。未广告的 id 走到这里同样被拒，与下游
+			// requireRef 的结论一致（同一个泛化码）。
+			ba.Warn("模板 id 未映射到 per-Bot 开关，fail-closed 拒绝",
+				zap.String("robot", robotID), zap.String("template", string(ref.ID)))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
+		}
+		if !allowed {
+			ba.Warn("Bot 推理卡已关闭，拒绝模板发送", zap.String("robot", robotID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
+		}
+		advertised, ok := ba.cardTemplates.AdvertisedRef(ref.ID)
+		if !ok || advertised != ref {
+			ba.Warn("Bot 模板 ref 与本部署广告集不一致，拒绝",
+				zap.String("robot", robotID), zap.String("version", ref.Version))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
+		}
+		return false
+	}
+
+	// raw 卡：按已校验的 profile 分档。这两个开关只作用于 Bot 自拼的 raw 卡，
+	// 绝不用来切模板卡的 wire profile。
+	profile, _ := payload["profile"].(string)
+	return ba.rejectRawCardByProfile(c, robotID, profile, config)
+}
+
+// botTemplateSwitchFor maps an advertised template to the per-Bot switch that
+// governs it. The second return is false for any template with no mapping, and
+// callers must fail closed on that.
+//
+// Deliberately a lookup rather than an `if id == reasoning` check: the send gate
+// would otherwise let a newly advertised template through untouched, and that
+// regression would be silent. TestBotTemplateSwitchCoversAdvertisedSet asserts
+// this map covers everything defaultBotTemplatePolicy advertises, so adding a
+// template without a switch fails the build's tests instead of production.
+func botTemplateSwitchFor(id cardtmpl.ID, config robot.BotCardConfig) (allowed, mapped bool) {
+	switch id {
+	case aireasoningprocess.TemplateID:
+		return config.ReasoningEnabled, true
+	default:
+		return false, false
+	}
+}
+
+// rejectRawCardEditByPolicy applies the raw-card switches to an already
+// normalized edit frame. Returns true when it has written a response.
+//
+// The edit frame's own profile is what matters, not the original message's:
+// cardmsg.Validate accepts any profile in the accepted set and does not compare
+// the two, so an edit is free to escalate octo/v1 → octo/v2. Checking the frame
+// being written closes that without needing to load the original.
+func (ba *BotAPI) rejectRawCardEditByPolicy(c *wkhttp.Context, normalizedEdit string) bool {
+	robotID := getRobotIDFromContext(c)
+	if robotID == "" {
+		ba.respondBotAPIIdentityMissing(c)
+		return true
+	}
+	config, err := ba.resolveBotCardConfig(robotID)
+	if err != nil {
+		ba.Error("查询 Bot 卡片配置失败", zap.Error(err), zap.String("robot", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+		return true
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(normalizedEdit), &payload); err != nil {
+		// Unreachable in practice: NormalizeContentEdit already produced this
+		// JSON. Fail closed rather than silently skipping the gate.
+		ba.Warn("解析已归一化的卡片编辑帧失败", zap.Error(err), zap.String("robot", robotID))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return true
+	}
+	profile, _ := payload["profile"].(string)
+	return ba.rejectRawCardByProfile(c, robotID, profile, config)
+}
+
+// rejectRawCardByProfile applies the display/interaction switches to one raw
+// frame's declared profile. Shared by the send and edit paths so a frame cannot
+// be refused on creation and then accepted as an edit.
+//
+// **display is a floor, not a peer of interaction.** octo/v2 is a strict
+// superset of octo/v1 — in cardmsg.validateCard the `interactive` flag only ever
+// relaxes checks, never requires an interactive element — so every card legal as
+// octo/v1 is also legal as octo/v2. Were the two switches treated as parallel
+// arms, a bot could defeat display_enabled=false by changing one string
+// (`"profile":"octo/v2"`) and sending byte-identical display-only cards. So an
+// octo/v2 frame needs BOTH switches: it is a display card that additionally
+// carries interaction.
+func (ba *BotAPI) rejectRawCardByProfile(
+	c *wkhttp.Context,
+	robotID, profile string,
+	config robot.BotCardConfig,
+) bool {
+	switch profile {
+	case cardmsg.ProfileV1:
+		if !config.AllowsRawDisplayCard() {
+			ba.Warn("Bot 展示卡已关闭，拒绝 raw 卡", zap.String("robot", robotID))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
+		}
+	case cardmsg.ProfileV2:
+		if !config.AllowsRawInteractiveCard() {
+			ba.Warn("Bot 展示卡或交互卡已关闭，拒绝 raw 交互卡",
+				zap.String("robot", robotID),
+				zap.Bool("display", config.DisplayEnabled),
+				zap.Bool("interaction", config.InteractionEnabled))
+			httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+			return true
+		}
+	default:
+		// cardmsg.Validate 已经把 profile 钉在接受集内，走到这里说明校验被绕过。
+		ba.Warn("Bot raw 卡 profile 不在接受集，拒绝",
+			zap.String("robot", robotID), zap.String("profile", profile))
+		httperr.ResponseErrorL(c, errcode.ErrBotAPICardInvalid, nil, nil)
+		return true
+	}
+	return false
+}
+
+// authorBotRawCardRenderProfile adds the deployment-owned visual compatibility
+// key after the caller-authored raw frame has passed cardmsg validation. UseNumber
+// preserves card_seq and any other 64-bit JSON integers across the rewrite.
+func authorBotRawCardRenderProfile(contentEdit string) (string, error) {
+	decoder := json.NewDecoder(strings.NewReader(contentEdit))
+	decoder.UseNumber()
+	var payload map[string]interface{}
+	if err := decoder.Decode(&payload); err != nil {
+		return "", err
+	}
+	if decoder.More() {
+		return "", errors.New("bot_api: card content_edit has trailing JSON data")
+	}
+	if !cardmsg.IsCardPayload(payload) {
+		return contentEdit, nil
+	}
+	payload["render_profile"] = cardmsg.RenderProfileOctoChatV1
+	if err := cardmsg.Validate(payload); err != nil {
+		return "", err
+	}
+	if err := cardmsg.Finalize(payload); err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// cardSeqCASMaxAttempts 是 D9 CAS 遇 InnoDB 死锁/锁等待超时的有界重试次数。
+const cardSeqCASMaxAttempts = 5
+
+// cardSeqCASWrite 执行 P2 D9 的 card_seq 条件 CAS 写：事务内 SELECT ... FOR UPDATE
+// 锁住该消息的 message_extra 行（不存在则取 next-key 锁串行化并发首帧），比对已存
+// card_seq —— 新值 ≤ 已存（非 NULL）→ 返回 conflict=true（乱序/迟到帧，什么都不写）；
+// 否则连 card_seq 一并 upsert 并提交。生产路径的可重试锁错误（1213/1205）由共享
+// CardMutator backend 统一有界重试；此处不再叠加第二层重试。
+//
+// P1-2（PR#548 review）：message_extra.version 在**拿到行锁之后**才分配。GenSeq
+// 是每-channel 单调递增,而 delta-sync 按 version 升序取增量帧
+// （db_message_extra.go:110 `where version>? order by version asc`）。若 version
+// 在锁外前置分配,一个更低 version 的帧可能赢下 card_seq CAS 却以更小 version 覆盖行
+// —— 已同步到更高 version 的客户端从此收不到该终帧（行在库里正确、但对 delta-sync
+// 不可见,违反 D6"各端收敛"/D9"no lost-update"）。锁内分配把竞争写的 GenSeq 调用按
+// 提交顺序串行化：赢家写（最大 seq、最后一次 advancing 写）必得最大 version。
+func (ba *BotAPI) cardSeqCASWrite(messageID string, messageSeq uint32, fakeChannelID string, channelType uint8, contentEdit, contentMD5 string, editedAt int, cardSeq int64) (conflict bool, err error) {
+	if ba.cardMutator != nil {
+		return ba.cardMutator.WriteCAS(carddispatch.CardMutationCASRequest{
+			MessageID: messageID, MessageSeq: messageSeq, ChannelID: fakeChannelID,
+			ChannelType: channelType, ContentEdit: contentEdit, ContentHash: contentMD5,
+			EditedAt: editedAt, CardSeq: cardSeq, StorageChannel: true,
+		})
+	}
+	// The local fallback needs the shared allocator. NewBotAPI wires seqStore
+	// alongside cardMutator; a hand-built &BotAPI{} literal that leaves both nil
+	// would otherwise nil-panic inside seqStore.Mode below — fail with a clear
+	// error instead.
+	if ba.seqStore == nil {
+		return false, fmt.Errorf("bot_api: card write fallback requires a configured seqStore (construct via NewBotAPI)")
+	}
+	tx, err := ba.ctx.DB().Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// #627 D4: choose the lock order by allocator mode so every message_extra
+	// writer shares one global order and cannot deadlock (mirrors the production
+	// path in carddispatch.casWriteOnce). transactional → reserve the channel
+	// sequence FIRST, then take the message-row lock; a stale-frame reject rolls
+	// the tx back and reverts the seq advance, so no version is consumed. legacy →
+	// message-row lock first (GenSeq has no serializing lock; PR#548 monotonicity).
+	mode, err := ba.seqStore.Mode(tx)
+	if err != nil {
+		return false, err
+	}
+	// casGate takes the message-row lock FOR UPDATE and evaluates the card_seq CAS.
+	// done=true means stop before writing: conflict=true is a stale/late frame;
+	// conflict=false with done=true is an idempotent replay (success, no write).
+	casGate := func() (conflict, done bool, gerr error) {
+		var stored struct {
+			CardSeq dbr.NullInt64 `db:"card_seq"`
+			Hash    string        `db:"content_edit_hash"`
+		}
+		if selErr := tx.SelectBySql("SELECT card_seq, content_edit_hash FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&stored); selErr != nil && selErr != dbr.ErrNotFound {
+			return false, true, selErr
+		}
+		if stored.CardSeq.Valid && stored.CardSeq.Int64 >= cardSeq {
+			if stored.CardSeq.Int64 == cardSeq && stored.Hash == contentMD5 {
+				return false, true, nil
+			}
+			return true, true, nil
+		}
+		return false, false, nil
+	}
+
+	var version int64
+	if mode == msgextraseq.ModeTransactional {
+		versions, rerr := ba.seqStore.ReserveTx(tx, fakeChannelID, channelType, 1)
+		if rerr != nil {
+			return false, rerr
+		}
+		version = versions[0]
+		if conflict, done, gerr := casGate(); gerr != nil || done {
+			return conflict, gerr
+		}
+	} else {
+		if conflict, done, gerr := casGate(); gerr != nil || done {
+			return conflict, gerr
+		}
+		versions, rerr := ba.seqStore.ReserveTx(tx, fakeChannelID, channelType, 1)
+		if rerr != nil {
+			return false, rerr
+		}
+		version = versions[0]
+	}
+	if _, err = tx.InsertBySql(
+		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version,card_seq) VALUES (?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version),card_seq=VALUES(card_seq)",
+		messageID, messageSeq, fakeChannelID, channelType, contentEdit, contentMD5, editedAt, version, cardSeq,
+	).Exec(); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// cardVersionInLockWrite 无 card_seq 的卡片编辑(LWW)写入：在行锁内分配 version 后
+// upsert content_edit —— 与 cardSeqCASWrite 取同一把 message_id 行锁(不存在则 next-key
+// 锁),使 version 分配序 == 提交序,杜绝锁外前置分配的低 version 覆盖并发写(CAS 或非
+// CAS)已提交的高 version 造成的 delta-sync 终帧丢失(PR#548 review P1)。不比较、不写
+// card_seq(保持 LWW 语义与既有 card_seq 值不变)。
+//
+// 单调性范围(PR#548 review H2/P1-b，纠正过度声明)：version 取自 ctx.GenSeq —— octo-lib
+// 的**进程内 HiLo 分配器**(进程级 seqMap+Mutex,每进程预留 seqStep=1000 的号段,DB 只补
+// 号段)。故「分配序==提交序」仅在**单进程内**成立:多副本部署下,持较低号段的实例可能在较
+// 高 version 提交后才抢到行锁、写入更低的 version;delta-sync(db_message_extra.go
+// `where version>? order by version asc`)会永久跳过该终帧,直到该客户端整表 resync。此为
+// **既有性质**(origin/main 富文本编辑亦用同一 GenSeq,本 PR 不触 config/seq.go),非本 PR
+// 引入 —— 本函数只关掉**进程内**竞态,TestBotCardEditMixedFrameVersionMonotonicIM 亦只验
+// 单进程。彻底的跨副本单调需把 version 换成频道级全序源(DB/Redis 原子计数),牵动所有
+// version 载体(含富文本),超出 #548 范围,列为后续。
+func (ba *BotAPI) cardVersionInLockWrite(messageID string, messageSeq uint32, fakeChannelID string, channelType uint8, contentEdit, contentMD5 string, editedAt int) error {
+	if ba.seqStore == nil {
+		return fmt.Errorf("bot_api: card write fallback requires a configured seqStore (construct via NewBotAPI)")
+	}
+	tx, err := ba.ctx.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.RollbackUnlessCommitted()
+
+	// #627 D4: uniform lock order by mode. transactional → reserve the channel
+	// sequence FIRST (seq → message-row), matching all other writers so no deadlock
+	// is possible. legacy → take the message-row lock FIRST to serialize GenSeq
+	// allocation for single-process monotonicity (PR#548). The message-row SELECT
+	// exists only to hold the lock; card_seq is deliberately not compared or
+	// written here (LWW leaves card_seq unchanged).
+	mode, err := ba.seqStore.Mode(tx)
+	if err != nil {
+		return err
+	}
+	lockMessageRow := func() error {
+		var lockHold dbr.NullInt64
+		if selErr := tx.SelectBySql("SELECT card_seq FROM message_extra WHERE message_id=? FOR UPDATE", messageID).LoadOne(&lockHold); selErr != nil && selErr != dbr.ErrNotFound {
+			return selErr
+		}
+		return nil
+	}
+
+	var version int64
+	if mode == msgextraseq.ModeTransactional {
+		versions, rerr := ba.seqStore.ReserveTx(tx, fakeChannelID, channelType, 1)
+		if rerr != nil {
+			return rerr
+		}
+		version = versions[0]
+		if lerr := lockMessageRow(); lerr != nil {
+			return lerr
+		}
+	} else {
+		if lerr := lockMessageRow(); lerr != nil {
+			return lerr
+		}
+		versions, rerr := ba.seqStore.ReserveTx(tx, fakeChannelID, channelType, 1)
+		if rerr != nil {
+			return rerr
+		}
+		version = versions[0]
+	}
+	if _, err = tx.InsertBySql(
+		"INSERT INTO message_extra (message_id,message_seq,channel_id,channel_type,content_edit,content_edit_hash,edited_at,version) VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE content_edit=VALUES(content_edit),content_edit_hash=VALUES(content_edit_hash),edited_at=VALUES(edited_at),version=VALUES(version)",
+		messageID, messageSeq, fakeChannelID, channelType, contentEdit, contentMD5, editedAt, version,
+	).Exec(); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// isRetriableMySQLLockErr 识别 InnoDB 可重试锁错误：1213 死锁 / 1205 锁等待超时
+// （与 modules/conversation_ext 同口径，errors.As 兼容包装错误）。
+func isRetriableMySQLLockErr(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == 1213 || mysqlErr.Number == 1205
+}

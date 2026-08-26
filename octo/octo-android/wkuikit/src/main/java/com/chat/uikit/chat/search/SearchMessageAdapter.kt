@@ -1,0 +1,83 @@
+/*
+ * Copyright 2026-present OctoIM contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.chat.uikit.chat.search
+
+import android.os.Build
+import android.text.Html
+import android.view.View
+import android.widget.ImageView
+import android.widget.TextView
+import com.chad.library.adapter.base.BaseQuickAdapter
+import com.chad.library.adapter.base.viewholder.BaseViewHolder
+import com.chat.base.entity.GlobalMessage
+import com.chat.base.msgitem.WKContentType
+import com.chat.base.ui.components.AvatarView
+import com.chat.base.utils.WKTimeUtils
+import com.chat.uikit.R
+import com.chat.uikit.chat.provider.WKFileProvider
+import com.chat.uikit.search.remote.GlobalAdapter
+import com.xinbida.wukongim.entity.WKChannelType
+
+class SearchMessageAdapter :
+    BaseQuickAdapter<GlobalMessage, BaseViewHolder>(R.layout.item_global_message_layout) {
+
+    var keyword: String = ""
+
+    override fun convert(holder: BaseViewHolder, item: GlobalMessage) {
+        val avatarView = holder.getView<AvatarView>(R.id.avatarView)
+        avatarView.setSize(40f)
+        // 频道内搜索结果每行展示发送人头像（与 web / iOS 对齐）。
+        // 原本展示 channel 头像在群里是群头像、在子区里无头像，所有行视觉一致但信息量低；
+        // 改为发送人头像后每行明确"谁发的"，子区也不会再出现空头像。
+        avatarView.showAvatar(item.from_uid, WKChannelType.PERSONAL)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            holder.setText(
+                R.id.nameTv,
+                Html.fromHtml(item.channel.getHtmlName(), Html.FROM_HTML_MODE_LEGACY)
+            )
+        } else {
+            holder.setText(R.id.nameTv, Html.fromHtml(item.channel.getHtmlName()))
+        }
+        val contentTv = holder.getView<TextView>(R.id.contentTv)
+        val fileTagIv = holder.getView<ImageView>(R.id.fileTagIv)
+        val type = item.getContentType()
+
+        if (type == WKContentType.WK_FILE) {
+            fileTagIv.visibility = View.VISIBLE
+            val extension = item.payload["extension"] as? String ?: ""
+            val fileName = item.payload["name"] as? String ?: ""
+            WKFileProvider.setFileIcon(fileTagIv, extension, fileName)
+        } else {
+            fileTagIv.visibility = View.GONE
+        }
+
+        val rawContent = item.payload["content"]
+        if (rawContent is String && rawContent.isNotEmpty() && !rawContent.contains("<mark>")) {
+            contentTv.text = GlobalAdapter.highlightKeyword(rawContent, keyword)
+        } else {
+            if (type == WKContentType.WK_TEXT) {
+                contentTv.text = Html.fromHtml(item.getHtmlText(), Html.FROM_HTML_MODE_LEGACY)
+            } else if (type == WKContentType.WK_FILE) {
+                contentTv.text = Html.fromHtml(item.getHtmlWithField("name"), Html.FROM_HTML_MODE_LEGACY)
+            }
+        }
+        holder.setText(
+            R.id.timeTv,
+            WKTimeUtils.getInstance().getTimeString(item.timestamp * 1000)
+        )
+    }
+}

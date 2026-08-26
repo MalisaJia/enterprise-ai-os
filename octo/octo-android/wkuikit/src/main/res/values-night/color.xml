@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="chat_face_tab_bg">#1D2733</color>
+    <color name="chat_function_text">#8E8F90</color>
+    <color name="pc_login_bg">#80111111</color>
+    <color name="chat_more_bg">#1D2733</color>
+    <color name="category_org_bg">#243048</color>
+    <color name="category_org_text">#96b3ed</color>
+    <color name="category_community_bg">#30283E</color>
+    <color name="category_community_text">#8DEC59D8</color>
+    <!-- 外部群标识：暗色模式下稍提亮度，保留紫色辨识度（对齐 web Semi purple） -->
+    <color name="external_group_tag_bg">#9B6DDF</color>
+    <color name="external_group_tag_text">#FFFFFF</color>
+    <color name="external_member_badge_bg">#7B1FA2</color>
+    <color name="external_member_badge_text">#FFFFFF</color>
+    <color name="external_member_source_text">#CE93D8</color>
+    <color name="tab_bg">#08090B</color>
+    <color name="tab_text_normal">#8CFFFFFF</color>
+    <color name="tab_text_selected">#FFFFFF</color>
+
+    <!-- ── Interactive Card (ContentType 17) 语义色（夜间）────────────────────
+         对齐 iOS `WKACardHostConfig.m:40-71` 深色分支：
+          - surface 走 #1C1C1E / emphasis 走 #2C2C2E（差 16 灰阶，克制而不喧宾夺主）
+          - good/warning/attention **不给专有背景**，全部沿用 default（跟 iOS 一致），
+            仅靠前景色（绿/橙/红文字与图标）表达语义，避免深色下低饱和暗底色显脏
+          - subtle 文字用 #B0B0B0（对齐 iOS fgSub） -->
+    <color name="interactive_card_bg">#1C1C1E</color>
+    <color name="interactive_card_bg_emphasis">#2C2C2E</color>
+    <!-- P1-B: accent 夜间也回归 default 底色（原 #2E2547 略紫），跟浅色模式方案对齐 —— 不靠背景色分层。 -->
+    <color name="interactive_card_bg_accent">#1C1C1E</color>
+    <color name="interactive_card_bg_good">#1C1C1E</color>
+    <color name="interactive_card_bg_warning">#1C1C1E</color>
+    <color name="interactive_card_bg_attention">#1C1C1E</color>
+    <color name="interactive_card_text_subtle">#B0B0B0</color>
+</resources>

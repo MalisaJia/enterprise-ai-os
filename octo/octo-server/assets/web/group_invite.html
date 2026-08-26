@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>群邀请</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+    <meta name="robots" content="noindex,nofollow">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #333; min-height: 100vh; }
+        .container { max-width: 420px; margin: 0 auto; padding: 0 16px; }
+        .card { margin-top: 32px; padding: 24px 20px; background: #fff; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); text-align: center; }
+        .avatar { width: 72px; height: 72px; border-radius: 12px; background: #e6e6e6; object-fit: cover; display: block; margin: 0 auto 12px; }
+        .group-name { font-size: 18px; font-weight: 600; color: #222; line-height: 1.4; word-break: break-all; }
+        .space-line {
+            font-size: 13px; color: #666; margin-top: 6px;
+            line-height: 1.5; word-break: break-all;
+        }
+        .space-line .space-icon { margin-right: 4px; }
+        .meta { font-size: 13px; color: #999; margin-top: 6px; }
+        .tip { font-size: 14px; color: #666; line-height: 1.6; margin-top: 16px; }
+        .btn-group { margin-top: 24px; display: flex; flex-direction: column; gap: 12px; }
+        .btn {
+            height: 44px; border: none; border-radius: 22px;
+            font-size: 15px; font-weight: 600; cursor: pointer;
+            transition: opacity 0.2s; text-decoration: none;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .btn:active { opacity: 0.7; }
+        .btn[disabled], .btn.disabled { opacity: 0.5; pointer-events: none; }
+        .btn-primary { background: #07c160; color: #fff; }
+        .btn-secondary { background: #f0f0f0; color: #333; }
+        .btn svg { flex: 0 0 auto; }
+        /* 下载行 = 下载按钮 + 复制链接。整行由 JS 在解析到合法地址后才显示。 */
+        .btn-row { gap: 8px; align-items: stretch; }
+        .btn-row .btn { flex: 1; min-width: 0; gap: 8px; }
+        .btn-copy {
+            flex: 0 0 auto; width: 44px; height: 44px; padding: 0;
+            border: none; border-radius: 22px; background: #f0f0f0; color: #666;
+            cursor: pointer; display: flex; align-items: center; justify-content: center;
+        }
+        .btn-copy:active { opacity: 0.7; }
+        .badge {
+            display: inline-block; padding: 2px 10px; border-radius: 10px;
+            font-size: 12px; line-height: 18px; margin-top: 8px;
+        }
+        .badge-warn { background: #fff3e0; color: #f57c00; }
+        .toast {
+            position: fixed; left: 50%; top: 32px; transform: translateX(-50%);
+            padding: 10px 16px; border-radius: 8px; font-size: 14px;
+            background: rgba(0,0,0,0.78); color: #fff; z-index: 1000;
+            max-width: 80%; text-align: center; display: none;
+        }
+        .loading { text-align: center; padding: 80px 20px; color: #999; font-size: 15px; }
+        .state-page { text-align: center; padding: 64px 20px; display: none; }
+        .state-page .icon { font-size: 48px; margin-bottom: 16px; }
+        .state-page .title { font-size: 17px; font-weight: 600; color: #333; margin-bottom: 8px; }
+        .state-page .desc { font-size: 14px; color: #999; line-height: 1.6; }
+    </style>
+</head>
+<body>
+    <div id="toast" class="toast"></div>
+    <div class="container">
+        <div id="loading" class="loading">加载中...</div>
+
+        <div id="content" style="display:none">
+            <div class="card">
+                <img class="avatar" id="v-avatar" alt="" />
+                <div class="group-name" id="v-name"></div>
+                <div class="space-line" id="v-space" style="display:none">
+                    <span class="space-icon">📁</span>属于 "<span id="v-space-name"></span>" Space
+                </div>
+                <div class="meta" id="v-meta"></div>
+                <div class="badge badge-warn" id="v-badge" style="display:none"></div>
+                <div class="tip" id="v-tip" style="display:none"></div>
+            </div>
+            <div class="btn-group">
+                <button class="btn btn-primary" id="btn-join" style="display:none">加入群聊</button>
+                <!-- 图标一律内联 SVG：落地页不引任何外部资源（无 CDN / 图标字体 /
+                     远程图片），离线、内网与被墙环境下都不会退化成空白方块。
+                     Android / Apple 两个路径与 octo-web 登录页的下载按钮同源，保持两端一致。 -->
+                <div class="btn-row" id="row-download-android" style="display:none">
+                    <a class="btn btn-secondary" id="btn-download-android" href="#" target="_blank" rel="noopener noreferrer">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 18c0 .55.45 1 1 1h1v3.5c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5V19h2v3.5c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5V19h1c.55 0 1-.45 1-1V8H6v10zM3.5 8C2.67 8 2 8.67 2 9.5v7c0 .83.67 1.5 1.5 1.5S5 17.33 5 16.5v-7C5 8.67 4.33 8 3.5 8zm17 0c-.83 0-1.5.67-1.5 1.5v7c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5v-7c0-.83-.67-1.5-1.5-1.5zm-4.97-5.84 1.3-1.3c.2-.2.2-.51 0-.71-.2-.2-.51-.2-.71 0l-1.48 1.48A7.4 7.4 0 0 0 12 1c-1.1 0-2.15.23-3.12.63L7.4.15c-.2-.2-.51-.2-.71 0-.2.2-.2.51 0 .71L8 2.17A6.83 6.83 0 0 0 6 7h12c0-1.99-.97-3.75-2.47-4.84zM10 5H9V4h1v1zm5 0h-1V4h1v1z"/></svg>
+                        <span>下载 Android 版</span>
+                    </a>
+                    <button class="btn-copy" id="btn-copy-android" type="button" title="复制下载链接" aria-label="复制 Android 下载链接">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+                    </button>
+                </div>
+                <div class="btn-row" id="row-download-ios" style="display:none">
+                    <a class="btn btn-secondary" id="btn-download-ios" href="#" target="_blank" rel="noopener noreferrer">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z"/></svg>
+                        <span>下载 iOS 版</span>
+                    </a>
+                    <button class="btn-copy" id="btn-copy-ios" type="button" title="复制下载链接" aria-label="复制 iOS 下载链接">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+                    </button>
+                </div>
+                <!-- 两个平台都没有可用安装包时的兜底入口，见 setupWebFallback。
+                     与上面两行互斥：有任一安装包可下时不显示。 -->
+                <div class="btn-row" id="row-web-fallback" style="display:none">
+                    <a class="btn btn-secondary" id="btn-web-fallback" href="#" target="_blank" rel="noopener noreferrer">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zm6.93 6h-2.95c-.32-1.25-.78-2.45-1.38-3.56 1.84.63 3.37 1.91 4.33 3.56zM12 4.04c.83 1.2 1.48 2.53 1.91 3.96h-3.82c.43-1.43 1.08-2.76 1.91-3.96zM4.26 14C4.1 13.36 4 12.69 4 12s.1-1.36.26-2h3.38c-.08.66-.14 1.32-.14 2 0 .68.06 1.34.14 2H4.26zm.82 2h2.95c.32 1.25.78 2.45 1.38 3.56-1.84-.63-3.37-1.9-4.33-3.56zm2.95-8H5.08c.96-1.66 2.49-2.93 4.33-3.56C8.81 5.55 8.35 6.75 8.03 8zM12 19.96c-.83-1.2-1.48-2.53-1.91-3.96h3.82c-.43 1.43-1.08 2.76-1.91 3.96zM14.34 14H9.66c-.09-.66-.16-1.32-.16-2 0-.68.07-1.35.16-2h4.68c.09.65.16 1.32.16 2 0 .68-.07 1.34-.16 2zm.25 5.56c.6-1.11 1.06-2.31 1.38-3.56h2.95c-.96 1.65-2.49 2.93-4.33 3.56zM16.36 14c.08-.66.14-1.32.14-2 0-.68-.06-1.34-.14-2h3.38c.16.64.26 1.31.26 2s-.1 1.36-.26 2h-3.38z"/></svg>
+                        <span>打开网页版</span>
+                    </a>
+                    <button class="btn-copy" id="btn-copy-web" type="button" title="复制网页版链接" aria-label="复制网页版链接">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <div class="state-page" id="state-expired">
+            <div class="icon">⏰</div>
+            <div class="title">邀请链接已过期</div>
+            <div class="desc">请联系群成员重新分享邀请链接</div>
+        </div>
+
+        <div class="state-page" id="state-not-found">
+            <div class="icon">🚫</div>
+            <div class="title">群聊不存在或已解散</div>
+            <div class="desc">请确认链接是否正确</div>
+        </div>
+
+        <div class="state-page" id="state-external-blocked">
+            <div class="icon">🔒</div>
+            <div class="title">该群不允许外部成员加入</div>
+            <div class="desc">该群仅允许所属空间（Space）内成员扫码入群，<br/>请联系管理员确认邀请方式</div>
+            <div class="desc" id="state-external-space" style="display:none; margin-top:8px">你不是「<span id="state-external-space-name"></span>」Space 的成员</div>
+        </div>
+
+        <div class="state-page" id="state-need-space">
+            <div class="icon">🛂</div>
+            <div class="title">请先加入一个 Space 后再加入群聊</div>
+            <div class="desc">你的账号尚未加入任何 Space，无法通过邀请链接入群。<br/>请打开 App 或 Web 首页，用邀请码加入一个 Space 后重试。</div>
+            <div class="btn-group" style="margin-top:24px">
+                <button class="btn btn-primary" id="btn-need-space-home">回主页加入 Space</button>
+            </div>
+        </div>
+
+        <div class="state-page" id="state-already-member">
+            <div class="icon">👤</div>
+            <div class="title">你已在此群内</div>
+            <div class="desc">即将跳转到 Web 首页...</div>
+        </div>
+
+        <div class="state-page" id="state-joined">
+            <div class="icon">✅</div>
+            <div class="title">加入成功</div>
+            <div class="desc">即将返回首页...</div>
+        </div>
+
+        <div class="state-page" id="state-rate-limited">
+            <div class="icon">⏳</div>
+            <div class="title">请稍后再试</div>
+            <div class="desc">当前访问人数较多，请稍等片刻后刷新页面重试</div>
+        </div>
+
+        <div class="state-page" id="state-server-error">
+            <div class="icon">⚠️</div>
+            <div class="title">加载失败</div>
+            <div class="desc">服务暂时不可用，请稍后刷新重试</div>
+        </div>
+
+        <div class="state-page" id="state-network-error">
+            <div class="icon">📡</div>
+            <div class="title">网络异常</div>
+            <div class="desc">无法连接服务器，请检查网络后刷新重试</div>
+        </div>
+    </div>
+
+<script>
+var API_BASE = "{{API_BASE_URL}}";
+var code = new URLSearchParams(location.search).get("code") || "";
+
+function show(id) {
+    var el = document.getElementById(id);
+    if (el) el.style.display = "block";
+}
+function hide(id) {
+    var el = document.getElementById(id);
+    if (el) el.style.display = "none";
+}
+
+function showState(stateID) {
+    hide("loading");
+    hide("content");
+    show(stateID);
+}
+
+function toast(msg, ms) {
+    var el = document.getElementById("toast");
+    el.textContent = msg;
+    el.style.display = "block";
+    clearTimeout(toast._t);
+    toast._t = setTimeout(function () { el.style.display = "none"; }, ms || 2200);
+}
+
+// 抓取 dmwork-web / admin 后台的登录 token。当前生产实际约定（im-test 验证得来）：
+//   1. sessionStorage 里 "token{sid}" → value 直接就是 token（dmwork-web 与 admin 都写这里）
+//   2. localStorage 里 "token{sid}" → 历史 / 兼容路径（旧版本或个别页面才会写）
+//   3. localStorage "dm-admin-auth" → JSON，token 在 state.token（仅 admin 后台）
+//
+// 历史版本只扫 localStorage 的 "tokenXXX"，在 IM Web / admin 后台（走 sessionStorage）
+// 的环境里直接读不到，从而短路成「请先登录 Web 端」，看不到「加入群聊」按钮。
+// 这里按 sessionStorage → localStorage → dm-admin-auth 的顺序依次尝试，保持纯只读，
+// 不依赖框架。返回 {token: "", sid: ""}；找不到 / Safari 隐私模式等异常场景同样返回空串。
+function findTokenAndSid() {
+    function scanByPrefix(storage) {
+        try {
+            for (var i = 0; i < storage.length; i++) {
+                var key = storage.key(i);
+                if (key && key.indexOf("token") === 0 && key !== "tokenCallback") {
+                    var val = storage.getItem(key);
+                    if (val && val.length > 10) {
+                        return { token: val, sid: key.substring(5) };
+                    }
+                }
+            }
+        } catch (e) { /* Safari 隐私模式等 */ }
+        return null;
+    }
+    var hit = scanByPrefix(sessionStorage) || scanByPrefix(localStorage);
+    if (hit) return hit;
+
+    // admin 后台的 dm-admin-auth 是 JSON 结构（zustand persist），存了 state.token / state.uid。
+    try {
+        var raw = localStorage.getItem("dm-admin-auth");
+        if (raw) {
+            var parsed = JSON.parse(raw);
+            var state = parsed && parsed.state;
+            if (state && typeof state.token === "string" && state.token.length > 10) {
+                return { token: state.token, sid: state.uid || "" };
+            }
+        }
+    } catch (e) { /* 损坏的 JSON、隐私模式等 */ }
+
+    return { token: "", sid: "" };
+}
+
+// 「下载 App」的安装包地址来自公开免登录的 updater 接口，与 Web 登录页的下载浮层
+// 同一个数据源（dmworklogin/AndroidDownloadButton.tsx / IOSDownloadButton.tsx 用的
+// 就是这两条路径）。版本号是「足够老」的哨兵值，让 updater 永远判定有新版可下。
+//
+// 历史实现把按钮 href 直接设成 API_BASE，注释写的是「回退到产品官网」，但注入的
+// External.BaseURL 在生产就是 API 前缀（.../api），点击必然落到 404 —— 语义和实现
+// 不一致。这里改为解析真实安装包地址；解析不出来就隐藏按钮，绝不回退到 API_BASE：
+// 没有入口好过一个死链。
+// 不做 UA 嗅探：两个平台各给一个按钮，各自按 updater 有没有版本记录独立显示。
+//
+// UA 分流在这个页面上尤其不可靠——邀请链接的主要打开方式是微信 / 企业 IM 的内嵌
+// 浏览器，UA 被各家改写；iPadOS 13+ 干脆把自己报成 Macintosh。猜错的代价是给用户
+// 递错平台的安装包，而猜对也只省下一个按钮。顺带这样桌面端也有了入口（扫码 / 转发
+// 到手机上打开），不必再单独接一个「去官网」的兜底。
+// 版本号是「足够老」的哨兵值：updater 在 model.AppVersion == 传入版本时返回 204，
+// 所以这里必须传一个不会与真实发行版本相等的值。这两个值不是随手取的 —— Web 登录页
+// 的下载浮层在生产就一直发这两条路径，真实发行版是 1.x.y / 2.x，碰撞会先打挂那个
+// 面向全体用户的入口。沿用它们等于复用一个已被线上验证过的约定。
+var DOWNLOADS = [
+    { path: "/v1/common/updater/android/1.0", row: "row-download-android", link: "btn-download-android", copy: "btn-copy-android" },
+    { path: "/v1/common/updater/ios/1.0.0", row: "row-download-ios", link: "btn-download-ios", copy: "btn-copy-ios" }
+];
+var APPCONFIG_PATH = "/v1/common/appconfig";
+var FETCH_TIMEOUT_MS = 8000;
+
+// 下载相关请求必须有超时：fetch 没有默认超时，而 setupWebFallback 要等 Promise.all
+// 全部 settle 才可能触发 —— 只要有一个平台的请求被中间层吞掉不返回，兜底就永远不会
+// 出现，页面停在改动前那个空白状态。没有 AbortController 的老 webview 退回裸 fetch：
+// 拿不到超时也不该拿不到功能。
+// 超时必须罩住 **body 读取**，不能只罩 fetch：fetch 的 promise 在响应头到达时就
+// resolve，body 还没读。若在那一刻清掉定时器，一个「先回 200 头、再把 body 挂住」的
+// 中间层仍然能让这个 job 永远不 settle，Promise.all 卡死、兜底永不出现 —— 正好是本
+// 函数要防的那个失效。所以 fetchJSON 把整条链（fetch + json）一起纳入同一个 signal，
+// 并且只在链终结时清定时器。
+function fetchJSONWithTimeout(url) {
+    if (typeof AbortController === "undefined") {
+        return fetch(url).then(readJSONBody);
+    }
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, FETCH_TIMEOUT_MS);
+    return fetch(url, { signal: controller.signal })
+        .then(readJSONBody)
+        .then(
+            function (d) { clearTimeout(timer); return d; },
+            function (e) { clearTimeout(timer); throw e; }
+        );
+}
+
+// readJSONBody 统一处理 updater / appconfig 的响应形态：
+// 204（updater 在没有版本记录时返回，是 2xx 但无 body，直接 .json() 会抛）、
+// 非 2xx、以及 body 不是合法 JSON —— 一律收敛成 null，由调用方按「没拿到」处理。
+function readJSONBody(r) {
+    if (r.status === 204 || !r.ok) return null;
+    return r.json().catch(function () { return null; });
+}
+
+// copyText 优先用 Clipboard API，失败或不可用时都退回 execCommand。
+//
+// 兜底挂在 rejection 上而不是写成 else 分支：内嵌 webview 常常既暴露了
+// navigator.clipboard、又满足安全上下文，却被权限策略拒绝 writeText。只判「能力
+// 是否存在」会让兜底恰好在最需要它的环境里永远不执行——而 IM 内嵌浏览器正是这个
+// 页面的主战场。execCommand 虽已废弃，但仍是那类环境里唯一稳定可用的路径。
+// 两条路都失败时由调用方提示手动复制，不谎报成功。
+function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+        return navigator.clipboard.writeText(text).catch(function () {
+            return legacyCopyText(text);
+        });
+    }
+    return legacyCopyText(text);
+}
+
+function legacyCopyText(text) {
+    return new Promise(function (resolve, reject) {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        // 放到视口内但不可见：iOS Safari 对 display:none / 视口外的元素不给选中。
+        ta.style.position = "fixed";
+        ta.style.top = "0";
+        ta.style.left = "0";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);
+        var ok = false;
+        try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+        document.body.removeChild(ta);
+        if (ok) { resolve(); } else { reject(new Error("copy failed")); }
+    });
+}
+
+// safeAbsoluteURL 收口所有要写进 a.href 的地址：只放行绝对 http/https。
+// updater 直接吐库里的裸 download_url（不像 pcupdater 会拼 APIBaseURL），可能为空 /
+// 相对 / 畸形 —— 不校验就等于把 javascript: 之类的 scheme 也一起放进来。
+//
+// 相对地址一律拒绝，不做解析。
+//
+// 曾经的实现把相对地址按 API_BASE 解析，但 Web 登录页的 resolveSafeDownloadUrl 用的
+// 是 window.location.origin —— 同一个 app_version.download_url 字段两个消费方能算出
+// 不同的地址（new URL 会替换 base 的末段：".../api/v2" + "files/x" → ".../api/files/x"），
+// 至多一处是对的。与其让两端各自猜一个 base，不如把契约钉死：安装包地址必须是绝对的。
+// 这和本页「没有入口好过一个死链」的取舍一致 —— 猜出来的地址就是死链的另一种写法。
+//
+// 副作用是协议相对地址（//host/x.apk）也会被拒，这是想要的：它绝对解析失败，
+// 只有靠相对分支才能通过，而那正是被删掉的分支。
+//
+// 若将来确实需要支持相对存储，正确做法是先和 Web 端对齐 base，再两边同时放开，
+// 而不是在这里单独恢复一个分支。
+function safeAbsoluteURL(value) {
+    if (typeof value !== "string") return "";
+    var trimmed = value.trim();
+    if (!trimmed) return "";
+    var u;
+    try { u = new URL(trimmed); } catch (e) { return ""; }
+    if (u.protocol === "http:" || u.protocol === "https:") return u.toString();
+    return "";
+}
+
+// 安装包地址和 web_url 共用 safeAbsoluteURL，不再额外要求文件后缀。
+//
+// 曾经加过一条「路径末段必须带后缀」的规则，想拦住把下载按钮指向落地页的情况。
+// 它做不到，而且反向伤害更大：
+//   - 判不准 —— 接受 ".../download/ios.html"（正是要拦的落地页），却拒绝
+//     App Store / TestFlight 地址和带查询参数的签名下载地址。
+//   - 对 iOS 是死局 —— 浏览器安装 iOS 应用必须走 itms-services:，而该 scheme 被
+//     白名单挡掉（正确）。于是任何真能装上 App 的 iOS 地址都是商店页，全都无后缀：
+//     不存在既通过校验又可用的取值。
+//   - 与写入侧和另一个消费方都不一致 —— addAppVersion 只要求 android 非空、不校验
+//     格式，octo-web 登录页也只校验 scheme。加了它，同一个存储值在两个页面上
+//     「能不能用」结论相反，正是本页拒绝相对地址时所反对的那种分歧。
+// 下载地址指向网页是数据质量问题，归管理台校验管；落地页从 URL 字符串判断不了。
+
+
+// setupDownloadButtons 为每个平台各解析一次安装包地址。两个请求互相独立：
+// 一个平台没记录不影响另一个显示。库里没有版本记录、地址非法、网络失败 ——
+// 该平台整行保持隐藏。没有入口好过一个死链。
+function setupDownloadButtons() {
+    var jobs = DOWNLOADS.map(function (item) {
+        var row = document.getElementById(item.row);
+        var link = document.getElementById(item.link);
+        if (!row || !link) return Promise.resolve(false);
+        return fetchJSONWithTimeout(API_BASE + item.path).then(function (d) {
+            var url = safeAbsoluteURL(d && d.url);
+            if (!url) return false;
+            link.href = url;
+            bindCopyButton(document.getElementById(item.copy), url, "下载链接");
+            row.style.display = "flex";
+            return true;
+        }).catch(function () { return false; });
+    });
+    // 只有当两个平台都拿不出可用安装包时才去取 web_url 兜底：否则页面上会同时
+    // 出现「下载 X 版」和「打开网页版」，把主路径稀释掉。
+    Promise.all(jobs).then(function (results) {
+        if (results.indexOf(true) === -1) setupWebFallback();
+    });
+}
+
+// setupWebFallback 在两个平台都没有可用安装包时给出「打开网页版」。
+//
+// 触发条件：两个平台都没有版本记录（updater 204）、updater 5xx、updater 请求失败或
+// 超时、地址非法。此前这些情况下页面是一张群卡片加一片空白，而 detail 请求是独立的、
+// 它成功时页面看起来完全正常，用户无从判断是「没有 App 可下」还是「页面坏了」。
+//
+// 注意它覆盖不到整体断网：那时 detail 也会失败，走 showState("state-network-error")，
+// 而 showState 会 hide("content") —— 兜底行就在 #content 里，一并被藏掉。把三行移出
+// #content 才能覆盖那种情况（以及「链接过期且还没装 App」），那是独立的布局改动。
+//
+// 地址取自公开的 appconfig.web_url（= External.WebLoginURL，产品门户），与安装包地址
+// 走同一套 safeAbsoluteURL 校验。取不到就仍然什么都不显示：依旧不回退到 API_BASE。
+function setupWebFallback() {
+    var row = document.getElementById("row-web-fallback");
+    var link = document.getElementById("btn-web-fallback");
+    if (!row || !link) return;
+    fetchJSONWithTimeout(API_BASE + APPCONFIG_PATH).then(function (d) {
+        var url = safeAbsoluteURL(d && d.web_url);
+        if (!url) return;
+        link.href = url;
+        bindCopyButton(document.getElementById("btn-copy-web"), url, "网页版链接");
+        row.style.display = "flex";
+    }).catch(function () { /* 兜底也拿不到：保持隐藏，不猜 */ });
+}
+
+// bindCopyButton 把「复制链接」绑到已解析出的地址上。桌面端看到的是安装包，装
+// 却要在手机上装，复制link转过去是主路径；移动端内嵌浏览器拦下载时也用得上。
+// 复制的是目标地址本身，不是当前邀请页地址——后者用户直接分享地址栏即可。
+//
+// label 区分「下载链接」和「网页版链接」：兜底行复制的是门户地址，提示成「下载链接
+// 已复制」会和用户刚点的按钮对不上。
+function bindCopyButton(btn, url, label) {
+    if (!btn) return;
+    btn.addEventListener("click", function () {
+        copyText(url).then(function () {
+            toast((label || "链接") + "已复制");
+        }, function () {
+            // 两条复制路径都不可用（老 webview / 权限被拒）：不假装成功，
+            // 告诉用户可以长按左边的按钮走浏览器自带的「复制链接地址」。
+            toast("复制失败，请长按左侧按钮复制链接");
+        });
+    });
+}
+
+function renderInfo(data) {
+    document.getElementById("v-name").textContent = data.group_name || "群聊";
+    if (typeof data.member_count === "number") {
+        document.getElementById("v-meta").textContent = "共 " + data.member_count + " 人";
+    }
+    if (data.avatar) {
+        document.getElementById("v-avatar").src = API_BASE + "/v1/" + data.avatar;
+    }
+    // YUJ-211: 渲染「📁 属于 "XX" Space」归属行。space_name 为空（公共群 /
+    // 降级路径）时保持隐藏，保证不破坏公共群极简卡片；后端 space_id 缺失的
+    // 旧客户端也会命中同一空串分支，向后兼容。
+    if (data.space_name) {
+        document.getElementById("v-space-name").textContent = data.space_name;
+        document.getElementById("v-space").style.display = "block";
+    }
+    // 邀请确认开启时，在落地页展示「需管理员审批」徽标，提示用户在 App 内走审批流
+    if (data.status === "invite_required") {
+        var badge = document.getElementById("v-badge");
+        badge.textContent = "需管理员审批";
+        badge.style.display = "inline-block";
+        var tip = document.getElementById("v-tip");
+        tip.textContent = "该群已开启邀请确认，请在 App 内由管理员审批后入群。";
+        tip.style.display = "block";
+    }
+    // Web 已登录 & 群可直接入群 → 显示「加入群聊」按钮
+    // invite_required 场景仍交由 App 内审批，不在落地页直接入群
+    if (data.status === "joinable" && findTokenAndSid().token) {
+        var joinBtn = document.getElementById("btn-join");
+        joinBtn.style.display = "flex";
+        joinBtn.addEventListener("click", onJoinClick);
+    }
+
+    hide("loading");
+    show("content");
+}
+
+function onJoinClick() {
+    var btn = document.getElementById("btn-join");
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = "正在加入...";
+
+    var session = findTokenAndSid();
+    var token = session.token;
+    if (!token) {
+        toast("请先登录 Web 端后再加入群聊");
+        btn.disabled = false;
+        btn.textContent = "加入群聊";
+        return;
+    }
+
+    // 1. 用公开 code 换出当前登录用户的 auth_code
+    fetch(API_BASE + "/v1/group/invite/authorize?code=" + encodeURIComponent(code), {
+        method: "POST",
+        headers: { "token": token }
+    }).then(function (r) {
+        return r.json().then(function (d) { return { ok: r.ok, data: d }; });
+    }).then(function (r) {
+        if (!r.ok || !r.data) {
+            throw new Error((r.data && r.data.msg) || "邀请链接已过期");
+        }
+        // 已经在群内：不再生成 auth_code，直接给提示 + 跳回首页（带 sid 保留登录态）。
+        if (r.data.already_member) {
+            toast("你已在此群内");
+            showState("state-already-member");
+            setTimeout(function () { redirectHome(session.sid); }, 1200);
+            return null;
+        }
+        // 群属于某 Space 且 allow_external=0：兜底短路（detail 已经把按钮藏掉，
+        // 这里是防御性分支，避免 H5 版本错位时直接撞到 scanjoin 的模糊错误）。
+        if (r.data.status === "external_blocked") {
+            showState("state-external-blocked");
+            return null;
+        }
+        // GH #1319 / Direction A：零 Space 用户禁止入群。
+        // 后端在 authorize 入口就会短路返回，不生成 auth_code；H5 这边给出
+        // 明确提示 + 「回主页加入 Space」CTA（复用 redirectHome 保留 sid），
+        // 避免用户点了「加入群聊」按钮后看到一条通用「加入失败」toast。
+        if (r.data.status === "need_space") {
+            showNeedSpaceState(session.sid);
+            return null;
+        }
+        if (!r.data.auth_code || !r.data.group_no) {
+            throw new Error((r.data && r.data.msg) || "邀请链接已过期");
+        }
+        var groupNo = r.data.group_no;
+        var authCode = r.data.auth_code;
+        // 2. 复用和移动端一致的入群接口，内部已覆盖外部成员 / allow_external / invite 校验
+        // YUJ-199 / GH#1265：把当前 Space 用 X-Space-ID header 透出，后端
+        // groupScanJoin 用它写 source_space_id，避免群错落在 home Space。
+        // currentSpaceId 由 Web 主应用写 localStorage（YUJ-88/EP3）；读不到
+        // 就不传，后端 fallback 到 home（与历史行为一致）。
+        var scanHeaders = { "token": token };
+        try {
+            var currentSpaceId = localStorage.getItem('currentSpaceId') || '';
+            if (currentSpaceId) { scanHeaders['X-Space-ID'] = currentSpaceId; }
+        } catch (e) { /* best-effort */ }
+        return fetch(API_BASE + "/v1/groups/" + encodeURIComponent(groupNo) +
+                     "/scanjoin?auth_code=" + encodeURIComponent(authCode), {
+            method: "GET",
+            headers: scanHeaders
+        }).then(function (r2) {
+            return r2.text().then(function (txt) {
+                // YUJ-170 round 3 / octo-server#1255: scanjoin 成功响应带
+                // space_id / space_name / group_no / group_name（groupScanJoin
+                // 新字段），保留整个对象供下游 crossSpace notice 判定使用。
+                // 失败响应仅需 msg 做 toast；解析失败走空对象兜底。
+                var data = {};
+                try { data = JSON.parse(txt) || {}; } catch (e) { /* ignore */ }
+                return {
+                    ok: r2.ok,
+                    msg: data.msg || "",
+                    space_id: data.space_id || "",
+                    space_name: data.space_name || "",
+                    group_no: data.group_no || groupNo,
+                    group_name: data.group_name || ""
+                };
+            });
+        });
+    }).then(function (r) {
+        // 已在群内 / external_blocked 已提前 return null，这里什么都不做。
+        if (r === null) return;
+        if (!r.ok) {
+            throw new Error(r.msg || "加入失败");
+        }
+        // YUJ-170 round 3 / dmwork-web#1100 / octo-server#1255:
+        // 跨 Space 加群引导 — 若群所属 Space 与端视角 currentSpaceId 不一致，
+        // 写 sessionStorage.pendingJoinSuccessNotice（YUJ-106 契约 key），
+        // Web 首页 consumeJoinSuccessNotice + showJoinSuccessToast 会按
+        // kind='group' 渲染「已加入「<群名>」群聊 / 位于「<Space 名>」空间 [切换过去]」。
+        // 同 Space / 私群（space_id=""）/ 未登录：跳过，保持原行为。
+        try {
+            var prevSpaceId = localStorage.getItem('currentSpaceId') || '';
+            var groupSpaceId = r.space_id || '';
+            if (groupSpaceId && prevSpaceId && groupSpaceId !== prevSpaceId) {
+                sessionStorage.setItem('pendingJoinSuccessNotice', JSON.stringify({
+                    kind: 'group',
+                    spaceId: groupSpaceId,
+                    spaceName: r.space_name || '',
+                    entityName: r.group_name || '',
+                    groupNo: r.group_no,
+                    groupName: r.group_name || '',
+                    crossSpace: true,
+                    ts: Date.now()
+                }));
+            }
+        } catch (e) { /* best-effort，不阻塞跳转 */ }
+        // 3. 入群成功：提示 + 跳回 Web 首页（带 sid 保证登录态可恢复）
+        toast("加入成功");
+        showState("state-joined");
+        setTimeout(function () { redirectHome(session.sid); }, 1200);
+    }).catch(function (err) {
+        toast((err && err.message) || "加入失败");
+        btn.disabled = false;
+        btn.textContent = "加入群聊";
+    });
+}
+
+// redirectHome 把 Web 落地页跳回 dmwork-web 首页（保留 sid）；失败时兜底到 "/"。
+function redirectHome(sid) {
+    try {
+        var basePath = window.location.pathname.replace(/\/+$/, '').replace(/\/v1\/group\/invite$/, '').replace(/^\/api(?:\/v\d+)?(?=\/|$)/, '');
+        var target = window.location.origin + (basePath || "/") + (sid ? "?sid=" + encodeURIComponent(sid) : "");
+        window.location.href = target;
+    } catch (e) {
+        window.location.href = "/";
+    }
+}
+
+// showNeedSpaceState 渲染「零 Space 用户」的 need_space 状态页，并把
+// 「回主页加入 Space」按钮的点击处理器挂好（跳回 dmwork-web 首页走
+// checkSpaceOnColdStart → JoinSpacePage，Gate 完成后用户可回到邀请链接重试入群）。
+// sid 可能为空（邀请链接直接被未登录用户打开），空串时兜底回根路径。
+function showNeedSpaceState(sid) {
+    showState("state-need-space");
+    var btn = document.getElementById("btn-need-space-home");
+    if (btn && !btn._bound) {
+        btn._bound = true;
+        btn.addEventListener("click", function () { redirectHome(sid); });
+    }
+}
+
+// 下载地址和邀请详情是互不依赖的公开 GET，并行发起。按钮本身在 #content 里，
+// 容器显示之前把它标成可见是安全的；串在 renderInfo 里只会让弱网下的下载入口
+// 白等一个 RTT 才浮出来，还会造成一次迟到的布局跳动。
+setupDownloadButtons();
+
+if (!code) {
+    showState("state-expired");
+} else {
+    fetch(API_BASE + "/v1/group/invite/detail?code=" + encodeURIComponent(code))
+        .then(function(r) {
+            // 先按 HTTP 状态分流：429 / 5xx 都不是「邀请过期」，不能让用户误以为链接失效。
+            // 这些分支里的 body 通常也不是合法 JSON（网关页 / 空响应），所以不 .json()。
+            if (r.status === 429) {
+                showState("state-rate-limited");
+                return null;
+            }
+            if (r.status >= 500) {
+                showState("state-server-error");
+                return null;
+            }
+            return r.json().then(function(d) { return { ok: r.ok, status: r.status, data: d }; });
+        })
+        .then(function(r) {
+            if (r === null) return;
+            if (!r.ok) {
+                // 4xx（主要是 404 / 400）：链接确实不存在或非法，保持「已过期」语义不回归。
+                showState("state-expired");
+                return;
+            }
+            switch (r.data.status) {
+                case "joinable":
+                case "invite_required":
+                    renderInfo(r.data);
+                    break;
+                case "external_blocked":
+                    // 群属于某 Space 且 allow_external=0：groupScanJoin 的最终裁决仍会拒绝，
+                    // 这里提前给明确状态页、藏掉「加入群聊」按钮，避免点了才看到错误。
+                    // YUJ-211: space_name 非空时追加「你不是「XX」Space 的成员」提示，
+                    // 让用户立刻明白被拦的原因；公共群降级时不渲染保持旧行为。
+                    if (r.data && r.data.space_name) {
+                        document.getElementById("state-external-space-name").textContent = r.data.space_name;
+                        document.getElementById("state-external-space").style.display = "block";
+                    }
+                    showState("state-external-blocked");
+                    break;
+                case "need_space":
+                    // GH #1319 / Direction A：detail 使用可选鉴权发现登录用户尚未加入
+                    // 任何 Space。优先级高于 external_blocked（加 Space 是用户侧修复，
+                    // 比群级硬拦截更可操作），直接展示「请先加入 Space」引导 +
+                    // 「回主页加入 Space」CTA。未登录访问者后端不会返回 need_space，
+                    // 保持公共预览体验。
+                    showNeedSpaceState(findTokenAndSid().sid);
+                    break;
+                case "not_found":
+                    showState("state-not-found");
+                    break;
+                case "expired":
+                default:
+                    showState("state-expired");
+                    break;
+            }
+        })
+        .catch(function() {
+            // fetch reject / JSON parse 失败通常意味着网络层问题，而非链接过期。
+            showState("state-network-error");
+        });
+}
+</script>
+</body>
+</html>

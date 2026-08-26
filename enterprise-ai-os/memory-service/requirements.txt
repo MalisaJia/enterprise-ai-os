@@ -1,0 +1,88 @@
+# =============================================================================
+# memory-service 依赖
+#
+# 版本策略：用 ==X.Y.* 锁到次版本。
+# 完全锁死（==X.Y.Z）会让安全补丁需要手动跟进；完全放开（>=）
+# 会让构建不可复现。锁次版本是两者的折中。
+# =============================================================================
+
+# ---- Web 框架 ----
+fastapi==0.111.*
+uvicorn[standard]==0.30.*
+pydantic==2.7.*
+pydantic-settings==2.3.*
+
+# ---- 配置 ----
+PyYAML==6.0.*
+
+# ---- PostgreSQL + pgvector ----
+# 用 psycopg3 而非 asyncpg：需要 pgvector 的类型适配（pgvector-python
+# 对 psycopg3 的支持最完整），且记忆服务的 UPDATE/DELETE 远多于
+# rag-pipeline，psycopg3 的 server-side binding 在这类场景更省心。
+psycopg[binary,pool]==3.1.*
+pgvector==0.2.*
+# 迁移。记忆的表结构会随策略演进（新增衰减字段、拆版本表），
+# 手工 DDL 迟早出错，从一开始就上迁移工具。
+alembic==1.13.*
+SQLAlchemy==2.0.*
+
+# ---- Redis ----
+# 用途：整合任务的分布式锁、抽取结果的幂等去重、热记忆缓存。
+redis[hiredis]==5.0.*
+
+# ---- 图存储（可选，GRAPH_BACKEND=neo4j 时才需要）----
+# 默认 requirements 里保留，因为它很轻（纯 Python 驱动，~1MB）。
+# 若确定不用图存储，可注释掉。
+neo4j==5.20.*
+
+# ---- HTTP 客户端 ----
+# 调 model-gateway（embedding / LLM 抽取）与 octo-auth。
+httpx==0.27.*
+# 重试。抽取是 LLM 调用，瞬时失败很常见，必须带退避重试。
+tenacity==8.3.*
+
+# ---- Kafka ----
+# 消费 octo.message.created 做自动抽取，生产 aios.memory.* 事件。
+# 选 aiokafka 而非 confluent-kafka：无 librdkafka 的 C 依赖，
+# 镜像构建简单，且本服务的吞吐要求远低于 rag-pipeline。
+aiokafka==0.10.*
+
+# ---- 文本处理 ----
+# token 计数，用于 /context 接口的 token_budget 截断。
+# 注意：这里只做本地估算，权威口径以 model-gateway 的 /tokenize 为准。
+tiktoken==0.7.*
+# 中文分词，用于记忆去重时的字面相似度预筛（在调 LLM 判定之前
+# 先用便宜的字面相似度过滤明显重复的，能省掉大量 LLM 调用）。
+jieba==0.42.*
+# 文本相似度：rapidfuzz 的 C 实现比 difflib 快两个数量级，
+# 去重预筛是 O(n) 比对，性能差异明显。
+rapidfuzz==3.9.*
+
+# ---- 可观测性 ----
+structlog==24.2.*
+prometheus-client==0.20.*
+opentelemetry-api==1.25.*
+opentelemetry-sdk==1.25.*
+opentelemetry-instrumentation-fastapi==0.46b0
+opentelemetry-exporter-otlp-proto-grpc==1.25.*
+
+# ---- 工具 ----
+# 后台周期任务（整合、衰减）。
+# 用 APScheduler 而非 celery：本服务的定时任务只有两三个且都很轻，
+# 引入 celery 需要额外的 broker 与 worker 进程，不划算。
+APScheduler==3.10.*
+python-dateutil==2.9.*
+orjson==3.10.*
+
+# ---- 开发与测试（生产镜像可用 --no-deps 排除，或拆成 requirements-dev.txt）----
+pytest==8.2.*
+pytest-asyncio==0.23.*
+pytest-cov==5.0.*
+# 打桩 httpx，用于测试抽取流程而不真调 LLM
+respx==0.21.*
+# 内存 Redis，避免单测依赖真实实例
+fakeredis==2.23.*
+# 真实 PG，用于测 pgvector 的向量检索与事务行为
+testcontainers[postgres]==4.5.*
+ruff==0.4.*
+mypy==1.10.*

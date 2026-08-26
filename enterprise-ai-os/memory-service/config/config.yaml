@@ -1,0 +1,541 @@
+# =============================================================================
+# memory-service 配置模板
+#
+# 复制为 config/config.yaml 后按需修改。
+# 支持 ${VAR} 与 ${VAR:-default} 形式的环境变量展开。
+# 优先级：环境变量 > config.yaml
+# =============================================================================
+
+service:
+  name: memory-service
+  env: ${APP_ENV:-dev}
+  version: 0.1.0
+  host: 0.0.0.0
+  port: ${MEMORY_PORT:-8400}
+  root_path: ""
+  workers: ${MEMORY_WORKERS:-2}
+
+logging:
+  level: ${LOG_LEVEL:-info}
+  format: ${LOG_FORMAT:-json}
+  # 记忆内容可能包含个人隐私（"我下周三看牙医"这类会被抽成 event 记忆）。
+  # 因此日志里**默认不打印 content**，只打印 id 与 category。
+  # 排障时可临时开启，但生产环境必须关闭——日志系统的访问控制
+  # 通常比业务库宽松，把记忆内容写进日志等于绕过了权限模型。
+  log_memory_content: false
+
+# -----------------------------------------------------------------------------
+# 存储
+# -----------------------------------------------------------------------------
+storage:
+  # 向量后端。当前只支持 pgvector。
+  #
+  # 为什么不像 rag-pipeline 那样提供 Milvus 选项：记忆的核心操作是
+  # UPDATE/DELETE（整合、衰减、遗忘），而专用向量库的删除多为标记删除，
+  # 需要定期 compact 才真正回收，且更新语义弱。记忆总量小（每用户数千条），
+  # pgvector 的性能完全够，换来的事务一致性更有价值。
+  vector_backend: pgvector
+
+  postgres:
+    dsn: ${PG_DSN:-postgres://aios:aios@postgres:5432/aios}
+    schema: ${PG_SCHEMA_MEMORY:-memory}
+    pool_min_size: 2
+    pool_max_size: 16
+    pool_timeout: 10
+    statement_timeout: 15000     # ms
+    # 启动时自动执行 alembic 迁移
+    auto_migrate: true
+
+    # 向量索引参数。
+    #
+    # 记忆库的规模（万级）远小于文档库（百万级），因此这里用较小的 m。
+    # 同时 ef_search 可以设得更大——记忆检索的召回质量比延迟更重要
+    # （漏掉一条关键偏好的代价 > 多花 5ms）。
+    index:
+      type: hnsw
+      m: 16
+      ef_construction: 64
+      ef_search: 200
+
+    # 记忆规模小，全表扫描在小租户下反而更快。
+    # 低于此阈值时跳过向量索引直接顺序扫描 + 精确计算余弦。
+    # 这不是过早优化：新租户前几十条记忆走索引反而慢，
+    # 且 HNSW 在极小数据集上的召回率不稳定。
+    exact_search_threshold: 200
+
+  # 图存储。默认关闭。
+  #
+  # 开启的判断标准：当出现"需要多跳推理"的真实需求时才开
+  # （如"张三所在团队的所有项目的负责人是谁"）。
+  # 纯向量检索能覆盖绝大多数场景，提前引入 Neo4j 只是增加运维面。
+  graph_backend: ${GRAPH_BACKEND:-none}    # none | neo4j
+  neo4j:
+    uri: ${NEO4J_URI:-bolt://neo4j:7687}
+    user: ${NEO4J_USER:-neo4j}
+    password: ${NEO4J_PASSWORD:-}
+    database: ${NEO4J_DATABASE:-neo4j}
+    max_connection_pool_size: 16
+    connection_timeout: 10
+
+  redis:
+    url: ${REDIS_URL:-redis://redis:6379/3}
+    key_prefix: "mem:"
+    # 热记忆缓存：高频命中的记忆缓存在 Redis，省掉向量检索。
+    # TTL 不宜过长——记忆被更新后缓存必须尽快失效，
+    # 否则 Agent 会继续使用旧偏好，用户会觉得"我改了它没听"。
+    hot_cache_ttl: 300
+    hot_cache_enabled: true
+
+# -----------------------------------------------------------------------------
+# 模型（一律经 model-gateway，不直连厂商）
+# -----------------------------------------------------------------------------
+models:
+  gateway_url: ${MODEL_GATEWAY_URL:-http://model-gateway:8200/v1}
+  api_key: ${MODEL_GATEWAY_API_KEY:-}
+  timeout: 60
+  max_retries: 3
+
+  embedding:
+    # 与 rag-pipeline 保持同一模型同一维度。
+    # 这不只是"统一"的洁癖：将来若要做"记忆 + 文档"的联合召回，
+    # 两边向量必须在同一空间才能比较相似度。
+    model: bge-m3
+    dimensions: 1024
+    batch_size: 32
+    # 记忆文本很短（一句话），无需截断策略
+    max_input_tokens: 512
+
+  # 抽取用模型。选廉价快速的——抽取是高频操作
+  # （每次会话结束都要跑），用贵模型成本不可控。
+  extraction:
+    model: ${MEMORY_EXTRACTION_MODEL:-auto:extraction}
+    temperature: 0.0            # 抽取要稳定，不要创造性
+    max_tokens: 2048
+    # 要求返回 JSON，直接解析为结构化记忆
+    json_mode: true
+
+  # 冲突判定用模型。这里必须用强模型。
+  #
+  # 判定"新记忆与旧记忆是否矛盾"是细粒度语义任务，
+  # 廉价模型的误判率高得多。而误判的代价是删掉有效记忆或积累矛盾，
+  # 两者都会让 Agent 行为不可预测——这比多花的模型费用严重得多。
+  reasoning:
+    model: ${MEMORY_REASONING_MODEL:-auto:reasoning}
+    temperature: 0.0
+    max_tokens: 1024
+    json_mode: true
+
+  # 摘要用模型（用于 /context 接口把多条记忆压缩进 token 预算）
+  summarization:
+    model: ${MEMORY_SUMMARY_MODEL:-auto:summary}
+    temperature: 0.2
+    max_tokens: 1024
+
+# -----------------------------------------------------------------------------
+# 三层记忆的作用域与权限
+# -----------------------------------------------------------------------------
+scopes:
+  personal:
+    enabled: true
+    scope_key: user_id
+    # 自动抽取写入，无需确认。写错只影响一人且易改。
+    write_mode: auto
+    # 仅本人可读
+    visibility: owner
+    # 召回权重最高：最贴合当前用户的上下文
+    recall_weight: 1.0
+    max_per_subject: 2000
+
+  team:
+    enabled: true
+    scope_key: space_id
+    # 抽取后进入 pending，需团队成员确认才生效。
+    # 理由：团队约定影响多人，LLM 抽取的不确定性需要人来兜底。
+    write_mode: confirm
+    visibility: space_members
+    recall_weight: 0.8
+    max_per_subject: 5000
+    # 确认超时未处理则丢弃。不设过期会积累大量无人处理的 pending，
+    # 让确认列表变成噪音，最终没人看。
+    pending_ttl_days: 14
+
+  org:
+    enabled: true
+    scope_key: tenant_id
+    # 仅管理员写入，或经 workflow-engine 的审批流。
+    # 组织记忆写错会影响所有 Agent 且极难发现，必须人工把关。
+    write_mode: manual
+    visibility: tenant_members
+    # 权重最低，但见 mandatory_override
+    recall_weight: 0.6
+    max_per_subject: 10000
+
+    # mandatory 标记的组织记忆在召回结果中强制保留且标注不可覆盖。
+    #
+    # 这解决一个真实矛盾：个人偏好应当优先（"我习惯用 pnpm"），
+    # 但组织硬约束不能被个人偏好推翻
+    # （"生产发布必须双人复核"不能因为某人说"我一个人够了"而失效）。
+    # 若不做这个机制，权重排序会让个人记忆挤掉组织约束，
+    # 形成一个很隐蔽的合规漏洞。
+    mandatory_override: true
+
+# -----------------------------------------------------------------------------
+# 记忆抽取
+# -----------------------------------------------------------------------------
+extraction:
+  enabled: true
+
+  # 抽取触发时机。
+  #
+  # session_end 而非 per_message：单条消息的信息往往不完整
+  # （"用 pnpm" 需要上文才知道在说什么），且逐条抽取的 LLM 成本
+  # 高一个数量级。批量抽取还能利用上下文做更准的判断。
+  trigger: session_end          # session_end | per_message | manual | interval
+  # session_end 的判定：最后一条消息后静默多久算会话结束
+  session_idle_seconds: 900
+
+  # 单次抽取的上下文窗口
+  max_messages_per_extraction: 50
+  max_context_tokens: 8000
+
+  # 抽取的记忆类别。
+  #
+  # 刻意不包含"任务"类——待办应该进 octo-matter，不该在记忆里存一份。
+  # 两处存同一件事必然不同步，用户会看到自相矛盾的状态。
+  categories:
+    - preference      # 偏好："我习惯用 pnpm"
+    - fact            # 事实："我负责支付模块"
+    - rule            # 规则："我们的 PR 需要两人 approve"
+    - relation        # 关系："张三是我的直接上级"
+    - event           # 事件："下周三产品评审"（带时效，会自动过期）
+
+  # 置信度阈值。低于此值的抽取结果丢弃。
+  #
+  # 设 0.7 是保守选择：宁可漏记也不要记错。
+  # 错误的记忆会持续影响 Agent 行为且用户很难意识到问题出在记忆上；
+  # 漏记的代价只是用户需要再说一次。
+  min_confidence: 0.7
+
+  # 单次抽取最多产出多少条。防止 LLM 把整段对话拆成几十条碎片记忆。
+  max_memories_per_extraction: 10
+
+  # 原子化约束：单条记忆的字数上限。
+  # 超长说明 LLM 把多件事塞进一条了，应当拒绝或要求重新抽取。
+  # 理由见 README：一条记忆含多件事时无法单独更新其中一件。
+  max_content_chars: 300
+
+  # 排除规则：这些内容不应被记为记忆
+  exclude:
+    # 密码、密钥类内容绝不入库。
+    # 这是硬性安全要求：记忆库的访问控制不适合承载凭据。
+    - type: pattern
+      patterns:
+        - "(?i)(password|passwd|secret|token|api[_-]?key)\\s*[:=]"
+        - "(?i)(私钥|密码|口令)\\s*[:：]"
+    # 纯闲聊不值得记
+    - type: llm_filter
+      instruction: "排除寒暄、感谢、无信息量的闲聊"
+
+  # 幂等：同一 session 的抽取只执行一次。
+  # Kafka 至少一次投递会导致重复消费，不去重会产生大量重复记忆。
+  idempotency:
+    enabled: true
+    key_template: "extract:{tenant_id}:{session_id}"
+    ttl_seconds: 86400
+
+# -----------------------------------------------------------------------------
+# 记忆整合（consolidation）
+# -----------------------------------------------------------------------------
+consolidation:
+  enabled: ${MEMORY_CONSOLIDATION_ENABLED:-true}
+
+  # 写入时的即时判定。
+  #
+  # 流程：新记忆 → 检索语义相近的既有记忆 → LLM 判定操作
+  #       → ADD / UPDATE / DELETE / NOOP
+  # 这是 mem0 的核心思想，直接采用。
+  on_write:
+    enabled: true
+    # 检索多少条相近记忆送给 LLM 判定。
+    # 太少会漏掉矛盾，太多会让 prompt 变长且 LLM 判断变差。
+    candidate_top_k: 8
+    # 只有相似度超过此值的才作为候选送判定。
+    # 低于此值的记忆与新记忆无关，送进去只是噪音。
+    candidate_min_similarity: 0.6
+
+    # 字面相似度预筛：完全相同或近乎相同的直接判 NOOP，不调 LLM。
+    # 能省掉相当比例的 LLM 调用——重复表述在真实对话里非常常见。
+    literal_dedup:
+      enabled: true
+      threshold: 0.95
+
+    # 影子模式：只记录判定结果，不实际执行 UPDATE/DELETE。
+    #
+    # **强烈建议上线初期开启。** 冲突判定是本组件最难做对的部分：
+    # 过于激进会误删有效记忆（用户会发现"它忘了我说过的话"），
+    # 过于保守会积累矛盾。先用影子模式跑真实数据评估准确率，
+    # 达标后再切换到实际执行。
+    shadow_mode: ${MEMORY_SHADOW_MODE:-true}
+
+  # 周期性整合任务。
+  #
+  # 注意：多 worker 部署时必须靠 Redis 锁保证单实例执行，
+  # 否则会重复合并、重复衰减。
+  periodic:
+    enabled: true
+    lock_key: "consolidation:lock"
+    lock_ttl_seconds: 3600
+    # 每天凌晨执行，避开业务高峰
+    cron: "0 3 * * *"
+    batch_size: 500
+
+    tasks:
+      # 去重合并：把语义等价的多条记忆合成一条
+      dedup:
+        enabled: true
+        similarity_threshold: 0.92
+      # 摘要压缩：同一主题的碎片记忆合并为概括性记忆
+      summarize:
+        enabled: true
+        min_cluster_size: 5
+        # 压缩后保留原始记忆的引用，不物理删除——
+        # 需要能回答"这条概括是从哪些原始记忆来的"
+        keep_originals: true
+      # 过期清理：event 类记忆过了时间点就失效
+      expire_events:
+        enabled: true
+        grace_days: 7
+
+# -----------------------------------------------------------------------------
+# 记忆衰减与遗忘
+# -----------------------------------------------------------------------------
+decay:
+  enabled: true
+
+  # 为什么需要衰减：不衰减的记忆库会无限增长，且老旧记忆会稀释
+  # 检索结果的相关性。人的记忆也是会淡忘的——一年前提过一次的
+  # 偏好不该和昨天强调过三次的偏好等权。
+  #
+  # 实现：记忆有 strength 字段，随时间指数衰减、每次命中回升。
+  # 检索排序时 strength 作为乘数因子参与打分。
+  model: exponential            # exponential | linear | none
+  half_life_days: 90            # 半衰期：90 天不被命中，强度减半
+  # 命中后的强度回升量
+  reinforcement: 0.3
+  strength_max: 1.0
+  # 强度低于此值时视为已遗忘（软删除，不再参与检索）
+  forget_threshold: 0.1
+
+  # 不衰减的类别。
+  #
+  # rule 类（"PR 需要两人 approve"）不应因为最近没提到就淡忘——
+  # 规则的有效性与提及频率无关。这是记忆衰减最容易搞错的一点：
+  # 对所有类别一视同仁地衰减，会让制度性约束悄悄失效。
+  exempt_categories:
+    - rule
+  # mandatory 的组织记忆永不衰减
+  exempt_mandatory: true
+
+  # 用户显式遗忘（"忘掉我说的那个偏好"）。
+  explicit_forget:
+    # 软删除：置 superseded_by 与 forgotten_at，不物理删除。
+    # 保留可追溯性，也让"我不小心让它忘了"可以恢复。
+    mode: soft
+    # 软删除记录的物理清理周期
+    purge_after_days: 180
+
+# -----------------------------------------------------------------------------
+# 检索与上下文组装
+# -----------------------------------------------------------------------------
+retrieval:
+  default_top_k: 10
+  max_top_k: 50
+  # 相似度下限。低于此值的记忆不相关，返回它们只会污染 prompt。
+  min_similarity: 0.5
+
+  # 打分公式（各项权重）：
+  #   score = similarity × w_sim
+  #         + strength   × w_strength
+  #         + recency    × w_recency
+  #         + scope_weight × w_scope
+  #
+  # 为什么不只用相似度：一条三年前的、几乎没被用过的记忆，
+  # 即使字面上最相似，也大概率不是用户当下想要的。
+  scoring:
+    w_similarity: 0.55
+    w_strength: 0.20
+    w_recency: 0.10
+    w_scope: 0.15
+
+  # 是否重排。
+  #
+  # 默认关闭：记忆条目很短（一句话），交叉编码重排带来的收益
+  # 远小于文档场景，而每次检索多一次模型调用的成本是实打实的。
+  rerank:
+    enabled: false
+    model: bge-reranker-v2-m3
+    top_n: 20
+
+  # 跨层检索的默认范围
+  default_scopes: [personal, team, org]
+
+# /api/v1/context 组合接口的参数
+context:
+  # token 预算必须由调用方指定，这里只是兜底默认值。
+  #
+  # 为什么强调必填：不设预算会让记忆无节制地挤占对话历史的空间，
+  # 反而降低整体效果——Agent 记得你的偏好但忘了三轮前说过什么，
+  # 是更糟的体验。
+  default_token_budget: 1000
+  max_token_budget: 4000
+
+  # 各层的预算分配比例。总和应为 1。
+  # mandatory 的组织记忆不受此限制，优先占用预算。
+  budget_split:
+    personal: 0.5
+    team: 0.3
+    org: 0.2
+
+  # 超预算时的处理：
+  #   truncate  —— 按分数截断（简单可预测）
+  #   summarize —— 调 LLM 压缩（信息保留更多但增加延迟与成本）
+  # 默认 truncate：/context 在 Agent 的关键路径上，
+  # 多一次 LLM 调用会显著增加首字延迟。
+  on_overflow: truncate
+
+  # 输出格式模板。
+  format:
+    # 分组呈现比平铺列表效果好：LLM 能区分"这是硬约束"
+    # 和"这是个人偏好"，从而正确处理两者冲突的情况。
+    group_by_scope: true
+    template: |
+      {% if org %}## 组织规定（必须遵守）
+      {% for m in org %}- {{ m.content }}
+      {% endfor %}{% endif %}
+      {% if team %}## 团队约定
+      {% for m in team %}- {{ m.content }}
+      {% endfor %}{% endif %}
+      {% if personal %}## 用户偏好
+      {% for m in personal %}- {{ m.content }}
+      {% endfor %}{% endif %}
+
+# -----------------------------------------------------------------------------
+# 图存储（实体关系）
+# -----------------------------------------------------------------------------
+graph:
+  enabled: ${GRAPH_ENABLED:-false}
+
+  # 从记忆中抽取实体与关系。只对 category=relation 的记忆做。
+  entity_extraction:
+    enabled: true
+    model: ${MEMORY_EXTRACTION_MODEL:-auto:extraction}
+    # 实体类型白名单。
+    # 开放式实体抽取会产生大量近义类型（"人"/"人员"/"员工"），
+    # 让图变得无法查询。限定类型是保持图可用的前提。
+    entity_types: [person, team, project, product, document, concept]
+    relation_types: [belongs_to, manages, owns, depends_on, related_to, part_of]
+
+  # 多跳查询上限。不设上限的图遍历可能扫全库。
+  max_hops: 3
+  max_results: 100
+
+# -----------------------------------------------------------------------------
+# 事件（Kafka）
+# -----------------------------------------------------------------------------
+events:
+  enabled: ${MEMORY_EVENTS_ENABLED:-true}
+  brokers: ${KAFKA_BROKERS:-kafka:9092}
+  client_id: memory-service
+
+  # 消费：OCTO 消息事件 → 自动抽取
+  consume:
+    enabled: true
+    group_id: memory-service-extractor
+    topics:
+      - ${KAFKA_TOPIC_OCTO_MESSAGE:-octo.message.created}
+    # 手动提交 offset：抽取涉及 LLM 调用，可能失败。
+    # 自动提交会导致失败的消息 offset 也被提交，记忆永久丢失。
+    auto_commit: false
+    max_poll_records: 100
+    # 抽取失败的消息进死信队列，人工排查后可重放
+    dlq_topic: aios.memory.extract.dlq
+    max_retries: 3
+
+  # 生产：记忆变更事件
+  produce:
+    topics:
+      written: aios.memory.written
+      updated: aios.memory.updated
+      forgotten: aios.memory.forgotten
+      conflict_detected: aios.memory.conflict
+
+# -----------------------------------------------------------------------------
+# 鉴权
+# -----------------------------------------------------------------------------
+auth:
+  enabled: ${AUTH_ENABLED:-true}
+  provider: octo-auth
+  octo_auth_url: ${OCTO_AUTH_BASE_URL:-http://octo-auth:8080}
+  cache_ttl: 60
+
+  # 内部服务免鉴权名单（凭 INTERNAL_SERVICE_TOKEN）
+  internal_token: ${INTERNAL_SERVICE_TOKEN:-}
+  internal_services:
+    - octo-server
+    - workflow-engine
+    - meeting-agent
+    - rag-pipeline
+
+  # 管理员角色：可写 org 层记忆、可查看任意用户的记忆
+  admin_roles:
+    - memory-admin
+    - platform-admin
+
+# -----------------------------------------------------------------------------
+# 多租户与隐私
+# -----------------------------------------------------------------------------
+tenancy:
+  enforce: true
+  # 靠 PG Row Level Security 兜底，不只依赖应用层拼 WHERE。
+  # 记忆是隐私数据，应用层漏一处就是跨用户泄露；RLS 是防御纵深。
+  rls_enabled: true
+
+privacy:
+  # 个人记忆的导出与删除（GDPR / 个保法的数据主体权利）。
+  # 企业产品迟早要面对这个要求，从一开始留好接口比事后补容易。
+  data_subject_requests:
+    export_enabled: true
+    delete_enabled: true
+    # 删除请求的处理方式：hard 表示物理删除（合规要求通常如此）
+    delete_mode: hard
+
+  # 记忆内容的加密。
+  # 默认关闭：应用层加密会让向量检索无法工作（密文无法计算相似度），
+  # 只能加密 content 字段而 embedding 明文存储——
+  # 这种"半加密"的安全收益有限但显著增加复杂度。
+  # 更实际的方案是依赖数据库的静态加密（TDE）与严格的访问控制。
+  encrypt_content: false
+
+# -----------------------------------------------------------------------------
+# 可观测性
+# -----------------------------------------------------------------------------
+observability:
+  metrics:
+    enabled: true
+    path: /metrics
+    # 核心指标：
+    #   memory_total{scope}              —— 各层记忆总量
+    #   memory_extraction_duration       —— 抽取耗时
+    #   memory_extraction_yield          —— 每次抽取产出条数（突然归零说明抽取坏了）
+    #   memory_consolidation_ops{op}     —— ADD/UPDATE/DELETE/NOOP 分布
+    #     这个指标最值得盯：DELETE 占比突增说明判定过于激进，
+    #     NOOP 占比接近 100% 说明判定形同虚设
+    #   memory_search_duration
+    #   memory_context_tokens            —— /context 实际返回的 token 数
+    #   memory_decay_forgotten_total     —— 因衰减被遗忘的条数
+
+  tracing:
+    enabled: ${OTEL_ENABLED:-false}
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4317}
+    service_name: memory-service
+    sample_ratio: 0.1

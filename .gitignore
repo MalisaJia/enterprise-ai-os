@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------------------
+# Enterprise AI OS — monorepo snapshot ignore rules
+# ---------------------------------------------------------------------------
+
+# Nested upstream git metadata. The .git directories of the cloned octo/*
+# repositories are renamed to .git.disabled so their source trees are
+# committed as plain directories rather than as submodules/gitlinks.
+octo/**/.git/
+octo/**/.git.disabled/
+codex-main/**/.git/
+codex-main/**/.git.disabled/
+
+# Local demo runtime: prebuilt binaries, virtualenv, logs, PID/state files
+.demo-bin/
+.demo-gotmp/
+.demo-logs/
+.demo-run/
+.demo-venv/
+start-demo.ps1
+demo-console.py
+
+# Dependencies
+**/node_modules/
+.pnpm-store/
+
+# Python
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Build output (Rust / Go / JS / Gradle)
+**/target/
+**/dist/
+**/build/
+*.exe
+*.test
+
+# Upstream-committed source that happens to live in build-shaped paths.
+# These negations must stay after the blanket rules above.
+!octo/multica/apps/desktop/build/
+!octo/octo-im/internal/bench/target/
+!octo/octo-im/demo/chatdemo/dist/
+!octo/octo-im/web/dist/
+
+# Secrets — real env files never get committed (.env.example templates do)
+.env
+.env.local
+**/.env
+**/.env.local
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Archives / large blobs
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
+# OS cruft
+Thumbs.db
+Desktop.ini
+.DS_Store

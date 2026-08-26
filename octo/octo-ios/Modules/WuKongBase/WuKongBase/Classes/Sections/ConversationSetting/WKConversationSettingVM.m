@@ -1,0 +1,781 @@
+//
+//  WKConversationSettingVM.m
+//  WuKongBase
+//
+//  Created by tt on 2020/1/21.
+//
+
+#import "WKConversationSettingVM.h"
+#import "WuKongBase.h"
+#import "WKFormItemModel.h"
+#import "WKFormSection.h"
+#import "WKLabelItemCell.h"
+#import "WKSwitchItemCell.h"
+#import "WKIconItemCell.h"
+#import "WKMeAvatarCell.h"
+#import "WKResource.h"
+#import "WKGroupManager.h"
+#import "WKButtonItemCell.h"
+#import "WKMultiLabelItemCell.h"
+#import "WKTableSectionUtil.h"
+#import "WKGroupQRCodeVC.h"
+#import "WKGlobalSearchResultController.h"
+#import "WKChannelHistorySearchVC.h"
+#import "WKThreadListVC.h"
+#import "WKThreadService.h"
+#import "WKGroupMdVC.h"
+#import "WKGroupAdminManageVC.h"
+#import "WKChannelWebhookVC.h"
+#import "WKIncomingWebhookManager.h"
+#import "WKMemberListVC.h"
+#import "WKActionSheetView2.h"
+#import "WKActionSheetItem2.h"
+
+@interface WKConversationSettingVM ()<WKChannelManagerDelegate>
+
+@property(nonatomic,strong) WKChannelInfo *_channelInfo;
+
+- (void)presentTransferOwnerPicker;
+
+@end
+
+@implementation WKConversationSettingVM
+
+- (instancetype)init
+{
+    self = [super init];
+    if (self) {
+        [[WKSDK shared].channelManager addDelegate:self];
+        
+    }
+    return self;
+}
+
+- (void)dealloc {
+    [[WKSDK shared].channelManager removeDelegate:self];
+}
+
+-(void) syncMembersIfNeed{
+    if(self.channel.channelType == WK_GROUP) {
+        [[WKGroupManager shared] syncMemebers:self.channel.channelId];
+    }
+    
+}
+
+
+- (NSArray<NSDictionary *> *)tableSectionMaps {
+    BOOL isCreatorOrManager = [self isManagerOrCreatorForMe];
+    NSMutableDictionary *param = [NSMutableDictionary dictionary];
+    param[@"channel"] = self.channel;
+    param[@"is_creator_or_manager"] = @(isCreatorOrManager);
+    if(self.channelInfo) {
+        param[@"channel_info"] = self.channelInfo;
+    }
+    param[@"refresh"] = ^ {
+        [self reloadData];
+    };
+    param[@"context"] = self.context;
+    [self registerSections];
+    NSArray *items = [WKApp.shared invokes:WKPOINT_CATEGORY_CHANNELSETTING param:param];
+    return items;
+}
+
+//-(NSArray<WKFormSection*>*) settingSections {
+//    if(!_settingSections) {
+//        if(self.channel.channelType == WK_GROUP) {
+//             _settingSections = [WKTableSectionUtil toSections:[self groupSettingItems]];
+//        }else {
+//             _settingSections = [WKTableSectionUtil toSections:[self personSettingItems]];
+//        }
+//       
+//    }
+//    return _settingSections;
+//}
+
+- (WKChannelMember *)memberOfMe {
+    if(!_memberOfMe) {
+        _memberOfMe = [[WKSDK shared].channelManager getMember:self.channel uid:[WKApp shared].loginInfo.uid];
+    }
+    return _memberOfMe;
+}
+
+-(BOOL) isManagerForMe {
+    return self.memberOfMe && self.memberOfMe.role == WKMemberRoleManager;
+}
+
+-(BOOL) isCreatorForMe {
+    return self.memberOfMe && self.memberOfMe.role == WKMemberRoleCreator;
+}
+
+-(BOOL) isManagerOrCreatorForMe {
+    return [self isManagerForMe] || [self isCreatorForMe];
+}
+
+
+- (NSInteger)memberCount {
+    if(self.groupType == WKGroupTypeSuper) {
+        return [self memberCount:self.channelInfo];
+    }else {
+        return [[WKSDK shared].channelManager getMemberCount:self.channel];
+    }
+    return 0;
+}
+
+-(NSInteger) memberCount:(WKChannelInfo*)channelInfo {
+    if(channelInfo && channelInfo.extra[@"member_count"]) {
+        return [channelInfo.extra[@"member_count"] integerValue];
+    }
+    return 0;
+}
+
+- (WKMemberRole)memberRole {
+    if(self.groupType == WKGroupTypeSuper) {
+        if(self.channelInfo && self.channelInfo.extra[@"role"]) {
+            return [self.channelInfo.extra[@"role"] integerValue];
+        }
+    }else {
+        WKChannelMember *memberOfMe = self.memberOfMe;
+        if(memberOfMe) {
+            return  memberOfMe.role;
+        }
+    }
+    return WKMemberRoleCommon;
+}
+
+-(WKGroupType) groupType {
+    
+    return [self groupType:self.channelInfo];
+}
+
+-(WKGroupType) groupType:(WKChannelInfo*)channelInfo {
+    return [WKChannelUtil groupType:channelInfo];
+}
+
+-(void) registerSections {
+    __weak typeof(self) weakSelf = self;
+    
+    // 是否有公告
+    BOOL hasNotice  = self.channelInfo && self.channelInfo.notice && ![self.channelInfo.notice isEqualToString:@""];
+    
+    
+
+    
+    // 在群内的名字
+    NSString *nameInGroup = self.memberOfMe.memberName;
+    if(self.memberOfMe.memberRemark && ![self.memberOfMe.memberRemark isEqualToString:@""]) {
+        nameInGroup = self.memberOfMe.memberRemark;
+    }
+    
+    [[WKApp shared] setMethod:@"channelsetting.groupname" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        if(channel.channelType != WK_GROUP) {
+            return nil;
+        }
+        BOOL isExternalGroup = NO;
+        id externalGroupFlag = self.channelInfo ? self.channelInfo.extra[@"is_external_group"] : nil;
+        if([externalGroupFlag isKindOfClass:[NSNumber class]] || [externalGroupFlag isKindOfClass:[NSString class]]) {
+            isExternalGroup = [externalGroupFlag integerValue] == 1;
+        }
+        NSMutableDictionary *groupNameItem = [NSMutableDictionary dictionaryWithDictionary:@{
+            @"class":WKLabelItemModel.class,
+            @"label":LLang(@"群聊名称"),
+            @"value":self.channelInfo&&self.channelInfo.name?self.channelInfo.name:@"",
+            @"showBottomLine":@(NO),
+            @"showTopLine":@(NO),
+            @"onClick":^{
+                if(weakSelf.delegate && [weakSelf.delegate respondsToSelector:@selector(settingOnGroupNameClick:)]) {
+                    [weakSelf.delegate settingOnGroupNameClick:weakSelf];
+                }
+            }
+        }];
+        if(isExternalGroup) {
+            groupNameItem[@"tagText"] = LLang(@"外部群");
+            // 与 Web 端 PR #980 / Android 保持一致：Semi 紫色填充、白色文字
+            groupNameItem[@"tagBackgroundColor"] = [UIColor colorWithRed:114.0f/255.0f green:46.0f/255.0f blue:209.0f/255.0f alpha:1.0f];
+            groupNameItem[@"tagTextColor"] = [UIColor whiteColor];
+        }
+        return @{
+            @"height":WKSectionHeight,
+            @"items": @[groupNameItem],
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:90000];
+
+    // 群头像（仅群主/管理员可见）
+    [[WKApp shared] setMethod:@"channelsetting.groupavatar" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        BOOL isCreatorOrManager = [param[@"is_creator_or_manager"] boolValue];
+        if(channel.channelType != WK_GROUP || !isCreatorOrManager) {
+            return nil;
+        }
+        return @{
+            @"height":@(0.0f),
+            @"items": @[
+                @{
+                    @"class":WKMeAvatarModel.class,
+                    @"label":LLang(@"群头像"),
+                    @"extra":channel,
+                    @"showBottomLine":@(NO),
+                    @"showTopLine":@(NO),
+                    @"onClick":^{
+                        if(weakSelf.delegate && [weakSelf.delegate respondsToSelector:@selector(settingOnGroupAvatarClick:)]) {
+                            [weakSelf.delegate settingOnGroupAvatarClick:weakSelf];
+                        }
+                    }
+                }
+            ],
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89900];
+
+
+    [[WKApp shared] setMethod:@"channelsetting.groupqrcode" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        if(channel.channelType != WK_GROUP) {
+            return nil;
+        }
+        return @{
+            @"height": @(0.0f),
+            @"items":@[
+                @{
+                    @"class":WKIconItemModel.class,
+                    @"label":LLang(@"群二维码"),
+                    @"icon":[self imageName:@"Conversation/Setting/IconQrcode"],
+                    @"width":@(24.0f),@"height":@(24.0f),
+                    @"showBottomLine":@(NO),
+                    @"onClick":^{
+                        WKGroupQRCodeVC *vc = [WKGroupQRCodeVC new];
+                        vc.channel = weakSelf.channel;
+                        [[WKNavigationManager shared] pushViewController:vc animated:YES];
+                    }
+                }
+            ],
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89800];
+
+    // 子区
+    [[WKApp shared] setMethod:@"channelsetting.threads" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        if(channel.channelType != WK_GROUP) {
+            return nil;
+        }
+        if(![WKApp shared].remoteConfig.threadOn) {
+            return nil;
+        }
+        return @{
+            @"height":@(0.0f),
+            @"items": @[
+                @{
+                    @"class": WKLabelItemModel.class,
+                    @"label": LLang(@"子区"),
+                    @"showBottomLine":@(NO),
+                    @"onClick":^{
+                        WKThreadListVC *vc = [WKThreadListVC new];
+                        vc.groupNo = weakSelf.channel.channelId;
+                        [[WKNavigationManager shared] pushViewController:vc animated:YES];
+                    }
+                }
+            ]
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89750];
+
+    [[WKApp shared] setMethod:@"channelsetting.groupintro" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        BOOL isCreatorOrManager = [param[@"is_creator_or_manager"] boolValue];
+        if(channel.channelType != WK_GROUP) {
+            return nil;
+        }
+        return @{
+            @"height":@(0.0f),
+            @"items": @[
+                @{
+                    @"class": hasNotice?WKMultiLabelItemModel.class:WKLabelItemModel.class,
+                    @"label":LLang(@"群公告"),
+                    @"value": hasNotice?self.channelInfo.notice:LLang(@"未设置"),
+                    @"showBottomLine":@(NO),
+                    @"bottomLeftSpace": isCreatorOrManager?[NSNull null]:@(0.0f),
+                    @"onClick":^{
+                        if(weakSelf.delegate && [weakSelf.delegate respondsToSelector:@selector(settingOnGroupNoticeClick:)]) {
+                            [weakSelf.delegate settingOnGroupNoticeClick:weakSelf];
+                        }
+                    }
+                }
+            ]
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89700];
+
+    // GROUP.md
+    [[WKApp shared] setMethod:@"channelsetting.groupmd" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        if(channel.channelType != WK_GROUP) {
+            return nil;
+        }
+        BOOL hasGroupMd = NO;
+        NSInteger mdVersion = 0;
+        if(self.channelInfo && self.channelInfo.extra[@"has_group_md"]) {
+            hasGroupMd = [self.channelInfo.extra[@"has_group_md"] boolValue];
+        }
+        if(self.channelInfo && self.channelInfo.extra[@"group_md_version"]) {
+            mdVersion = [self.channelInfo.extra[@"group_md_version"] integerValue];
+        }
+        NSString *statusText = hasGroupMd ? [NSString stringWithFormat:@"%@ v%ld", LLang(@"已配置"), (long)mdVersion] : LLang(@"未配置");
+        return @{
+            @"height":@(0.0f),
+            @"items": @[
+                @{
+                    @"class": WKLabelItemModel.class,
+                    @"label": @"GROUP.md",
+                    @"value": statusText,
+                    @"showBottomLine":@(NO),
+                    @"onClick":^{
+                        WKGroupMdVC *vc = [WKGroupMdVC new];
+                        vc.channel = weakSelf.channel;
+                        vc.canEdit = [weakSelf isManagerOrCreatorForMe];
+                        [[WKNavigationManager shared] pushViewController:vc animated:YES];
+                    }
+                }
+            ]
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89650];
+
+    // 群消息推送（入站 Webhook）：与 web 端「群消息推送」入口顺序一致 —— 在 GROUP.md
+    // 之下、群管理之上。全员可见可点；列表内部按权限矩阵（群主/管理员 / 自己创建）
+    // 控制操作。副标题策略：
+    //   - 没有缓存（首次进群信息页）→ 静默后台 fetch 一次写回 channelInfo.extra；
+    //     副标题暂留空，fetch 完会触发 channelInfoUpdate: → reloadData → 入口
+    //     handler 再跑一次拿到数字。
+    //   - 命中缓存 → 直接显示「已配置 N 个」/「未配置」。
+    [[WKApp shared] setMethod:@"channelsetting.incomingwebhook" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        if(channel.channelType != WK_GROUP) {
+            return nil;
+        }
+        NSNumber *cachedCount = nil;
+        if (self.channelInfo && [self.channelInfo.extra[@"incoming_webhook_count"] isKindOfClass:[NSNumber class]]) {
+            cachedCount = self.channelInfo.extra[@"incoming_webhook_count"];
+        }
+        NSString *subtitle;
+        if (!cachedCount) {
+            // 触发一次惰性预取（按 group 去重，避免 reloadData 反复触发）
+            static NSMutableSet<NSString *> *inFlightGroups;
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{ inFlightGroups = [NSMutableSet set]; });
+            NSString *gno = channel.channelId ?: @"";
+            if (gno.length > 0 && ![inFlightGroups containsObject:gno]) {
+                [inFlightGroups addObject:gno];
+                [[WKIncomingWebhookManager shared] listWebhooksOfGroup:gno complete:^(NSArray<WKIncomingWebhook *> *items, NSError * _Nullable error) {
+                    [inFlightGroups removeObject:gno];
+                    if (error) {
+                        // 失败时不写 cache —— 下次进群信息页还会再试一次。
+                        return;
+                    }
+                    WKChannelInfo *info = [[WKSDK shared].channelManager getChannelInfo:channel];
+                    if (!info) return;
+                    info.extra[@"incoming_webhook_count"] = @(items.count);
+                    [[WKSDK shared].channelManager updateChannelInfo:info];
+                }];
+            }
+            // fetch 在飞 / 失败 都先留空字符串，不要显示"查看 ›"那种容易被误读的占位
+            subtitle = @"";
+        } else if (cachedCount.integerValue <= 0) {
+            subtitle = LLang(@"未配置");
+        } else {
+            subtitle = [NSString stringWithFormat:LLang(@"已配置 %ld 个"), (long)cachedCount.integerValue];
+        }
+        BOOL isCreatorOrManager = [param[@"is_creator_or_manager"] boolValue];
+        return @{
+            @"height":@(0.0f),
+            @"items": @[
+                @{
+                    @"class": WKLabelItemModel.class,
+                    @"label": LLang(@"群消息推送"),
+                    @"value": subtitle,
+                    @"showBottomLine":@(NO),
+                    @"onClick":^{
+                        WKChannelWebhookVC *vc = [WKChannelWebhookVC new];
+                        vc.channel = weakSelf.channel;
+                        vc.isManagerOrCreator = isCreatorOrManager;
+                        [[WKNavigationManager shared] pushViewController:vc animated:YES];
+                    }
+                }
+            ]
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89640];
+
+    // 群管理（仅群主和管理员可见，与 web 端 module.tsx 行为一致）
+    [[WKApp shared] setMethod:@"channelsetting.groupmanage" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        BOOL isCreatorOrManager = [param[@"is_creator_or_manager"] boolValue];
+        if(channel.channelType != WK_GROUP || !isCreatorOrManager) {
+            return nil;
+        }
+        BOOL isCreator = [weakSelf isCreatorForMe];
+        return @{
+            @"height":@(0.0f),
+            @"items": @[
+                @{
+                    @"class": WKLabelItemModel.class,
+                    @"label": LLang(@"群管理"),
+                    @"showBottomLine":@(NO),
+                    @"onClick":^{
+                        WKGroupAdminManageVC *vc = [WKGroupAdminManageVC new];
+                        vc.channel = weakSelf.channel;
+                        vc.isCreator = isCreator;
+                        [[WKNavigationManager shared] pushViewController:vc animated:YES];
+                    }
+                }
+            ]
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89625];
+
+    // 转让群主（仅群主可见，与 web 端 module.tsx 行为一致）
+    [[WKApp shared] setMethod:@"channelsetting.transferowner" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        if(channel.channelType != WK_GROUP || ![weakSelf isCreatorForMe]) {
+            return nil;
+        }
+        return @{
+            @"height":@(0.0f),
+            @"items": @[
+                @{
+                    @"class": WKLabelItemModel.class,
+                    @"label": LLang(@"转让群主"),
+                    @"showBottomLine":@(NO),
+                    @"bottomLeftSpace":@(0.0f),
+                    @"onClick":^{
+                        [weakSelf presentTransferOwnerPicker];
+                    }
+                }
+            ]
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89660];
+
+    [[WKApp shared] setMethod:@"channelsetting.hsitory" handler:^id _Nullable(id  _Nonnull param) {
+        return @{
+            @"height":WKSectionHeight,
+            @"items":@[
+                @{
+                    @"class":WKLabelItemModel.class,
+                    @"label":LLang(@"查找聊天内容"),
+                    @"showBottomLine":@(NO),
+                    @"showTopLine":@(NO),
+                    @"onClick":^{
+                        // 入口：进入新版「查找聊天内容」页（与 web ChannelSearchPanel 同口径，纯 API）。
+                        // 不再走全局搜索栈 WKGlobalSearchResultController —— 那条路径仍服务
+                        // 「会话列表→搜索→在某频道点更多」次级跳转，独立保留。
+                        WKChannelHistorySearchVC *vc = [WKChannelHistorySearchVC new];
+                        vc.channel = weakSelf.channel;
+                        [[WKNavigationManager shared] pushViewController:vc animated:YES];
+                    }
+                }
+            ]
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89600];
+    
+    
+    [[WKApp shared] setMethod:@"channelsetting.mute" handler:^id _Nullable(id  _Nonnull param) {
+        return @{
+            @"height":WKSectionHeight,
+            @"items":@[
+                @{
+                    @"class":WKSwitchItemModel.class,
+                    @"label":LLang(@"消息免打扰"),
+                    @"on":@(self.channelInfo?self.channelInfo.mute:false),
+                    @"showBottomLine":@(NO),
+                    @"showTopLine":@(NO),
+                    @"onSwitch":^(BOOL on){
+                        [[WKChannelSettingManager shared] channel:self.channel mute:on];
+                    }
+                }
+            ]
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89500];
+    
+    [[WKApp shared] setMethod:@"channelsetting.top" handler:^id _Nullable(id  _Nonnull param) {
+        return @{
+            @"height":@(0.0f),
+            @"items":@[
+                @{
+                    @"class":WKSwitchItemModel.class,
+                    @"label":LLang(@"置顶聊天"),
+                    @"on":@(self.channelInfo?self.channelInfo.stick:false),
+                    @"showBottomLine":@(NO),
+                    @"onSwitch":^(BOOL on){
+                        [[WKChannelSettingManager shared] channel:self.channel stick:on];
+                    }
+                }
+            ]
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89400];
+    
+    [[WKApp shared] setMethod:@"channelsetting.groupsave" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        if(channel.channelType != WK_GROUP) {
+            return nil;
+        }
+        return @{
+            @"height":@(0.0f),
+            @"items":@[
+                @{
+                    @"class":WKSwitchItemModel.class,
+                    @"label":LLang(@"保存到通讯录"),
+                    @"on":@(self.channelInfo?self.channelInfo.save:false),
+                    @"showBottomLine":@(NO),
+                    @"bottomLeftSpace":@(0.0f),
+                    @"onSwitch":^(BOOL on){
+                        [[WKChannelSettingManager shared] group:self.channel.channelId save:on];
+
+                    }
+                }
+            ]
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89300];
+    
+    
+    
+   
+    
+    [[WKApp shared] setMethod:@"channelsetting.nameInGroup" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        if(channel.channelType != WK_GROUP) {
+            return nil;
+        }
+        return  @{
+            @"height":WKSectionHeight,
+            @"items":@[
+                @{
+                    @"class":WKLabelItemModel.class,
+                    @"label":LLang(@"我在本群的昵称"),
+                    @"value":nameInGroup?:@"",
+                    @"showBottomLine":@(NO),
+                    @"showTopLine":@(NO),
+                    @"onClick":^{
+                        if(weakSelf.delegate && [weakSelf.delegate respondsToSelector:@selector(settingOnGroupNoticeClick:)]) {
+                            [weakSelf.delegate settingOnNickNameInGroup:weakSelf];
+                        }
+                    }
+                },
+               ]
+
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:89100];
+    
+   
+    
+    [[WKApp shared] setMethod:@"channelsetting.report" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        if(channel.channelType != WK_PERSON) {
+            return nil;
+        }
+        return  @{
+            @"height":WKSectionHeight,
+            @"items":@[
+                @{
+                    @"class":WKLabelItemModel.class,
+                    @"label":self.channelInfo && self.channelInfo.status == WKChannelStatusBlacklist?LLangW(@"拉出黑名单", weakSelf):LLangW(@"拉入黑名单", weakSelf),
+                    @"value":@"",
+                    @"showBottomLine":@(NO),
+                    @"bottomLeftSpace":@(0.0f),
+                    @"showTopLine":@(NO),
+                    @"onClick":^{
+                        if(weakSelf.delegate && [weakSelf.delegate respondsToSelector:@selector(settingOnBlacklist:action:)]) {
+                           [weakSelf.delegate settingOnBlacklist:weakSelf action:self.channelInfo && self.channelInfo.status != WKChannelStatusBlacklist];
+                       }
+                    }},
+               ]
+
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:88800];
+    
+    [[WKApp shared] setMethod:@"channelsetting.report" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        CGFloat sectionHeight = 0.0f;
+        if(channel.channelType == WK_GROUP) {
+            sectionHeight = WKSectionHeight.floatValue;
+        }
+        return  @{
+            @"height":@(sectionHeight),
+            @"items":@[
+                @{
+                    @"class":WKLabelItemModel.class,
+                    @"label":LLang(@"投诉"),
+                    @"value":@"",
+                    @"showBottomLine":@(NO),
+                    @"bottomLeftSpace":@(0.0f),
+                    @"showTopLine":@(NO),
+                    @"onClick":^{
+                       if(weakSelf.delegate && [weakSelf.delegate respondsToSelector:@selector(settingOnReport:)]) {
+                           [weakSelf.delegate settingOnReport:weakSelf];
+                       }
+                    }
+                },
+               ]
+
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:88900];
+    
+    [[WKApp shared] setMethod:@"channelsetting.clearchat" handler:^id _Nullable(id  _Nonnull param) {
+        return  @{
+            @"height":WKSectionHeight,
+            @"items":@[
+                @{
+                    @"class":WKButtonItemModel.class,
+                    @"title":LLang(@"清空聊天记录"),
+                    @"showBottomLine":@(NO),
+                    @"bottomLeftSpace":@(0.0f),
+                    @"showTopLine":@(NO),
+                    @"onClick":^{
+                        if(weakSelf.delegate && [weakSelf.delegate respondsToSelector:@selector(settingOnClearMessages:)]) {
+                            [weakSelf.delegate settingOnClearMessages:weakSelf];
+                        }
+                    }
+                },
+               ]
+
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:88800];
+    
+    [[WKApp shared] setMethod:@"channelsetting.groupexit" handler:^id _Nullable(id  _Nonnull param) {
+        WKChannel *channel = param[@"channel"];
+        if(channel.channelType != WK_GROUP) {
+            return nil;
+        }
+        return  @{
+            @"height":@(0.0f),
+            @"items":@[
+                @{
+                    @"class":WKButtonItemModel.class,
+                    @"title":LLang(@"删除并退出"),
+                    @"showBottomLine":@(NO),
+                    @"bottomLeftSpace":@(0.0f),
+                    @"showTopLine":@(NO),
+                    @"onClick":^{
+                           if(weakSelf.delegate && [weakSelf.delegate respondsToSelector:@selector(settingOnGroupExit:)]) {
+                               [weakSelf.delegate settingOnGroupExit:weakSelf];
+                           }
+                    }
+                },
+               ]
+        };
+    } category:WKPOINT_CATEGORY_CHANNELSETTING sort:88700];
+}
+
+
+-(AnyPromise*) addBlacklist {
+    return [[WKAPIClient sharedClient] POST:[NSString stringWithFormat:@"user/blacklist/%@",self.channelInfo.channel.channelId?:@""] parameters:nil];
+}
+-(AnyPromise*) deleteBlacklist {
+    return [[WKAPIClient sharedClient] DELETE:[NSString stringWithFormat:@"user/blacklist/%@",self.channelInfo.channel.channelId?:@""] parameters:nil];
+}
+
+
+-(AnyPromise*) onlineMembers:(NSArray<NSString*>*)users {
+    __weak typeof(self) weakSelf = self;
+  return  [WKAPIClient.sharedClient POST:@"user/online" parameters:users model:WKUserOnlineResp.class].then(^(NSArray<WKUserOnlineResp*>*onlines){
+      weakSelf.onlineMembers = onlines;
+      return onlines;
+    });
+}
+
+-(WKUserOnlineResp*) memberOnline:(NSString*)uid {
+    if(!self.onlineMembers || self.onlineMembers.count == 0) {
+        return nil;
+    }
+    for (WKUserOnlineResp *onlineResp in self.onlineMembers) {
+        if([onlineResp.uid isEqualToString:uid]) {
+            return onlineResp;
+        }
+    }
+    return nil;
+}
+
+
+-(UIImage*) imageName:(NSString*)name {
+    return [WKApp.shared loadImage:name moduleID:@"WuKongBase"];
+}
+
+- (WKChannelInfo *)channelInfo {
+    if(!self._channelInfo) {
+        self._channelInfo = [[WKSDK shared].channelManager getChannelInfo:self.channel];
+    }
+    return self._channelInfo;
+}
+
+-(AnyPromise*) requestGroupMemberInvite:(NSArray<NSString*>*)uids remark:(NSString*)remark {
+   return [[WKAPIClient sharedClient] POST:[NSString stringWithFormat:@"groups/%@/member/invite",self.channel.channelId] parameters:@{@"uids":uids?:@[],@"remark":remark?:@""}];
+}
+
+#pragma mark - 转让群主
+
+- (void)presentTransferOwnerPicker {
+    __weak typeof(self) weakSelf = self;
+    WKMemberListVC *vc = [WKMemberListVC new];
+    vc.title = LLang(@"选择新群主");
+    vc.channel = self.channel;
+    vc.edit = YES;
+    vc.singleSelect = YES;
+
+    NSMutableArray<NSString*> *hidden = [NSMutableArray array];
+    if ([WKApp shared].loginInfo.uid) {
+        [hidden addObject:[WKApp shared].loginInfo.uid];
+    }
+    NSArray<WKChannelMember*> *allMembers = [[WKSDK shared].channelManager getMembersWithChannel:self.channel];
+    for (WKChannelMember *m in allMembers) {
+        if (m.robot && m.memberUid) {
+            [hidden addObject:m.memberUid];
+        }
+    }
+    vc.hiddenUsers = hidden;
+
+    vc.onFinishedSelect = ^(NSArray<NSString *> *uids) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || uids.count == 0) return;
+        NSString *toUID = uids.firstObject;
+        WKChannelMember *target = [[WKSDK shared].channelManager getMember:strongSelf.channel uid:toUID];
+        NSString *name = target.memberRemark.length > 0 ? target.memberRemark : (target.memberName.length > 0 ? target.memberName : toUID);
+        NSString *tip = [NSString stringWithFormat:LLang(@"确定将群主转让给 %@ 吗？转让后你将成为普通成员。"), name];
+
+        WKActionSheetView2 *sheet = [WKActionSheetView2 initWithTip:tip cancel:LLang(@"取消")];
+        [sheet addItem:[WKActionSheetButtonItem2 initWithAlertTitle:LLang(@"转让群主") onClick:^{
+            [[WKNavigationManager shared].topViewController.view showHUD];
+            [[WKGroupManager shared] groupNo:strongSelf.channel.channelId transferOwner:toUID complete:^(NSError *error) {
+                [[WKNavigationManager shared].topViewController.view hideHud];
+                if (error) {
+                    NSString *msg = error.domain.length > 0 ? error.domain : LLang(@"转让群主失败");
+                    [[WKNavigationManager shared].topViewController.view showMsg:msg];
+                    return;
+                }
+                [[WKNavigationManager shared] popViewControllerAnimated:YES];
+                [[WKNavigationManager shared].topViewController.view showMsg:LLang(@"群主已转让")];
+                // 同步角色与群信息；设置页通过通知/Delegate 自动 reload
+                [[WKGroupManager shared] syncMemebers:strongSelf.channel.channelId];
+                [[WKSDK shared].channelManager fetchChannelInfo:strongSelf.channel];
+            }];
+        }]];
+        [sheet show];
+    };
+
+    [[WKNavigationManager shared] pushViewController:vc animated:YES];
+}
+
+#pragma mark - WKChannelManagerDelegate
+- (void)channelInfoUpdate:(WKChannelInfo *)channelInfo oldChannelInfo:(WKChannelInfo * _Nullable)oldChannelInfo{
+    if(![self.channel isEqual:channelInfo.channel]) {
+        return;
+    }
+    self._channelInfo = [[WKSDK shared].channelManager getChannelInfo:self.channel];
+    [self reloadData];
+    if(_delegate && [_delegate respondsToSelector:@selector(settingOnChannelUpdate:)]) {
+        [_delegate settingOnChannelUpdate:self];
+    }
+    WKGroupType groupType = [self groupType:channelInfo];
+    if(groupType == WKGroupTypeSuper) {
+        if(oldChannelInfo && [self memberCount:oldChannelInfo]!=[self memberCount:channelInfo]) {
+            if(_delegate && [_delegate respondsToSelector:@selector(settingOnTopNMembersUpdate:)]) {
+                [_delegate settingOnTopNMembersUpdate:self];
+            }
+        }
+     
+    }
+}
+@end
+
+

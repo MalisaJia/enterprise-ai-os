@@ -1,0 +1,96 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+node_modules
+.pnp
+.pnp.js
+
+# testing
+coverage
+test-results
+playwright-report
+.local-browsers
+
+# next.js
+.next/
+out/
+build
+build-e2e
+*.tsbuildinfo
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local env files
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# turbo
+.turbo
+
+# generated i18n scan reports (baseline/config stay tracked)
+.i18n/reports/
+
+lib/
+out/
+build
+out-election/
+dist-ele/
+icon.icns
+icons.iconset
+.debug-screenshots/
+scripts/debug.js
+debug-storybook.log
+/.storybook-static-mobile-download-check/
+
+.mcp.json
+.gstack/
+dm__test
+.ftre/snapshot
+.omc/
+AGENTS.config.local.json
+package-lock.json
+
+# AI/IDE 工件文件（不进仓库）
+.kiro/settings/mcp.json
+**/figma-spec.md
+**/rawdata.txt
+.kiro/handoff-*.md
+.claude/
+.codex/
+.zed/
+.ftre/memory/
+.vscode/settings.json
+**/settings.local.json
+docs/superpowers/plans/
+docs/superpowers/specs/
+# Review output files
+/cc-*.json
+grp_out.txt
+.cctmp/
+.codegraph/
+
+# docs standalone dev build output
+packages/docs/dev-dist/
+# docs collab smoke screenshots / artifacts
+packages/docs/dev/smoke-out/
+packages/docs/dev/presence-out/
+packages/docs/dev/reorder-out/
+packages/docs/dev/handle-ux-out/
+packages/docs/dev/coexist-out/
+packages/docs/dev/multipointer-out/
+packages/docs/dev/colhover-out/
+
+# Loop V1 内部设计文档仅保留在本地 workspace，不纳入版本库
+docs/loop-v1/
+.omx
+.idea/
+.ftre/

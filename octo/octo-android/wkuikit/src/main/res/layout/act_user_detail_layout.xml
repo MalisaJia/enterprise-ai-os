@@ -1,0 +1,481 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/homeColor"
+    android:orientation="vertical">
+
+    <include layout="@layout/wk_title_bar_layout" />
+
+    <com.scwang.smart.refresh.layout.SmartRefreshLayout
+        android:id="@+id/refreshLayout"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <androidx.core.widget.NestedScrollView
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="@color/homeColor"
+                android:orientation="vertical">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="15dp"
+                    android:layout_marginTop="25dp"
+                    android:layout_marginEnd="15dp">
+
+                    <FrameLayout
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content">
+
+                        <com.chat.base.ui.components.AvatarView
+                            android:id="@+id/avatarView"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content" />
+
+                        <!--  (对齐 web PR#1092 BotDetailModal)：bot 创建者可见的
+                             头像编辑铅笔，默认 GONE；UserDetailActivity.showBotInfo()
+                             在 isOwner=true 时切到 VISIBLE。 -->
+                        <androidx.appcompat.widget.AppCompatImageView
+                            android:id="@+id/botAvatarEditIv"
+                            android:layout_width="20dp"
+                            android:layout_height="20dp"
+                            android:layout_gravity="bottom|end"
+                            android:background="@drawable/bg_ai_badge"
+                            android:padding="3dp"
+                            android:src="@mipmap/msg_edit"
+                            android:visibility="gone"
+                            android:contentDescription="@string/update_avatar" />
+                    </FrameLayout>
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_gravity="center_vertical"
+                        android:layout_marginStart="10dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content">
+
+                            <TextView
+                                android:id="@+id/nameTv"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_gravity="center_vertical"
+                                android:background="@drawable/send_chat_text_bg"
+                                android:textColor="@color/colorDark"
+                                android:textSize="16sp" />
+
+                            <androidx.appcompat.widget.AppCompatImageView
+                                android:id="@+id/realnameVerifiedIv"
+                                android:layout_width="24dp"
+                                android:layout_height="17dp"
+                                android:layout_gravity="center_vertical"
+                                android:layout_marginStart="4dp"
+                                android:layout_marginTop="2dp"
+                                android:src="@mipmap/ic_realname_verified_card"
+                                android:visibility="gone" />
+
+                            <androidx.appcompat.widget.AppCompatImageView
+                                android:id="@+id/sexIv"
+                                android:layout_width="25dp"
+                                android:layout_height="25dp"
+                                android:layout_gravity="center_vertical"
+                                android:src="@mipmap/icon_male" />
+
+                            <TextView
+                                android:id="@+id/aiBadgeTv"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_gravity="center_vertical"
+                                android:layout_marginStart="5dp"
+                                android:background="@drawable/bg_ai_badge"
+                                android:paddingStart="5dp"
+                                android:paddingTop="1dp"
+                                android:paddingEnd="5dp"
+                                android:paddingBottom="1dp"
+                                android:text="AI"
+                                android:textColor="@color/white"
+                                android:textSize="10sp"
+                                android:textStyle="bold"
+                                android:visibility="gone" />
+
+                        </LinearLayout>
+
+                        <LinearLayout
+                            android:id="@+id/inGroupNameLayout"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="5dp"
+                            android:visibility="gone">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_gravity="center_vertical"
+                                android:text="@string/in_group_name"
+                                android:textSize="12sp" />
+
+                            <TextView
+                                android:id="@+id/inGroupNameTv"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_gravity="center_vertical"
+                                android:textSize="12sp" />
+                        </LinearLayout>
+
+                        <LinearLayout
+                            android:visibility="gone"
+                            android:id="@+id/nickNameLayout"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="5dp">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_gravity="center_vertical"
+                                android:text="@string/nickname"
+                                android:textSize="12sp" />
+
+                            <TextView
+                                android:id="@+id/nickNameTv"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_gravity="center_vertical"
+                                android:background="@drawable/send_chat_text_bg"
+                                android:textSize="12sp" />
+                        </LinearLayout>
+
+                        <LinearLayout
+                            android:id="@+id/identityLayout"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="5dp"
+                            android:visibility="gone">
+
+                            <TextView
+                                android:id="@+id/appIdNumLeftTv"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_gravity="center_vertical"
+                                android:text="@string/app_idnum"
+                                android:textSize="12sp" />
+
+                            <TextView
+                                android:id="@+id/appIdNumTv"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_gravity="center_vertical"
+                                android:background="@drawable/send_chat_text_bg"
+                                android:textSize="12sp" />
+                        </LinearLayout>
+                    </LinearLayout>
+
+                </LinearLayout>
+
+                <!-- Bot info section (default GONE) -->
+                <LinearLayout
+                    android:id="@+id/botInfoLayout"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="15dp"
+                    android:background="@color/white"
+                    android:orientation="vertical"
+                    android:visibility="gone">
+
+                    <LinearLayout
+                        android:id="@+id/botDescLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:background="@drawable/layout_bg"
+                        android:orientation="vertical"
+                        android:paddingStart="15dp"
+                        android:paddingTop="15dp"
+                        android:paddingEnd="15dp"
+                        android:paddingBottom="15dp"
+                        android:visibility="gone">
+
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:orientation="horizontal">
+
+                            <TextView
+                                style="@style/leftTextView"
+                                android:layout_width="0dp"
+                                android:layout_weight="1"
+                                android:text="@string/bot_description_label" />
+
+                            <!--  (对齐 web PR#1092 BotDetailModal)：bot 创建者可见的
+                                 「编辑简介」按钮；非 owner 场景保持 GONE。 -->
+                            <androidx.appcompat.widget.AppCompatImageView
+                                android:id="@+id/botDescEditIv"
+                                android:layout_width="24dp"
+                                android:layout_height="24dp"
+                                android:layout_gravity="center_vertical"
+                                android:padding="2dp"
+                                android:src="@mipmap/msg_edit"
+                                android:visibility="gone"
+                                android:contentDescription="@string/bot_edit_description_title" />
+                        </LinearLayout>
+
+                        <TextView
+                            android:id="@+id/botDescTv"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="4dp"
+                            android:textColor="@color/color999" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:id="@+id/botCreatorLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:background="@drawable/layout_bg"
+                        android:orientation="vertical"
+                        android:paddingStart="15dp"
+                        android:paddingTop="15dp"
+                        android:paddingEnd="15dp"
+                        android:paddingBottom="15dp"
+                        android:visibility="gone">
+
+                        <TextView
+                            style="@style/leftTextView"
+                            android:layout_width="wrap_content"
+                            android:layout_weight="0"
+                            android:text="@string/bot_creator_label" />
+
+                        <TextView
+                            android:id="@+id/botCreatorTv"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="4dp"
+                            android:textColor="@color/color999" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:id="@+id/botIdLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:background="@drawable/layout_bg"
+                        android:orientation="vertical"
+                        android:paddingStart="15dp"
+                        android:paddingTop="15dp"
+                        android:paddingEnd="15dp"
+                        android:paddingBottom="15dp"
+                        android:visibility="gone">
+
+                        <TextView
+                            style="@style/leftTextView"
+                            android:layout_width="wrap_content"
+                            android:layout_weight="0"
+                            android:text="@string/bot_id_label" />
+
+                        <TextView
+                            android:id="@+id/botIdTv"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="4dp"
+                            android:textColor="@color/color999" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:id="@+id/botCommandsLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:background="@drawable/layout_bg"
+                        android:orientation="vertical"
+                        android:paddingStart="15dp"
+                        android:paddingTop="15dp"
+                        android:paddingEnd="15dp"
+                        android:paddingBottom="15dp"
+                        android:visibility="gone">
+
+                        <TextView
+                            style="@style/leftTextView"
+                            android:layout_width="wrap_content"
+                            android:layout_weight="0"
+                            android:text="@string/bot_commands_label" />
+
+                        <LinearLayout
+                            android:id="@+id/botCommandsContainer"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="4dp"
+                            android:orientation="vertical" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="20dp"
+                    android:background="@color/white"
+                    android:orientation="vertical">
+
+                    <LinearLayout
+                        android:id="@+id/remarkLayout"
+                        style="@style/layoutBg">
+
+                        <TextView
+                            style="@style/leftTextView"
+                            android:layout_weight="1"
+                            android:text="@string/set_remark" />
+
+                        <androidx.appcompat.widget.AppCompatImageView style="@style/arrow_right_iv" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:id="@+id/fromLayout"
+                        style="@style/layoutBg"
+                        android:visibility="visible">
+
+                        <TextView
+                            style="@style/leftTextView"
+                            android:layout_gravity="center_vertical"
+                            android:text="@string/source_from" />
+
+                        <TextView
+                            android:gravity="end"
+                            android:layout_weight="5"
+                            android:id="@+id/sourceFromTv"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_gravity="center_vertical"
+                            android:text="@string/source_from_unknown"
+                            android:textColor="@color/color999" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:id="@+id/joinGroupWayLayout"
+                        style="@style/layoutBg"
+                        android:visibility="gone">
+
+                        <TextView
+                            style="@style/leftTextView"
+                            android:layout_gravity="center_vertical"
+                            android:text="@string/join_group_source" />
+
+                        <TextView
+                            android:id="@+id/joinGroupWayTv"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_gravity="center_vertical"
+                            android:layout_weight="3"
+                            android:gravity="end"
+                            android:textColor="@color/color999" />
+                    </LinearLayout>
+
+                    <View style="@style/view_line_15" />
+
+                    <LinearLayout
+                        android:id="@+id/otherLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical" />
+
+                    <LinearLayout
+                        android:id="@+id/deleteLayout"
+                        style="@style/layoutBg">
+
+                        <TextView
+                            style="@style/leftTextView"
+                            android:layout_weight="1"
+                            android:text="@string/delete_friends" />
+
+                        <androidx.appcompat.widget.AppCompatImageView style="@style/arrow_right_iv" />
+                    </LinearLayout>
+
+
+                    <LinearLayout
+                        android:id="@+id/complaintLayout"
+                        style="@style/layoutBg"
+                        android:visibility="gone">
+
+                        <TextView
+                            style="@style/leftTextView"
+                            android:layout_weight="1"
+                            android:text="@string/report" />
+
+                        <androidx.appcompat.widget.AppCompatImageView style="@style/arrow_right_iv" />
+                    </LinearLayout>
+                </LinearLayout>
+
+                <LinearLayout
+                    android:id="@+id/pushBlackLayout"
+                    style="@style/layoutBg">
+
+                    <TextView
+                        android:id="@+id/blacklistTv"
+                        style="@style/leftTextView"
+                        android:layout_weight="1"
+                        android:text="@string/push_black_list" />
+
+                    <androidx.appcompat.widget.AppCompatImageView style="@style/arrow_right_iv" />
+                </LinearLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/sendMsgBtn"
+                    style="@style/buttonNormal"
+                    android:layout_marginStart="15dp"
+                    android:layout_marginTop="30dp"
+                    android:layout_marginEnd="15dp"
+                    android:text="@string/send_msg"
+                    android:visibility="gone"
+                    app:cornerRadius="@dimen/button_radian" />
+
+                <TextView
+                    android:id="@+id/blacklistDescTv"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="center"
+                    android:layout_marginTop="10dp"
+                    android:text="@string/black_list_desc"
+                    android:textColor="@color/color999"
+                    android:textSize="14sp"
+                    android:visibility="gone" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/applyBtn"
+                    style="@style/buttonNormal"
+                    android:layout_marginStart="15dp"
+                    android:layout_marginTop="30dp"
+                    android:layout_marginEnd="15dp"
+                    android:text="@string/apply"
+                    android:visibility="gone"
+                    app:cornerRadius="@dimen/button_radian" />
+
+                <!-- ：外部成员 viewer 下替代整个 bottomPanel 的提示文案，
+                     对齐 web `.wk-userinfo-footer-external-hint`。默认隐藏，
+                     UserDetailActivity 在 isExternalUser=true 时显示。 -->
+                <TextView
+                    android:id="@+id/externalHintTv"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="15dp"
+                    android:layout_marginTop="30dp"
+                    android:layout_marginEnd="15dp"
+                    android:gravity="center"
+                    android:text="@string/external_member_only_in_group_hint"
+                    android:textColor="@color/color999"
+                    android:textSize="14sp"
+                    android:visibility="gone" />
+
+                <Space
+                    android:layout_width="match_parent"
+                    android:layout_height="30dp" />
+            </LinearLayout>
+        </androidx.core.widget.NestedScrollView>
+    </com.scwang.smart.refresh.layout.SmartRefreshLayout>
+</LinearLayout>

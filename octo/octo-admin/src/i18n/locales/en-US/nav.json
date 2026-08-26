@@ -1,0 +1,17 @@
+{
+  "groupOverview": "Overview",
+  "groupManagement": "Management",
+  "groupSystem": "System",
+  "dashboard": "Dashboard",
+  "users": "Users",
+  "groups": "Groups",
+  "spaces": "Spaces",
+  "appBots": "App Bots",
+  "systemSetting": "System Settings",
+  "systemMcp": "MCP Market",
+  "skillMarket": "Skill Market",
+  "expertMarket": "Expert Market",
+  "backup": "Backups",
+  "download": "Downloads",
+  "systemSkill": "Skill Market"
+}

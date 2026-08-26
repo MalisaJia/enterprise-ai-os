@@ -1,0 +1,684 @@
+# =============================================================================
+# OCTO Helm Chart — values.yaml
+# =============================================================================
+# REQUIRED: Before installing, set every value under `secrets:` that has an
+# empty or placeholder default. Generate strong values with:
+#   openssl rand -hex 16   (for 32-byte keys)
+#   openssl rand -hex 32   (for 64-byte tokens)
+# =============================================================================
+
+nameOverride: ""
+fullnameOverride: ""
+
+# =============================================================================
+# Global image settings
+# =============================================================================
+global:
+  # Private registry prefix applied to repositories without an explicit registry host.
+  # Example: hub.intra.mlamp.cn/octo
+  # Unqualified images become: <imageRegistry>/<repository>:<tag>.
+  # Fully-qualified repositories such as registry.example.com/team/image bypass it.
+  imageRegistry: ""
+
+  # List of existing Kubernetes Secrets with registry credentials.
+  # Applied to every pod in the chart.
+  # Create with: kubectl create secret docker-registry regcred \
+  #   --docker-server=<registry> --docker-username=<user> \
+  #   --docker-password=<password> -n <namespace>
+  imagePullSecrets: []
+  # - name: regcred
+
+# CloudApp TCR credentials (injected by deployment.tf during CloudApp deployment).
+# Used by secret-registry.yaml to create a kubernetes.io/dockerconfigjson Secret
+# that Pods reference via imagePullSecrets.
+tcrImageCredentials:
+  registry: ""
+  username: ""
+  password: ""
+
+# CloudApp runtime CAM role. Reserved for Tencent Cloud API calls implemented
+# by the application; COS currently uses secrets.cosSecretId/cosSecretKey.
+CAM_ROLE: ""
+
+# Busybox image used by all init containers (wait-for-* probes).
+busybox:
+  image:
+    repository: busybox
+    tag: "1.36"
+    pullPolicy: IfNotPresent
+
+# Public domain / hostname the stack is accessible at.
+domain: "octo.local"
+
+# Override the full external base URL (scheme + host + port).
+# Defaults to http://{{ domain }}:{{ nginx.service.port }}
+externalBaseURL: ""
+
+# Kubernetes CoreDNS / kube-dns ClusterIP.
+# Only needed if you use nginx variable-form proxy_pass (not the default).
+# Common values: kubeadm/kind/minikube=10.96.0.10, k3s=10.43.0.10
+dns:
+  clusterIP: "10.96.0.10"
+
+# Global timezone
+timezone: "UTC"
+
+# =============================================================================
+# Secrets — MUST be rotated before deploying
+# =============================================================================
+secrets:
+  # MySQL root password. Characters must be in [A-Za-z0-9._+=-].
+  # Generate: openssl rand -hex 16
+  mysqlRootPassword: ""
+
+  # MinIO root password (≥8 chars).
+  # Generate: openssl rand -hex 16
+  minioRootPassword: ""
+
+  # MinIO application-scoped IAM password.
+  # Generate: openssl rand -hex 24
+  minioAppPassword: ""
+
+  # MySQL service-account passwords. Characters must be in [A-Za-z0-9._+=-].
+  # Cannot be the literal strings "matter", "summary", "summary_reader".
+  matterDbPassword: ""
+  summaryDbPassword: ""
+  summaryReaderPassword: ""
+
+  # OCTO master key — exactly 32 bytes.
+  # Generate: openssl rand -hex 16
+  octoMasterKey: ""
+
+  # Inter-service HMAC token (octo-server ↔ matter / summary-api).
+  # Generate: openssl rand -hex 32
+  notifyInternalToken: ""
+
+  # WuKongIM admin manager token.
+  # Generate: openssl rand -hex 32
+  wukongimManagerToken: ""
+
+  # Initial superAdmin password. Must be set explicitly — leave empty to skip
+  # auto-bootstrap. When non-empty AND no superAdmin row exists, octo-server
+  # creates a superAdmin account on startup with password = bcrypt(adminPwd).
+  adminPwd: ""
+
+  # Redis AUTH password. Leave empty if Redis runs without authentication
+  # (the bundled Redis StatefulSet has no auth by default).
+  redisPassword: ""
+
+  # LLM API key for octo-matter + smart-summary (optional for smoke tests).
+  llmApiKey: ""
+
+  # Speech credentials. Required only when speech.enabled=true.
+  speechDbPassword: ""
+  speechApiKey: ""
+  speechModelKey: ""
+  # Legacy engine-specific keys remain supported for direct Helm upgrades.
+  speechQwenKey: ""
+  speechLiteLLMKey: ""
+  speechAdminUsername: ""
+  speechAdminPassword: ""
+  speechAdminJwtSecret: ""
+
+  # Docs credentials. Required only when docs.enabled=true.
+  docsDbPassword: ""          # Password for the 'docs' MySQL user
+  docsCollabSecret: ""        # JWT signing secret for collab tokens (min 32 chars)
+  docsAttachmentSecret: ""    # HMAC secret for attachment presigned URLs (min 32 chars)
+
+  # Marketplace credentials. Required only when marketplace.enabled=true.
+  marketplaceDbPassword: ""   # Password for the 'marketplace' MySQL user
+
+  # Inbound webhook HMAC secret (optional).
+  webhookSecretKey: ""
+
+  # ── Cloud storage credentials ───────────────────────────────────────────────
+  # Only the block matching server.config.fileService is required.
+
+  # fileService: tencentCOS. Inject through Kubernetes Secret and env vars.
+  cosSecretId: ""
+  cosSecretKey: ""
+
+  # fileService: aliOSS
+  ossAccessKeyId: ""
+  ossAccessKeySecret: ""
+
+  # fileService: s3
+  s3AccessKeyId: ""
+  s3SecretAccessKey: ""
+  s3SessionToken: ""   # Optional — STS temporary credential
+
+  # fileService: qiniu
+  qiniuAccessKey: ""
+  qiniuSecretKey: ""
+
+# =============================================================================
+# LLM configuration (shared by matter + smart-summary)
+# =============================================================================
+llm:
+  apiURL: "https://api.example.com/v1"
+  model: "claude-sonnet-4-6"
+
+# =============================================================================
+# Cloud object storage — used when server.config.fileService != "minio"
+# Set minio.enabled=false when using any of these providers.
+
+# fileService: tencentCOS
+cos:
+  region: ""          # Required. e.g. ap-guangzhou
+  bucket: ""          # Required. e.g. my-bucket-1234567890
+  downloadURL: ""     # Public download domain. e.g. https://my-bucket-1234567890.cos.ap-guangzhou.myqcloud.com
+  prefix: ""          # Optional path prefix for multi-env isolation
+
+# fileService: aliOSS (Aliyun OSS)
+oss:
+  endpoint: ""        # Required. e.g. oss-cn-hangzhou.aliyuncs.com
+  bucket: ""          # Required.
+  downloadURL: ""     # Public download domain. e.g. https://my-bucket.oss-cn-hangzhou.aliyuncs.com
+
+# fileService: s3 (AWS S3 or S3-compatible stores)
+s3:
+  endpoint: ""        # Host only, no scheme. e.g. s3.us-east-1.amazonaws.com
+  region: ""          # e.g. us-east-1
+  bucket: ""          # Required.
+  downloadURL: ""     # Optional CDN domain.
+  prefix: ""          # Optional path prefix.
+  usePathStyle: false # Set true for path-style addressing (MinIO-compatible stores)
+
+# fileService: qiniu (Qiniu Kodo)
+qiniu:
+  bucket: ""          # Kodo space name.
+  downloadURL: ""     # CDN / bucket domain. e.g. https://cdn.example.com
+
+# =============================================================================
+# MySQL
+# =============================================================================
+mysql:
+  enabled: true
+  image:
+    repository: mysql
+    tag: "8.0"
+    pullPolicy: IfNotPresent
+  auth:
+    database: "octo"
+  service:
+    port: 3306
+  storage:
+    size: 20Gi
+    storageClass: ""
+  resources: {}
+
+# =============================================================================
+# Redis
+# =============================================================================
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+  service:
+    port: 6379
+  storage:
+    size: 10Gi
+    storageClass: ""
+  resources: {}
+
+# =============================================================================
+# MinIO
+# =============================================================================
+minio:
+  enabled: true
+  image:
+    repository: minio/minio
+    tag: "RELEASE.2025-04-22T22-12-26Z"
+    pullPolicy: IfNotPresent
+  mcImage:
+    repository: minio/mc
+    tag: "RELEASE.2025-04-16T18-13-26Z"
+    pullPolicy: IfNotPresent
+  auth:
+    rootUser: "octoadmin"
+    appUser: "octo-app"
+  # Override the public S3 endpoint URL (scheme+host+port, no path).
+  # Defaults to externalBaseURL (or http://domain:nginx.port).
+  serverURL: ""
+  service:
+    apiPort: 9000
+    consolePort: 9001
+  storage:
+    size: 50Gi
+    storageClass: ""
+  resources: {}
+
+# =============================================================================
+# WuKongIM
+# =============================================================================
+wukongim:
+  enabled: true
+  image:
+    repository: wukongim/wukongim
+    tag: "v2.2.5-20260422"
+    pullPolicy: IfNotPresent
+  mode: "release"
+  # externalIP is advertised to clients in /route responses.
+  externalIP: ""
+  # Leave wsAddr empty to auto-derive: ws://domain:nginx.port/ws
+  wsAddr: ""
+  wssAddr: ""
+  tcpAddr: ""
+  service:
+    apiPort: 5001
+    tcpPort: 5100
+    wsPort: 5200
+    monitorPort: 5300
+  storage:
+    size: 10Gi
+    storageClass: ""
+  resources: {}
+
+# =============================================================================
+# External services — set the matching `<service>.enabled: false` to disable
+# the bundled component, then fill in the connection info here.
+# When `<service>.enabled: true` (default), these blocks are ignored.
+# =============================================================================
+externalMySQL:
+  host: ""
+  port: 3306
+  database: "octo"
+
+externalRedis:
+  # Format: host:port
+  addr: ""
+
+externalMinio:
+  # Format: host:port
+  endpoint: ""
+  rootUser: ""
+  appUser: "octo-app"
+
+externalWukongim:
+  apiURL: ""
+  # Format: host:port — required when wukongim.enabled=false
+  wsEndpoint: ""
+
+# =============================================================================
+# octo-server
+# =============================================================================
+server:
+  image:
+    repository: mininglamposs/octo-server
+    tag: "1.6.0"
+    pullPolicy: IfNotPresent
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  # ---------------------------------------------------------------------------
+  # Runtime configuration — maps 1:1 to octo-server.yaml (tsdd.yaml).
+  # Values intentionally left empty here are overridden at runtime via
+  # TS_* env vars in the Deployment (credentials, addresses). Only set these
+  # when you need to diverge from the defaults.
+  # ---------------------------------------------------------------------------
+  config:
+    # Runtime mode: debug | release
+    mode: "release"
+
+    # Optional external web-login redirect URL (e.g. for SSO / custom login page).
+    # Corresponds to external.webLoginURL in tsdd.yaml.
+    webLoginURL: ""
+
+    # Test-only SMS verification code bypass. Ignored in release mode.
+    smsCode: ""
+
+    # File storage backend. Supported values:
+    #   minio       — bundled or external MinIO (see minio:/externalMinio:)
+    #   tencentCOS  — Tencent Cloud COS         (see cos: + secrets.cosSecretId/Key)
+    #   aliOSS      — Aliyun OSS                (see oss: + secrets.ossAccessKeyId/Secret)
+    #   s3          — AWS S3 or S3-compatible   (see s3: + secrets.s3AccessKeyId/SecretKey)
+    #   qiniu       — Qiniu Kodo                (see qiniu: + secrets.qiniuAccessKey/SecretKey)
+    # When set to any value other than "minio", set minio.enabled=false.
+    fileService: "minio"
+
+    logger:
+      # Log verbosity: 0=off  1=error  2=warn  3=info  4=debug
+      level: 2
+      # Log output directory inside the container.
+      dir: "./logs"
+      # Include source file:line in every log line (noisy — off by default).
+      lineNum: false
+
+    register:
+      # Disable user self-registration. Set to false to allow open sign-up.
+      # Note: avoid key name "off" — it is a YAML 1.1 boolean synonym and
+      # will be mis-parsed by Go's yaml.v3.
+      disabled: true
+      # Restrict registration to China mobile numbers only.
+      onlyChina: false
+      # Enable email-based registration (requires support.emailSmtp below).
+      emailOn: false
+
+    # Support / outbound email settings.
+    # Required when register.emailOn: true or for password-reset emails.
+    support:
+      # Sender address (From:) for all outbound emails.
+      email: ""
+      # SMTP server in host:port form.
+      # Port 465 = implicit TLS (SMTPS), 587 = STARTTLS.
+      # Example: "smtp.gmail.com:465"
+      emailSmtp: ""
+      # SMTP login password.
+      emailPwd: ""
+
+# =============================================================================
+# octo-web (SPA frontend)
+# =============================================================================
+web:
+  image:
+    repository: mininglamposs/octo-web
+    tag: "1.4.2"
+    pullPolicy: IfNotPresent
+  replicas: 1
+  resources: {}
+
+# =============================================================================
+# octo-admin (admin console)
+# =============================================================================
+admin:
+  image:
+    repository: mininglamposs/octo-admin
+    tag: "1.5.1"
+    pullPolicy: IfNotPresent
+  replicas: 1
+  resources: {}
+
+# =============================================================================
+# octo-matter (tasks/AI assistant)
+# =============================================================================
+matter:
+  image:
+    repository: mininglamposs/octo-matter
+    tag: "1.1.1"
+    pullPolicy: IfNotPresent
+  replicas: 1
+  appEnv: "prod"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+# =============================================================================
+# Smart Summary (summary-api + summary-worker)
+# =============================================================================
+summary:
+  enabled: false
+  api:
+    image:
+      repository: mininglamposs/octo-smart-summary-api
+      tag: "1.2.1"
+      pullPolicy: IfNotPresent
+    replicas: 1
+    resources: {}
+  worker:
+    image:
+      repository: mininglamposs/octo-smart-summary-worker
+      tag: "1.2.1"
+      pullPolicy: IfNotPresent
+    replicas: 1
+    resources: {}
+
+# =============================================================================
+# Speech (speech API + speech admin)
+# =============================================================================
+speech:
+  enabled: false
+  image:
+    repository: mininglamposs/octo-speech
+    tag: "1.3.0"
+    pullPolicy: IfNotPresent
+  replicas: 1
+  config:
+    engine: qwen
+    selectedModels: ""
+    selectedURL: ""
+    # Legacy engine-specific fields remain supported for direct Helm upgrades.
+    qwenModels: qwen3.5-omni-plus
+    gptModels: gpt-4o-mini-transcribe
+    models: gemini-3-flash-preview,gemini-3.1-pro-preview,gemini-2.5-pro
+    liteLLMURL: https://dashscope.aliyuncs.com/compatible-mode/v1
+    qwenURL: ""
+    liteLLMTimeout: "60"
+    totalTimeout: "90"
+    logBufferSize: "256"
+    logRetentionDays: "7"
+    feedbackURL: ""
+  storage:
+    enabled: true
+    size: 10Gi
+    storageClass: ""
+  podSecurityContext:
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  admin:
+    image:
+      repository: mininglamposs/octo-speech-admin
+      tag: "1.3.0"
+      pullPolicy: IfNotPresent
+    replicas: 1
+    secureCookie: false
+    tokenExpire: "24"
+    readTimeout: 30s
+    writeTimeout: 60s
+    idleTimeout: 120s
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+  bootstrap:
+    appName: octo-server
+    image:
+      repository: curlimages/curl
+      tag: "8.10.1"
+      pullPolicy: IfNotPresent
+
+# =============================================================================
+# Docs (octo-docs-backend: Hocuspocus + Yjs real-time collaborative documents)
+# =============================================================================
+docs:
+  enabled: false
+  image:
+    repository: mininglamposs/octo-docs-backend
+    tag: "0.4.0"
+    pullPolicy: IfNotPresent
+  replicas: 1
+  config:
+    # Public WebSocket URL for Hocuspocus collab (browser-reachable)
+    # Defaults to ws://{{ domain }}:{{ nginx.service.port }}/docs-ws/
+    collabWsURL: ""
+    # Public web origin for shareable doc links
+    # Defaults to http://{{ domain }}:{{ nginx.service.port }}
+    webOrigin: ""
+    # S3 endpoint for attachments (browser-reachable for presigned URLs)
+    # Defaults to http://{{ domain }}:{{ nginx.service.port }}
+    s3Endpoint: ""
+    # CORS allowed origins (comma-separated or *)
+    # Defaults to http://{{ domain }}:{{ nginx.service.port }}
+    corsOrigins: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# =============================================================================
+# Marketplace (skill / bot / MCP catalog) — OPT-IN.
+# Default OFF: with marketplace.enabled=false NO marketplace resources are rendered.
+# =============================================================================
+marketplace:
+  enabled: false
+  image:
+    repository: mininglamposs/octo-marketplace
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  replicas: 1
+  config:
+    # Whether to require authentication for API calls
+    authEnabled: true
+    # Storage driver (oss = MinIO-compatible S3)
+    storageDriver: oss
+    # Public endpoint for presigned URL downloads (browser-reachable)
+    # Defaults to http://{{ domain }}:{{ nginx.service.port }}
+    ossPublicEndpoint: ""
+    # Maximum upload size in MB
+    maxUploadMB: 20
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# =============================================================================
+# Search pipeline (Kafka + OpenSearch[analysis-ik] + es-indexer) — OPT-IN.
+# Default OFF: with search.enabled=false NO search resources are rendered.
+# Enabling deploys search INFRASTRUCTURE ONLY; it does NOT wire octo-server onto
+# OpenSearch (reader/producer cut-over is a separate owner-gated step — parity
+# with kustomize/search, which is also infra-only).
+#
+# 🔴 PREREQUISITE before search.enabled=true is actually installable:
+#   - opensearch.image MUST be a registry image with analysis-ik baked in
+#     (build docker/opensearch/Dockerfile, push, set repository/tag below).
+#     The default name below is a LOCAL build name and will NOT pull as-is.
+#   - indexer.image is published only on v* tags; pin a real tag/digest for prod.
+#
+# NOTE (china overlay): the new search images (self-built opensearch-ik +
+# private indexer) are NOT yet mirrored for values-china.yaml; wiring the china
+# overlay's search image overrides is a separate follow-up, out of scope here.
+# =============================================================================
+search:
+  enabled: false
+  opensearch:
+    image: { repository: octo-search-opensearch-ik, tag: "2.17.0", pullPolicy: IfNotPresent }
+    javaOpts: "-Xms512m -Xmx512m"
+    disableSecurityPlugin: true
+    storage: { size: 20Gi, storageClass: "" }
+    resources:
+      requests: { cpu: 500m, memory: 1Gi }
+      limits:   { cpu: "2", memory: 2Gi }
+  kafka:
+    image: { repository: apache/kafka, tag: "3.8.0", pullPolicy: IfNotPresent }
+    # 🔴 IMMUTABLE after first install: this UUID formats the KRaft metadata on
+    # the PVC. Changing it on an existing PVC crash-loops the broker. Regenerate
+    # (kafka-storage.sh random-uuid) ONLY for a fresh deploy / fresh PVC.
+    clusterId: "3kNqlPkyT16sjDguh9qqKA"
+    storage: { size: 10Gi, storageClass: "" }
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits:   { cpu: "1", memory: 1Gi }
+  indexer:
+    image: { repository: mininglamposs/octo-search-indexer, tag: "latest", pullPolicy: Always }
+    batchSize: 500
+    dlqSpill: { size: 1Gi, storageClass: "" }
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 512Mi }
+  # Standalone searchetl-producer — DISABLED-ARTIFACT-ONLY in this chart.
+  # Double-OFF (enabled:false AND replicas:0), parity with kustomize/search.
+  # 🔴 ACTUALLY ENABLING the producer (replicas>0) is OUT OF SCOPE for this
+  # chart revision — it reads the LIVE message DB + shares cursor/Redis lock
+  # with octo-server's built-in producer (double-write risk) and is owner-gated.
+  # The template fail-fasts on illegal enable states (see helm README).
+  producer:
+    enabled: false
+    replicas: 0
+    # When (later) enabled, reference a PRE-CREATED Secret rather than inlining
+    # the DSN — inline --set leaks the DSN into the release Secret, values
+    # history, and shell history. existingSecret keeps the credential out of the
+    # chart, mirroring kustomize/search's dedicated searchetl-producer-secret.
+    existingSecret: ""            # name of a Secret holding the two keys below
+    mysqlDsnKey: "PRODUCER_MYSQL_DSN"
+    redisAddrKey: "PRODUCER_REDIS_ADDR"
+    tables: "message,message1,message2,message3,message4"
+    # lagSeconds: the producer only advances its cursor to DB_NOW - lag, so a new
+    # message is not produced until lag + one tick elapses. lag MUST exceed the
+    # longest single-message INSERT transaction on the source DB or low ids in a
+    # long-running transaction are silently missed (C1 visibility gate). Default
+    # 600 (10 min) has wide margin for sub-second message commits.
+    lagSeconds: 600
+    # tickSeconds: slow-cursor poll period. The producer binary clamps this to
+    # [5, 3600] (octo-search-indexer internal/producer/config.go). Default 60
+    # keeps existing environments unchanged; lower it (toward 5) only where
+    # near-real-time indexing is required AND lagSeconds is also lowered.
+    tickSeconds: 60
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 512Mi }
+
+# =============================================================================
+# Nginx reverse proxy
+# =============================================================================
+nginx:
+  image:
+    repository: nginx
+    tag: "1.27-alpine"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 80
+    # nodePort: 30080   # uncomment for NodePort type
+    annotations: {}
+  resources: {}
+
+# =============================================================================
+# Ingress (optional — routes external traffic into the embedded nginx)
+# =============================================================================
+# All complex routing (/api/, /ws, /minio/, URL rewrites, rate-limiting) is
+# handled by the embedded nginx. The Ingress only needs a single catch-all
+# rule pointing at the octo-nginx Service.
+ingress:
+  enabled: false
+
+  # IngressClass name. Common values:
+  #   nginx   — community nginx-ingress-controller
+  #   qcloud  — TKE / Tencent Cloud CLB ingress
+  #   traefik — Traefik ingress controller
+  className: ""
+
+  # Extra annotations forwarded to the Ingress resource.
+  # Defaults below are suitable for nginx-ingress-controller; adjust for
+  # other controllers.
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "1000m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+
+  # Hostname the stack is exposed on. Defaults to .Values.domain.
+  host: ""
+
+  tls:
+    enabled: false
+    # Tencent Cloud SSL certificate ID. When set, the chart creates the
+    # Opaque Secret consumed by TKE CLB Ingress.
+    certId: ""
+    # Name of an existing K8s Secret that holds tls.crt + tls.key.
+    # Create with: kubectl create secret tls octo-tls --cert=tls.crt --key=tls.key
+    secretName: ""

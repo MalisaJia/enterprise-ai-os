@@ -1,0 +1,588 @@
+package robot
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-server/pkg/botevent"
+	"github.com/tidwall/gjson"
+	"go.uber.org/zap"
+)
+
+// getCreatorUID 带缓存地查询机器人的创建者UID
+func (rb *Robot) getCreatorUID(robotID string) (string, error) {
+	if v, ok := rb.creatorCache.Load(robotID); ok {
+		return v.(string), nil
+	}
+	uid, err := rb.db.queryCreatorUID(robotID)
+	if err != nil {
+		return "", err
+	}
+	rb.creatorCache.Store(robotID, uid)
+	return uid, nil
+}
+
+// robotIDMaxLen bounds a candidate bot id in **bytes**.
+//
+// It is the width of `robot.robot_id` (VARCHAR(40),
+// modules/robot/sql/20210926000001_robot_legacy01.sql), which MySQL counts in *characters*
+// under utf8mb4 — so this is deliberately the stricter of the two, and the difference is
+// stated rather than glossed (review round 7). A multibyte id would be rejected here while
+// the column would accept it; that is unreachable today because both id-producing paths are
+// ASCII-only (a client-chosen username is `[a-z0-9_]{1,20}` plus `_bot`, and the generated
+// form is lowercase hex plus `_bot` — modules/botfather), and bytes are what the Redis key
+// and the log line are actually made of. If a multibyte id ever becomes producible, widen
+// this to utf8.RuneCountInString rather than raising the number.
+const robotIDMaxLen = 40
+
+const robotMissingCacheTTL = 30 * time.Second
+
+// plausibleRobotID reports whether a client-supplied `payload.robot_id` is shaped like
+// something that could name a bot at all.
+//
+// This is a *syntactic* gate in front of the existRobot lookup, and it exists because that
+// lookup is on a client-controlled path. The monotonic allocator turns every adopted value
+// into a permanent `botEventSeq:counter:{id}` key — no TTL, in a Redis running `noeviction`
+// — plus a `seq` row that is never reclaimed. This check bounds one key's size and rejects
+// spellings no real bot can use; it does **not** bound cardinality, because a client can send
+// arbitrarily many distinct well-shaped values. Positive existence verification below is
+// what closes that dimension.
+//
+// The length bound is the decisive one and it needs no judgement call: a value longer than
+// the column can hold cannot match any row, so adopting it could only ever create permanent
+// state for a bot that provably does not exist. Whitespace and control characters are
+// rejected for the same reason botevent.NextEventID rejects a padded id — the allocator, the
+// queue key and the doorbell must all key off the identical string, and an id that cannot
+// round-trip through a log line or a `KEYS` listing is not one anybody meant to send.
+//
+// Deliberately no charset allowlist beyond that: bot ids are UUID-hex in production, but the
+// column stores whatever it is given, and guessing narrower here would silently stop a real
+// bot's events for the sake of a surface the length bound already closes.
+func plausibleRobotID(candidate string) bool {
+	if candidate == "" || len(candidate) > robotIDMaxLen {
+		return false
+	}
+	for _, r := range candidate {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// verifiedPayloadRobotID applies the trust boundary for client-controlled
+// payload.robot_id values.
+//
+// Only a successful, positive lookup is authority to adopt the candidate. Treating a lookup
+// error as existence lets a client create a fresh permanent counter key for every distinct
+// value throughout a dependency outage; the syntactic bound above limits key size, not key
+// count. Returning the lookup error lets the caller surface the availability failure while
+// keeping the unverified id out of the allocator.
+func verifiedPayloadRobotID(candidate string, exists bool, lookupErr error) (string, error) {
+	if lookupErr != nil {
+		return "", lookupErr
+	}
+	if !exists {
+		return "", nil
+	}
+	return candidate, nil
+}
+
+func (rb *Robot) existRobot(robotID string) (bool, error) {
+	key := fmt.Sprintf("robot:exist:%s", robotID)
+	exist, err := rb.ctx.GetRedisConn().GetString(key)
+	if err != nil {
+		return false, err
+	}
+	if exist == "1" {
+		return true, nil
+	}
+	if exist == "0" {
+		return false, nil
+	}
+	existB, err := rb.db.exist(robotID)
+	if err != nil {
+		return false, err
+	}
+	if existB {
+		err = rb.ctx.GetRedisConn().SetAndExpire(key, "1", time.Hour*24)
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	// Unknown client-supplied ids are common on this listener path. Cache a proven miss
+	// briefly so one repeated payload cannot turn into one MySQL query per message. Keep
+	// the TTL short: bot creation is allowed to make a previously missing id valid, and
+	// no creation hook can invalidate every replica's local observation atomically.
+	if err := rb.ctx.GetRedisConn().SetAndExpire(key, "0", robotMissingCacheTTL); err != nil {
+		rb.Warn("缓存不存在的robotID失败", zap.Error(err), zap.String("robotID", robotID))
+	}
+	return false, nil
+
+}
+
+func (rb *Robot) robotMessageListen(messages []*config.MessageResp) {
+	for _, message := range messages {
+		// Go 1.20 loopclosure: the goroutines spawned below close over `message`,
+		// so bind a loop-local copy first. (Go 1.22 makes this implicit, but the
+		// project still targets 1.20.)
+		message := message
+		payloadValue := gjson.ParseBytes(message.Payload)
+
+		if !payloadValue.Exists() {
+			continue
+		}
+		var robotID string
+		var robotIDs []string
+		// aisBroadcastSet captures the robotIDs that were added to
+		// `robotIDs` purely because of the `mention.ais=1` broadcast
+		// branch below (i.e. group bots that were NOT already in
+		// `mention.uids`). The fan-out loop uses this set to inject
+		// each such bot's UID into its own per-event payload copy so
+		// legacy adapters (octo-server#137) that only inspect
+		// `mention.uids` still recognise themselves as mentioned and
+		// reply.
+		//
+		// Important invariants (locked by the ais_broadcast tests):
+		//   - bots that came from the explicit `mention.uids` path
+		//     are NOT in this set, and their payload is delivered
+		//     verbatim (no rewrite) — preserving exact-@ semantics.
+		//   - the set is keyed on the SAME string that appears in
+		//     `robotIDs`, so the lookup at fan-out time is O(1) and
+		//     can't drift.
+		var aisBroadcastSet map[string]struct{}
+
+		if message.ChannelType == common.ChannelTypePerson.Uint8() {
+			uid := common.GetToChannelIDWithFakeChannelID(message.ChannelID, message.FromUID)
+			// Space channel_id 格式: s{spaceId}_{robotID}，提取真实 robotID
+			realUID := uid
+			if strings.HasPrefix(uid, "s") {
+				if idx := strings.LastIndex(uid, "_"); idx >= 0 {
+					realUID = uid[idx+1:]
+				}
+			}
+			exist, err := rb.existRobot(realUID)
+			if err != nil {
+				rb.Error("查询有效robotID失败！", zap.Error(err))
+				continue
+			}
+			rb.Debug("DM消息路由检测", zap.String("channelID", message.ChannelID), zap.String("fromUID", message.FromUID), zap.String("targetUID", uid), zap.String("realUID", realUID), zap.Bool("isRobot", exist))
+			if exist {
+				// BotFather 跳过好友关系校验
+				if realUID != "botfather" {
+					// 检查发送者是否为 Bot 创建者（使用缓存减少 DB 查询）
+					creatorUID, err := rb.getCreatorUID(realUID)
+					if err != nil {
+						rb.Error("查询Bot创建者失败", zap.Error(err), zap.String("robotID", realUID))
+						continue
+					}
+					// 创建者跳过好友关系校验
+					if creatorUID != message.FromUID {
+						isFriend, err := rb.userService.IsFriend(message.FromUID, realUID)
+						if err != nil {
+							rb.Error("查询好友关系失败", zap.Error(err), zap.String("fromUID", message.FromUID), zap.String("robotID", realUID))
+							continue
+						}
+						// Space 场景：好友表可能使用原始 uid 格式(s{spaceId}_{robotID})，需同时检查
+						if !isFriend && uid != realUID {
+							isFriend, err = rb.userService.IsFriend(message.FromUID, uid)
+							if err != nil {
+								rb.Error("查询好友关系失败(Space格式)", zap.Error(err), zap.String("fromUID", message.FromUID), zap.String("uid", uid))
+								continue
+							}
+						}
+						if !isFriend {
+							// 检查发送者是否为 bot 或系统账号，避免向 bot 发送系统提示导致消息循环
+							isFromBot, _ := rb.existRobot(message.FromUID)
+							if isFromBot || message.FromUID == rb.ctx.GetConfig().Account.SystemUID {
+								rb.Warn("发送者为Bot或系统账号，跳过好友提示避免消息循环",
+									zap.String("fromUID", message.FromUID), zap.String("robotID", realUID))
+								continue
+							}
+							rb.Warn("用户与Bot非好友关系，拒绝转发消息", zap.String("fromUID", message.FromUID), zap.String("robotID", realUID))
+							// YUJ-674 / Mininglamp-OSS#37: PERSONAL 走 NewPersonalMsgSendReq builder
+							// (with bot's resolved SpaceID); GROUP / 其它 channel_type 保留直接构造。
+							// "请先加好友"这条提示在 GROUP 路径下罕见，但保守保留旧语义。
+							friendTipPayload := map[string]interface{}{
+								"content": "请先添加好友后再与我对话",
+								"type":    common.Text,
+							}
+							if message.ChannelType == common.ChannelTypePerson.Uint8() {
+								rb.ctx.SendMessage(config.NewPersonalMsgSendReq(
+									message.FromUID,
+									realUID,
+									friendTipPayload,
+									rb.resolveBotActiveSpaceID(realUID),
+									config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+								))
+							} else {
+								rb.ctx.SendMessage(&config.MsgSendReq{
+									Header: config.MsgHeader{
+										RedDot: 1,
+									},
+									FromUID:     realUID,
+									ChannelID:   message.FromUID,
+									ChannelType: message.ChannelType,
+									Payload:     []byte(util.ToJson(friendTipPayload)),
+								})
+							}
+							continue
+						}
+					}
+				}
+				robotID = realUID
+			}
+
+		}
+		if len(robotID) == 0 {
+			robotIDValue := payloadValue.Get("robot_id")
+			if robotIDValue.Exists() {
+				// #697: validate before adopting it, as the three sibling branches below
+				// already do (mention.uids, @username text, ais broadcast). This one did
+				// not, and it is the only branch whose value comes verbatim out of a
+				// client's message payload.
+				//
+				// It used to cost an unknown value only a queue key with a TTL plus a
+				// `seq` row. The monotonic allocator adds a per-bot counter key with
+				// **no** TTL in a Redis running `noeviction`, plus a durable `seq` row
+				// that is never reclaimed — so an arbitrary payload value would become
+				// permanent per-value state. Rejecting an unknown bot is also just
+				// correct on its own terms: enqueueing onto a queue no bot will ever poll
+				// is not a delivery.
+				//
+				// A lookup error must not turn into authority to adopt the value. During
+				// a dependency outage a client can submit arbitrarily many distinct,
+				// well-shaped ids; adopting them would leave one permanent counter per
+				// value. The syntactic gate limits each key's size, not their count, so
+				// this branch accepts only a positively verified bot. The availability
+				// trade-off is explicit: an event routed solely by payload.robot_id is
+				// ignored while its identity cannot be verified.
+				candidate := robotIDValue.String()
+				if !plausibleRobotID(candidate) {
+					rb.Debug("payload.robot_id 形状不合法，忽略",
+						zap.String("robotID", candidate), zap.Int64("messageID", message.MessageID))
+				} else {
+					exist, err := rb.existRobot(candidate)
+					verified, verifyErr := verifiedPayloadRobotID(candidate, exist, err)
+					switch {
+					case verifyErr != nil:
+						rb.Error("查询有效robotID失败，无法正向验证，忽略payload.robot_id",
+							zap.Error(verifyErr), zap.String("robotID", candidate),
+							zap.Int64("messageID", message.MessageID))
+					case verified != "":
+						robotID = verified
+					default:
+						rb.Debug("payload.robot_id 不是已知机器人，忽略",
+							zap.String("robotID", candidate), zap.Int64("messageID", message.MessageID))
+					}
+				}
+			}
+			if len(robotID) == 0 && payloadValue.Get("mention").Exists() {
+				rb.Debug("检测到@提及", zap.String("mention", payloadValue.Get("mention").String()))
+				mentionValue := payloadValue.Get("mention")
+				mentionUIDsValue := mentionValue.Get("uids")
+				if mentionValue.Exists() && mentionUIDsValue.Exists() {
+					uidsValues := mentionUIDsValue.Array()
+					// 遍历所有被@的UID，找到其中的机器人
+					for _, uidValue := range uidsValues {
+						uid := uidValue.String()
+						exist, err := rb.existRobot(uid)
+						if err != nil {
+							rb.Error("查询有效robotID失败！", zap.Error(err))
+							continue
+						}
+						if exist {
+							robotIDs = append(robotIDs, uid)
+						}
+					}
+				}
+				// YUJ-1393 / PR#82 review #2 R2 / #142 follow-up:
+				// mention.ais=1 means "@所有 AI" (Plan X / YUJ-1389).
+				// The robot event dispatcher previously only considered
+				// robot_id / mention.uids / @username text, so a payload
+				// carrying only mention.ais=1 (no uids, no @username)
+				// silently skipped the robot event queue and group bots
+				// never received the "@所有 AI" broadcast.
+				//
+				// Post-#142 (`pkg/mentionrewrite` reverted to pass-
+				// through): legacy `mention.all=1` is NO LONGER
+				// auto-promoted to `mention.ais=1` by the send-side
+				// chokepoint. New clients that want their `@所有 AI`
+				// broadcast to summon group bots MUST set
+				// `mention.ais=1` explicitly. Legacy clients that only
+				// emit `mention.all=1` will not trigger this branch —
+				// that is intentional and matches the OBO fan-out
+				// gate's post-#142 contract (see modules/bot_api/
+				// obo_fanout.go: `mention.all` alone is not a bot
+				// summon).
+				//
+				// Scope: GROUP channels only. PERSONAL DMs are already
+				// dispatched via the realUID branch above and have no
+				// notion of "all members of a channel".
+				// COMMUNITY_TOPIC support is a deliberate follow-up —
+				// it needs the parent-group lookup (see
+				// modules/webhook/api.go parseThreadChannelID) and was
+				// intentionally left out of this hotfix to keep the
+				// change surface small.
+				//
+				// Dedup against any uid-matched robots already in
+				// robotIDs so the goroutine fan-out below never
+				// double-saves the same event for the same bot.
+				if rb.mentionAisTruthy(mentionValue.Get("ais")) &&
+					message.ChannelType == common.ChannelTypeGroup.Uint8() {
+					groupRobotIDs, err := rb.collectGroupRobotIDs(message.ChannelID)
+					if err != nil {
+						rb.Error("查询群机器人成员失败！", zap.Error(err), zap.String("channelID", message.ChannelID))
+					} else {
+						// Snapshot what was already in robotIDs (from
+						// the explicit mention.uids path) so we can
+						// compute the ais-only delta. We rewrite
+						// payload ONLY for the ais-only delta — bots
+						// already targeted via mention.uids already
+						// carry their UID in the payload and must
+						// keep the verbatim message.
+						before := make(map[string]struct{}, len(robotIDs))
+						for _, id := range robotIDs {
+							before[id] = struct{}{}
+						}
+						robotIDs = appendUniqueRobotIDs(robotIDs, groupRobotIDs)
+						if len(groupRobotIDs) > 0 {
+							aisBroadcastSet = make(map[string]struct{}, len(groupRobotIDs))
+							for _, id := range groupRobotIDs {
+								if id == "" {
+									continue
+								}
+								if _, dup := before[id]; dup {
+									continue
+								}
+								aisBroadcastSet[id] = struct{}{}
+							}
+						}
+					}
+				}
+			} else if len(robotID) == 0 {
+				if common.ContentType(payloadValue.Get("type").Int()) == common.Text {
+					content := payloadValue.Get("content").String()
+					if strings.Contains(content, "@") {
+						mentionUsernames := rb.mentionRegexp.FindAllString(content, -1)
+						// 遍历所有@提及，找到其中的机器人
+						for _, mentionUsername := range mentionUsernames {
+							robotUsername := strings.TrimSpace(mentionUsername[1:])
+							exist, err := rb.existRobot(robotUsername)
+							if err != nil {
+								rb.Error("查询有效robotID失败！", zap.Error(err))
+								continue
+							}
+							if exist {
+								robotIDs = append(robotIDs, robotUsername)
+							}
+						}
+					}
+				}
+			}
+		}
+		if len(robotIDs) > 0 {
+			for _, rid := range robotIDs {
+				rb.Info("投递消息到机器人事件队列", zap.String("robotID", rid), zap.String("fromUID", message.FromUID), zap.Int64("messageID", message.MessageID))
+				rid := rid // capture loop variable
+				// Per-bot payload: bots that came in via the ais
+				// broadcast branch get their UID injected into
+				// mention.uids on a SHALLOW COPY of the message so
+				// legacy adapters (octo-server#137) recognise the
+				// mention. Bots that came in via mention.uids keep
+				// the verbatim payload.
+				perBotMsg := message
+				if _, isAis := aisBroadcastSet[rid]; isAis {
+					cp := *message
+					cp.Payload = injectBotUIDIntoMentionUIDs(message.Payload, rid)
+					perBotMsg = &cp
+				}
+				rb.msgSem <- struct{}{}
+				go func() {
+					defer func() {
+						<-rb.msgSem
+						if r := recover(); r != nil {
+							rb.Error("panic in robot message goroutine", zap.Any("recover", r), zap.String("robotID", rid))
+						}
+					}()
+					rb.saveRobotMessage(perBotMsg, rid)
+					rb.autoReadForBot(perBotMsg, rid)
+				}()
+			}
+		} else if len(robotID) > 0 {
+			rb.Info("投递消息到机器人事件队列", zap.String("robotID", robotID), zap.String("fromUID", message.FromUID), zap.Int64("messageID", message.MessageID))
+			rb.msgSem <- struct{}{}
+			go func() {
+				defer func() {
+					<-rb.msgSem
+					if r := recover(); r != nil {
+						rb.Error("panic in robot message goroutine", zap.Any("recover", r), zap.String("robotID", robotID))
+					}
+				}()
+				rb.saveRobotMessage(message, robotID)
+				rb.autoReadForBot(message, robotID)
+			}()
+		}
+	}
+}
+
+// autoReadForBot 为Bot自动标记消息已读
+func (rb *Robot) autoReadForBot(message *config.MessageResp, robotID string) {
+	channelID := message.ChannelID
+	channelType := message.ChannelType
+	if channelType == common.ChannelTypePerson.Uint8() {
+		// DM场景：对Bot而言，会话的channelID是发送者的UID
+		channelID = message.FromUID
+	}
+	err := rb.ctx.IMClearConversationUnread(config.ClearConversationUnreadReq{
+		UID:         robotID,
+		ChannelID:   channelID,
+		ChannelType: channelType,
+		Unread:      0,
+	})
+	if err != nil {
+		rb.Warn("Bot自动已读失败", zap.Error(err), zap.String("robotID", robotID), zap.String("channelID", channelID))
+	}
+}
+
+func (rb *Robot) saveRobotMessage(message *config.MessageResp, robotID string) {
+
+	// YUJ-2531 / Mininglamp-OSS/octo-server#208: bot-delivery chokepoint.
+	// Strip any bare legacy `mention.all=1` and inject `mention.humans=1`
+	// so bots never observe the legacy broadcast flag regardless of the
+	// (user-machine-resident, possibly outdated) adapter version. Operates
+	// on a copy of the payload; the original `message.Payload` shared with
+	// the human-client fan-out keeps `all=1` for rendering.
+	if normalized := stripBareMentionAllForBot(message.Payload); !bytes.Equal(normalized, message.Payload) {
+		cp := *message
+		cp.Payload = normalized
+		message = &cp
+	}
+
+	// #697: monotonic per-bot allocator instead of GenSeq. This is the
+	// highest-volume producer and it runs inside a msgSem slot, which is why the
+	// allocator's timeouts are bounded — see pkg/botevent/seq.go.
+	seq, err := botevent.NextEventID(rb.ctx, robotID)
+	if err != nil {
+		rb.Warn("allocate bot event id failed", zap.Error(err), zap.String("robotID", robotID))
+		return
+	}
+	messageUpdateJson := util.ToJson(&robotEvent{
+		EventID: seq,
+		Message: message,
+		Expire:  time.Now().Add(rb.ctx.GetConfig().Robot.MessageExpire).Unix(),
+	})
+	key := botevent.QueueKey(robotID)
+	err = rb.ctx.GetRedisConn().ZAdd(key, float64(seq), messageUpdateJson)
+	if err != nil {
+		rb.Error("投递消息给机器人失败！", zap.Error(err), zap.String("robotID", robotID), zap.String("message", messageUpdateJson))
+		return
+	}
+	if err := rb.ctx.GetRedisConn().Expire(key, rb.ctx.GetConfig().Robot.MessageExpire); err != nil {
+		rb.Warn("设置机器人消息过期时间失败！", zap.Error(err))
+	}
+	// Listener fast-path (ordinary DMs / @-mentions, the highest-volume producer)
+	// with its own GenSeq/ZAdd/Expire copy, so it needs its own notify. Runs
+	// inside a msgSem slot whose exhaustion stalls fan-out for every bot in the
+	// process — which is why Notify does no I/O here. See pkg/botevent/notify.go.
+	botevent.Notify(rb.ctx.GetConfig(), robotID)
+}
+
+func (rb *Robot) messagesListen(messages []*config.MessageResp) {
+	for _, message := range messages {
+		contentMap, err := util.JsonToMap(string(message.Payload))
+		if err != nil {
+			rb.Error("解析消息内容错误")
+			continue
+		}
+		if contentMap != nil && contentMap["robot_id"] != nil {
+			robotIDRaw := contentMap["robot_id"]
+			robotID, ok := robotIDRaw.(string)
+			if ok && robotID != "" {
+				if robotID == config.New().Account.SystemUID {
+					content, _ := contentMap["content"].(string)
+					entities, _ := contentMap["entities"].([]interface{})
+					var key string
+					if entities != nil {
+						var offset int64
+						var length int64
+						var offsetOK, lengthOK bool
+						for _, entitiesObj := range entities {
+							entitiesMap, ok := entitiesObj.(map[string]interface{})
+							if !ok {
+								continue
+							}
+							if entitiesMap["type"] == "bot_command" {
+								// Safely extract offset
+								if offsetVal, ok := entitiesMap["offset"].(json.Number); ok {
+									offset, _ = offsetVal.Int64()
+									offsetOK = true
+								}
+								// Safely extract length
+								if lengthVal, ok := entitiesMap["length"].(json.Number); ok {
+									length, _ = lengthVal.Int64()
+									lengthOK = true
+								}
+								break
+							}
+						}
+						contentRunes := []rune(content)
+						contentLen := int64(len(contentRunes))
+						// Validate bounds before slicing - require both offset and length to be valid
+						if offsetOK && lengthOK && offset >= 0 && length > 0 && offset < contentLen && offset+length <= contentLen {
+							key = string(contentRunes[offset : offset+length])
+						}
+					}
+
+					channelID := message.ChannelID
+					if message.ChannelType == common.ChannelTypePerson.Uint8() {
+						channelID = message.FromUID
+					}
+					sendContent := ""
+					for _, m := range systemRobotMap {
+						if m.CMD == key {
+							sendContent = m.ReplyContent
+							break
+						}
+					}
+					if sendContent == "" {
+						sendContent = "抱歉，无法解析您发送的命令"
+					}
+					// YUJ-674 / Mininglamp-OSS#37: PERSONAL 走 NewPersonalMsgSendReq builder。
+					sysReplyPayload := map[string]interface{}{
+						"content": sendContent,
+						"type":    common.Text,
+					}
+					if message.ChannelType == common.ChannelTypePerson.Uint8() {
+						rb.ctx.SendMessage(config.NewPersonalMsgSendReq(
+							channelID,
+							robotID,
+							sysReplyPayload,
+							rb.resolveBotActiveSpaceID(robotID),
+							config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+						))
+					} else {
+						rb.ctx.SendMessage(&config.MsgSendReq{
+							Header: config.MsgHeader{
+								RedDot: 1,
+							},
+							FromUID:     robotID,
+							ChannelID:   channelID,
+							ChannelType: message.ChannelType,
+							Payload:     []byte(util.ToJson(sysReplyPayload)),
+						})
+					}
+				}
+
+			}
+		}
+	}
+}

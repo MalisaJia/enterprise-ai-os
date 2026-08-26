@@ -1,0 +1,45 @@
+# =============================================================================
+# model-gateway 依赖
+# 刻意保持精简：网关只做转发与治理，不做推理，不引入 torch / transformers
+# =============================================================================
+
+# ---- Web 框架 ----
+fastapi==0.115.*
+uvicorn[standard]==0.32.*
+pydantic==2.9.*
+pydantic-settings==2.6.*
+sse-starlette==2.1.*              # 流式响应（SSE）
+
+# ---- 配置与日志 ----
+PyYAML==6.0.*
+structlog==24.4.*
+python-dotenv==1.0.*
+
+# ---- 上游调用 ----
+httpx[http2]==0.27.*              # 所有 provider 统一用 httpx，不引入各家 SDK 以免依赖膨胀
+tenacity==9.0.*                   # 重试与退避
+openai==1.54.*                    # 仅用于类型定义与流式分块解析的参考实现
+
+# ---- 限流 / 熔断 / 计量 ----
+redis[hiredis]==5.1.*             # 分布式令牌桶与断路器状态
+psycopg[binary,pool]==3.2.*       # 用量落账
+sqlalchemy==2.0.*
+alembic==1.13.*
+
+# ---- token 计数（成本预估与 max_tokens 校验）----
+tiktoken==0.8.*
+
+# ---- 可观测性 ----
+prometheus-client==0.21.*
+opentelemetry-sdk==1.27.*
+opentelemetry-instrumentation-fastapi==0.48b0
+opentelemetry-instrumentation-httpx==0.48b0
+
+# ---- 开发与测试 ----
+pytest==8.3.*
+pytest-asyncio==0.24.*
+pytest-cov==5.0.*
+respx==0.21.*                     # provider 打桩，测试禁止真实出网
+fakeredis==2.25.*                 # 限流逻辑单测
+ruff==0.7.*
+mypy==1.13.*

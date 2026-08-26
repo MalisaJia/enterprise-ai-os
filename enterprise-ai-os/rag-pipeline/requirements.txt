@@ -1,0 +1,65 @@
+# =============================================================================
+# rag-pipeline 依赖
+# 生产建议用 pip-compile 锁定为 requirements.lock；此处保留兼容区间便于脚手架期迭代
+# =============================================================================
+
+# ---- Web 框架 ----
+fastapi==0.115.*
+uvicorn[standard]==0.32.*
+pydantic==2.9.*
+pydantic-settings==2.6.*
+python-multipart==0.0.12          # 文件上传
+
+# ---- 配置与日志 ----
+PyYAML==6.0.*
+structlog==24.4.*
+python-dotenv==1.0.*
+
+# ---- HTTP 客户端（调 model-gateway / octo-search-indexer）----
+httpx==0.27.*
+tenacity==9.0.*                   # 重试
+
+# ---- 向量存储 ----
+psycopg[binary,pool]==3.2.*       # PostgreSQL 驱动
+pgvector==0.3.*                   # pgvector 类型适配
+sqlalchemy==2.0.*
+alembic==1.13.*                   # schema 迁移
+pymilvus==2.4.*                   # 可选后端
+
+# ---- 分块与 RAG 编排 ----
+langchain-core==0.3.*
+langchain-text-splitters==0.3.*   # RecursiveCharacterTextSplitter 等
+tiktoken==0.8.*                   # token 计数，控制 chunk 大小
+
+# ---- Embedding / 重排（本地兜底；线上默认走 model-gateway）----
+sentence-transformers==3.2.*
+# torch 体积大，CPU 版通过 --extra-index-url 安装以缩小镜像：
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch==2.4.*
+numpy==1.26.*
+
+# ---- 文档解析 ----
+unstructured[md,html]==0.16.*
+pypdf==5.0.*
+python-docx==1.1.*
+openpyxl==3.1.*
+beautifulsoup4==4.12.*
+python-magic==0.4.*               # MIME 嗅探
+
+# ---- 事件与对象存储 ----
+aiokafka==0.11.*
+boto3==1.35.*                     # MinIO / S3
+redis[hiredis]==5.1.*
+
+# ---- 可观测性 ----
+prometheus-client==0.21.*
+opentelemetry-sdk==1.27.*
+opentelemetry-instrumentation-fastapi==0.48b0
+
+# ---- 开发与测试 ----
+pytest==8.3.*
+pytest-asyncio==0.24.*
+pytest-cov==5.0.*
+respx==0.21.*                     # httpx mock
+ruff==0.7.*
+mypy==1.13.*

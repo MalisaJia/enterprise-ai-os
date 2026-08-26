@@ -1,0 +1,134 @@
+"选择国家和地区"="Select country and region";
+"取消"="Cancel";
+"搜索"="Search";
+"验证您的电话号码"="Verify your phone number";
+"%@会发送短信验证手机号码，请输入您的验证码"="%@ will send a text message to verify the mobile number";
+"请输入手机号"="Please enter phone number";
+"短信验证码"="SMS verification code";
+"获取验证码"="Send";
+"请输入登录密码"="Please enter your password";
+"确定"="Done";
+"发送验证码过于频繁，请在%d秒后重试"="The verification code is sent too frequently, please try again in %d seconds";
+"手机号已注册,去登录？"="The phone number has been registered, go to login?";
+"去登录"="Go to login";
+"获取中"="Sending";
+"重新发送(%li)"="Resend (%li)";
+"手机号不能为空！"="The phone number cannot be empty!";
+"密码不能为空！"="password can not be blank!";
+"授权登录"="Authorized login";
+"网页版%@登录确认"="Web version %@ login confirmation";
+"登录"="Log in";
+"取消登录"="Cancel login";
+"登录验证"="Login authentication";
+"你正在一台新设备登录%@，需要进行安全验证，通过后下次无需验证。"="You are logging in to %@ on a new device. Security verification is required. After passing, verification is not required next time.";
+"手机号码：%@"="Mobile number:%@";
+"开始验证"="Start verification";
+"填写验证码"="Fill in the verification code";
+"重新发送"="Resend";
+"我们已给你的手机号码%@发送了一条验证码短信。"="We have sent a verification code SMS to your mobile number %@.";
+"确认"="Confirm";
+"发送"="Send";
+"登录中"="Logging in";
+"欢迎登录%@"="Welcome";
+"请输入登录密码"="Please enter your password";
+"忘记密码?"="Forget?";
+"新用户？请"="New user? please";
+"注册"="register";
+"完善个人资料"="Improve personal information";
+"请设置你的个人头像和昵称"="Please set your profile picture and nickname";
+"名字(必填)"="Name (required)";
+"拍照"="Take pictures";
+"从手机相册选择"="Choose from album";
+"头像不能为空！"="The avatar cannot be empty!";
+"名字不能为空！"="The name cannot be empty!";
+"提交中"="Submitting";
+"上传中"="Uploading";
+"上传失败"="Upload failed";
+"上传成功"="Upload successfully";
+"欢迎注册%@"="Welcome to register for %@";
+"注册中"="Registering";
+"邀请码（选填）"="Invitation code (optional)";
+"邀请码（必填）"="Invitation code (required)";
+
+// ============================================================
+// MARK: - i18n batch 2026-05: WuKongLogin 收尾 (B 级)
+// ============================================================
+
+// 通用
+"提交"="Submit";
+"忘记密码"="Forgot password";
+"协议"="Terms";
+"用户协议"="User Agreement";
+"隐私政策"="Privacy Policy";
+"《服务协议》"="Terms of Service";
+"《隐私政策》"="Privacy Policy";
+"← 返回"="← Back";
+
+// 登录主页
+"邮箱 / 用户名"="Email / Username";
+"欢迎回来"="Welcome back";
+"使用 %@ 安全登录你的 %@ 账号\n新用户首次登录将自动创建账号"="Sign in to your %@ account securely with %@\nA new account will be created on first sign-in";
+"使用 %@ 登录"="Sign in with %@";
+"使用 %@ 登录或注册"="Sign in or sign up with %@";
+"身份认证由 %@ 提供 · 企业级安全"="Authentication powered by %@ · enterprise-grade security";
+
+// 注册
+"昵称"="Nickname";
+"昵称不能为空！"="Nickname is required";
+"账号不能为空！"="Account is required";
+"邮箱不能为空！"="Email is required";
+"邮箱格式不正确！"="Invalid email format";
+"邮箱已注册,去登录？"="This email is already registered. Sign in?";
+"请输入邮箱"="Enter email";
+"请输入账号（可以是任意字符）"="Enter account (any characters)";
+"验证码不能为空！"="Verification code is required";
+"邀请码不能为空！"="Invitation code is required";
+"已有账号？请"="Already have an account? ";
+"点击\"注册\"即表示已阅读并同意"="By tapping Sign Up, you accept ";
+"获取授权失败，请重试"="Failed to authenticate, try again";
+"授权地址无效"="Invalid auth URL";
+"发送中..."="Sending...";
+"发送失败"="Send failed";
+"重新发送(%ld)"="Resend (%ld)";
+"验证码已发送"="Verification code sent";
+"请输入验证码"="Enter verification code";
+
+// 忘记密码 / 重置
+"忘记密码"="Forgot password";
+"邮箱地址"="Email";
+"%@会发送验证码到您的邮箱，请输入您收到的验证码"="%@ will send a verification code to your email — please enter it";
+"验证您的邮箱"="Verify your email";
+"重置密码"="Reset password";
+"请输入新密码"="Enter new password";
+"确认新密码"="Confirm new password";
+"新密码不能为空！"="New password is required";
+"密码长度为6-16位！"="Password must be 6–16 characters";
+"两次密码输入不一致！"="The two passwords do not match";
+"密码重置成功，请登录"="Password reset, please sign in";
+
+// 登录设置 / 服务器配置
+"服务器配置"="Server settings";
+"服务器地址"="Server address";
+"端口"="Port";
+"重置配置"="Reset settings";
+"重置成功！，请重启APP。"="Reset complete. Please restart the app.";
+
+// Space 邀请码 / 加入空间
+"输入邀请码"="Enter invitation code";
+"输入邀请码加入团队"="Enter invitation code to join your team";
+"📩 输入邀请码加入团队"="📩 Enter invitation code to join your team";
+"请输入邀请码"="Enter invitation code";
+"邀请码无效或已过期"="Invitation code invalid or expired";
+"加入"="Join";
+"加入中..."="Joining…";
+"已加入 Space"="Joined Space";
+"已加入空间"="Joined";
+"已成功加入空间"="Joined successfully";
+"已在该空间中"="Already in this space";
+"空间已满，无法加入"="Space is full";
+"正在加入空间..."="Joining space…";
+"正在通过邀请码加入空间..."="Joining with invitation code…";
+"检查中..."="Checking…";
+"欢迎使用 %@！"="Welcome to %@!";
+"退出登录"="Logout";
+"退出后不会删除任何历史数据，下次登录依然可以使用本账号。"="Logout will not delete any data. You can still log in with this account.";

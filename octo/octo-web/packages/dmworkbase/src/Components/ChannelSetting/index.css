@@ -1,0 +1,374 @@
+
+
+:root {
+    --wk-channelsetting-header: 56px;
+}
+
+.wk-channelsetting {
+    width: 100%;
+    height: 100%;
+    background-color: var(--wk-color-secondary);
+}
+
+.wk-channelsetting-header {
+    width: 100%;
+    height: var(--wk-channelsetting-header);
+    padding: 0.5rem 0.8125rem;
+    display: flex;
+    align-items: center;
+}
+
+.wk-channelsetting-close {
+    width: 44px;
+    height: 44px;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border-radius: 50%;
+}
+
+.wk-channelsetting-close:hover {
+    background-color: rgb(112,117,121,0.08);
+}
+
+.wk-channelsetting-close-icon {
+    position: absolute;
+    transform: rotate(-45deg);
+}
+
+.wk-channelsetting-close-icon,.wk-channelsetting-close-icon::before,.wk-channelsetting-close-icon::after {
+    width: 1.125rem;
+    height: 0.125rem;
+    border-radius: 0.125rem;
+    background-color: rgb(112,117,121);
+    transition: transform 300ms cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+.wk-channelsetting-close-icon::before {
+    transform: rotate(90deg);
+}
+
+.wk-channelsetting-close-icon::before ,.wk-channelsetting-close-icon::after {
+    position: absolute;
+    left: 0;
+    top: 0;
+    content: "";
+}
+
+.wk-state-back {
+    transform: rotate(180deg);
+}
+
+.wk-state-back::before {
+    transform: rotate(45deg) scaleX(0.75) translate(0, -0.375rem);
+}
+
+.wk-state-back::after {
+    transform: rotate(-45deg) scaleX(0.75) translate(0, 0.375rem);
+}
+
+
+
+
+.wk-channelsetting-box {
+    width: 100%;
+    height: calc(100% - var(--wk-channelsetting-header));
+    overflow: hidden;
+    position: relative;
+}
+
+.wk-channelsetting-content {
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    padding: var(--wk-sp-2) 0 var(--wk-sp-4);
+    background: var(--wk-bg-surface);
+}
+
+/*
+ * 头像、二维码、群管理、GROUP.md、群消息推送和群管理成员选择页返回时仍保留 animationend，让 WKViewQueue 正常清理栈顶；
+ * 只取消可见位移，避免标题先切回父页、内容仍横向退场造成的闪动。
+ * 通过 RoutePage 的 .wk-channelsetting 根节点限定，只作用于 ChannelSetting 内的 WKViewQueue。
+ * 该规则不改变 RoutePage/WKViewQueue 的退栈和数据刷新逻辑。
+ */
+.wk-channelsetting .wk-viewqueue-view-out:has(.wk-channelavatar),
+.wk-channelsetting .wk-viewqueue-view-out:has(.wk-channelqrcode),
+.wk-channelsetting .wk-viewqueue-view-out:has(.wk-group-management),
+.wk-channelsetting .wk-viewqueue-view-out:has(.wk-groupmd-editor),
+.wk-channelsetting .wk-viewqueue-view-out:has(.wk-webhook),
+.wk-channelsetting .wk-viewqueue-view-out:has(.wk-group-member-picker) {
+    background: var(--wk-bg-surface);
+    animation-name: wk-channelsetting-child-exit;
+    animation-duration: var(--wk-dur-fast);
+    animation-timing-function: var(--wk-ease);
+}
+
+@keyframes wk-channelsetting-child-exit {
+    from,
+    to {
+        transform: translate3d(0, 0, 0);
+    }
+}
+
+/* 仅作用于 ChannelSetting，避免影响其他 Sections/ListItem 调用方。 */
+.wk-channelsetting-content > .wk-sections {
+    display: flex;
+    flex-direction: column;
+    gap: var(--wk-sp-2);
+}
+
+.wk-channelsetting-content .wk-section {
+    margin: 0 var(--wk-sp-4);
+    overflow: hidden;
+    background: var(--wk-bg-base);
+    border: 1px solid var(--wk-border-subtle);
+    border-radius: var(--wk-r-sm);
+}
+
+.wk-channelsetting-content .wk-section-title {
+    padding: var(--wk-sp-3) var(--wk-sp-4) var(--wk-sp-2);
+    color: var(--wk-text-tertiary);
+    font-size: var(--wk-text-size-sm);
+}
+
+.wk-channelsetting-content .wk-section-subtitle {
+    padding: var(--wk-sp-2) var(--wk-sp-4) var(--wk-sp-3);
+    color: var(--wk-text-tertiary);
+    font-size: var(--wk-text-size-sm);
+}
+
+.wk-channelsetting-content .wk-section-row + .wk-section-row {
+    border-top: 1px solid var(--wk-border-subtle);
+}
+
+.wk-channelsetting-content .wk-list-item {
+    min-height: calc(var(--wk-sp-10) + var(--wk-sp-2));
+    padding: var(--wk-sp-2) var(--wk-sp-4);
+    background: transparent;
+}
+
+.wk-channelsetting-content .wk-list-item:hover {
+    background: var(--wk-bg-hover);
+}
+
+.wk-channelsetting-content .wk-list-item-static:hover {
+    background: transparent;
+}
+
+.wk-channelsetting-content .wk-list-item-title {
+    color: var(--wk-text-primary);
+    font-size: var(--wk-text-size-md);
+}
+
+.wk-channelsetting-content .wk-list-item-subtitle {
+    min-width: 0;
+    margin-left: var(--wk-sp-4);
+    color: var(--wk-text-secondary);
+    font-size: var(--wk-text-size-base);
+}
+
+.wk-channelsetting-content .wk-list-item-subtitle-muliteline {
+    margin-top: var(--wk-sp-2);
+    color: var(--wk-text-secondary);
+    font-size: var(--wk-text-size-base);
+}
+
+.wk-channelsetting-content .wk-channelsetting-qrcode-icon {
+    width: var(--wk-sp-4);
+    height: var(--wk-sp-4);
+    color: var(--wk-text-tertiary);
+}
+
+.wk-channelsetting-content .wk-section:has(.wk-subscribers) {
+    padding: var(--wk-sp-4) var(--wk-sp-2) var(--wk-sp-3);
+}
+
+.wk-channelsetting-content .wk-section:has(.wk-subscribers) .wk-section-row {
+    border: 0;
+}
+
+.wk-channelsetting-content .wk-subscribers-content {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    column-gap: var(--wk-sp-2);
+    row-gap: var(--wk-sp-4);
+    padding-inline: var(--wk-sp-2);
+}
+
+.wk-channelsetting-content .wk-subscribers-item {
+    min-height: 0;
+    gap: var(--wk-sp-1-5);
+}
+
+.wk-channelsetting-content .wk-subscribers-item img,
+.wk-channelsetting-content .wk-subscribers-item-avatar-wrap img,
+.wk-channelsetting-content .wk-subscribers-item-avatar-wrap {
+    width: var(--wk-sp-12);
+    height: var(--wk-sp-12);
+}
+
+.wk-channelsetting-content .wk-subscribers-item-name {
+    margin-top: 0;
+    color: var(--wk-text-secondary);
+    font-size: var(--wk-text-size-xs);
+    line-height: var(--wk-text-size-md);
+}
+
+.wk-channelsetting-content .wk-subscribers-item-role-badge {
+    right: auto;
+    bottom: calc(0px - var(--wk-sp-1));
+    left: 50%;
+    padding: var(--wk-sp-0-5) var(--wk-sp-1);
+    color: var(--wk-text-inverse);
+    font-size: var(--wk-text-size-badge);
+    border-radius: var(--wk-r-xs);
+    box-shadow: none;
+    transform: translateX(-50%);
+}
+
+.wk-channelsetting-content .wk-subscribers-item-role-badge-owner {
+    background: var(--wk-color-warning);
+}
+
+.wk-channelsetting-content .wk-subscribers-item-role-badge-manager {
+    background: var(--wk-text-primary);
+}
+
+.wk-channelsetting-content .wk-subscribers-more {
+    margin: var(--wk-sp-4) var(--wk-sp-2) 0;
+    padding: var(--wk-sp-2);
+    border-radius: var(--wk-r-sm);
+    color: var(--wk-text-primary);
+    font-size: var(--wk-text-size-sm);
+}
+
+.wk-channelsetting-content .wk-subscribers-more:hover {
+    background: var(--wk-bg-hover);
+}
+
+.wk-channelsetting-channel-info {
+    display: flex;
+    align-items: center;
+    padding: 15px;
+    background-color: white;
+
+}
+
+.wk-channelsetting-avatar {
+    /* 高宽比率 */
+    width: 64px;
+    height: 64px; 
+    position: relative;
+}
+
+.wk-channelsetting-avatar img {
+    width: 100%;
+    object-fit: cover;
+    border-radius: var(--wk-avatar-radius, 50%);
+}
+
+.wk-channelsetting-name {
+    color: var(--wk-color-theme);
+    font-size: 16px;
+    font-weight: 600;
+    margin-left: 10px;
+    font-weight: 500px;
+}
+
+
+.wk-channelsetting-header-title-box {
+    color: #999;
+   display: flex;
+    align-items: center;
+    height: 100%;
+    position: relative;
+    flex: 1;
+}
+
+.wk-channelsetting-header-title-box-open {
+
+}
+
+.wk-channelsetting-header-title {
+    font-size: 18px;
+    font-weight: 500;
+    margin-left: 1.375rem;
+    color: black;
+}
+
+.wk-channelsetting-header-title-box-open .wk-channelsetting-header-title{
+    display: none;
+}
+
+.wk-channelsetting-header-title-route {
+    font-size: 18px;
+    font-weight: 500;
+    margin-left: 1.375rem;
+    color: black;
+    position: absolute;
+
+    transform: translate3d(100vw, 0, 0);
+    transition: transform var(--wk-layer-transition);
+    width: 240px;
+
+}
+
+.wk-channelsetting-header-title-box-open .wk-channelsetting-header-title-route {
+    transform: translate3d(0, 0, 0);
+}
+
+
+
+.wk-channelsetting-route {
+    width: 100%;
+    height: 100%;
+    background-color: var(--wk-color-secondary);
+    position: absolute;
+    top: 0px;
+    overflow: hidden;
+    transform: translate3d(100vw, 0, 0);
+    transition: transform var(--wk-layer-transition);
+}
+
+.wk-channelsetting-route-open {
+    transform: translate3d(0, 0, 0);
+}
+
+.wk-channelsetting-route-content {
+    width: 100%;
+    height: 100%;
+}
+
+.wk-channelsetting-header-right-view {
+    opacity: 0;
+    transition: opacity 500ms ease-out;
+}
+
+.wk-channelsetting-header-right-view-open {
+    opacity: 1;
+}
+
+.wk-channelsetting-content-loading {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 10px;
+}
+
+.wk-route-content .wk-channelsetting-input-edit {
+    box-sizing: border-box;
+    width: calc(100% - (2 * var(--wk-sp-4)));
+    margin: var(--wk-sp-2) var(--wk-sp-4) 0;
+    overflow: hidden;
+    background: var(--wk-bg-base);
+    border: 1px solid var(--wk-border-subtle);
+    border-radius: var(--wk-r-sm);
+}
+
+.wk-channelmanage {
+    width: 100%;
+    height: 100%;
+    overflow-y: auto;
+}

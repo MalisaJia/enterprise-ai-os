@@ -1,0 +1,466 @@
+package model
+
+import (
+	"database/sql/driver"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+)
+
+// JSON is a custom type for JSON columns in MySQL.
+type JSON json.RawMessage
+
+func (j JSON) Value() (driver.Value, error) {
+	if len(j) == 0 {
+		return nil, nil
+	}
+	return []byte(j), nil
+}
+
+func (j *JSON) Scan(src interface{}) error {
+	if src == nil {
+		*j = nil
+		return nil
+	}
+	switch v := src.(type) {
+	case []byte:
+		cp := make([]byte, len(v))
+		copy(cp, v)
+		*j = cp
+		return nil
+	case string:
+		*j = []byte(v)
+		return nil
+	default:
+		return errors.New("unsupported type for JSON")
+	}
+}
+
+func (j JSON) MarshalJSON() ([]byte, error) {
+	if len(j) == 0 {
+		return []byte("null"), nil
+	}
+	return []byte(j), nil
+}
+
+func (j *JSON) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*j = nil
+		return nil
+	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	*j = cp
+	return nil
+}
+
+// Task status constants.
+const (
+	StatusPending        = 0
+	StatusWaitingConfirm = 1
+	StatusProcessing     = 2
+	StatusCompleted      = 3
+	StatusFailed         = 4
+	StatusCancelled      = 5
+)
+
+// Trigger type constants.
+// Trigger types for summary_task.trigger_type
+const (
+	TriggerManual    = 1
+	TriggerScheduled = 2
+	// TriggerAgent marks a summary created via the agent conversational entry
+	// (POST /api/v1/summaries/agent). The task is born with status=Completed
+	// and content is filled synchronously from the agent's produced deliverable;
+	// no worker dispatch is triggered.
+	TriggerAgent = 3
+	// TriggerBot marks a traditional asynchronous summary created by a
+	// personal bot acting with its human owner's permissions.
+	TriggerBot = 4
+)
+
+// Scheduled multi-participant confirm policy constants (summary_schedule.confirm_policy).
+const (
+	SchedConfirmAuto     = 0 // AUTO_ACCEPT（降级兜底/固定班）
+	SchedConfirmRequire  = 1 // CONFIRM（P1 主推，方案 B）
+	SchedConfirmFallback = 2 // CONFIRM_FALLBACK（P2，零确认降级 auto）
+)
+
+// PersonalResult.submit_source constants: distinguish system back-fill from manual /submit.
+const (
+	SubmitSourceNone   = 0 // 未表态 / 历史行
+	SubmitSourceManual = 1 // 人工 /submit
+	SubmitSourceSystem = 2 // 系统代补（多人定时 personal 跑完自动补）
+)
+
+// Summary mode constants.
+const (
+	ModeByPerson = 2
+)
+
+// Source type constants.
+const (
+	SourceGroup  = 1
+	SourceThread = 2
+	SourceDirect = 3
+)
+
+// Origin channel type constants.
+const (
+	OriginChannelGlobal = 0
+	OriginChannelGroup  = 1
+	OriginChannelThread = 2
+	OriginChannelDM     = 3
+)
+
+// Channel type constants (aligned with the IM server protocol).
+// These are the values stored in the WuKongIM message table's channel_type
+// column. Different from OriginChannel* above (which is the application-layer
+// "user-facing origin" enum) — see appToStorageChannelType() for mapping.
+const (
+	ChannelTypeDM     = 1
+	ChannelTypeGroup  = 2
+	ChannelTypeThread = 5 // WuKongIM reserves 3/4 so thread jumps to 5
+)
+
+// SummaryTask represents a summary generation task.
+type SummaryTask struct {
+	ID                int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskNo            string    `gorm:"column:task_no;type:varchar(32);uniqueIndex:uk_task_no;not null" json:"task_no"`
+	SpaceID           string    `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
+	CreatorID         string    `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
+	CreatorBotID      string    `gorm:"column:creator_bot_id;type:varchar(64);not null;default:'';index:idx_summary_task_creator_bot_id" json:"creator_bot_id,omitempty"`
+	Title             string    `gorm:"column:title;type:varchar(2300);not null;default:''" json:"title"`
+	Topic             string    `gorm:"column:topic;type:varchar(2300);not null;default:''" json:"topic"`
+	SummaryMode       int       `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
+	TimeRangeStart    time.Time `gorm:"column:time_range_start;not null" json:"time_range_start"`
+	TimeRangeEnd      time.Time `gorm:"column:time_range_end;not null" json:"time_range_end"`
+	Status            int       `gorm:"column:status;type:tinyint;not null;default:0" json:"status"`
+	TriggerType       int       `gorm:"column:trigger_type;type:tinyint;not null;default:1" json:"trigger_type"`
+	RetryCount        int       `gorm:"column:retry_count;type:tinyint;not null;default:0" json:"retry_count"`
+	ErrorMessage      *string   `gorm:"column:error_message;type:varchar(500)" json:"error_message"`
+	ScheduleID        *int64    `gorm:"column:schedule_id" json:"schedule_id"`
+	CurrentResultID   *int64    `gorm:"column:current_result_id" json:"current_result_id"`
+	OriginChannelID   string    `gorm:"column:origin_channel_id;type:varchar(64);not null;default:'';index:idx_origin_channel" json:"origin_channel_id"`
+	OriginChannelType int       `gorm:"column:origin_channel_type;type:tinyint;not null;default:0" json:"origin_channel_type"`
+	// R11 Q2 (PR #190): provenance flag — the origin was inherited from a
+	// DERIVED (worker-backfilled) source row via tier-3/tier-4, so it is
+	// masked on the wire (list/detail echo "", the list filter excludes the
+	// row). json:"-" so no serializer can leak it; see task.go projections.
+	OriginFromDerived  bool       `gorm:"column:origin_from_derived;type:tinyint;not null;default:0" json:"-"`
+	ProcessingDeadline *time.Time `gorm:"column:processing_deadline" json:"processing_deadline"`
+	ConfirmDeadline    *time.Time `gorm:"column:confirm_deadline" json:"confirm_deadline"`
+	ReminderSentAt     *time.Time `gorm:"column:reminder_sent_at" json:"reminder_sent_at"`
+	CreatedAt          time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt          time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+	DeletedAt          *time.Time `gorm:"column:deleted_at;index" json:"deleted_at,omitempty"`
+	// ReferencedTaskIDs is a JSON-encoded array of task_ids that this agent
+	// summary was generated with reference to. NULL when the summary was
+	// generated from scratch (no reference). Only populated for
+	// trigger_type=agent summaries where the user picked one or more existing
+	// summaries as reference material via the chat UI.
+	ReferencedTaskIDs *string `gorm:"column:referenced_task_ids;type:text" json:"-"`
+	// AgentSessionID / AgentMessageID / SnapshotVersion are the safe-save
+	// audit trail for trigger_type=Agent tasks (SUM-BE2). They record the
+	// exact assistant reply and client-declared snapshot version at save time,
+	// so a reviewer can trace which draft became this summary. Legacy clients
+	// leave SnapshotVersion at 0 even though snapshot_json uses the v1 envelope;
+	// non-agent tasks leave all three fields at their zero values.
+	AgentSessionID  string `gorm:"column:agent_session_id;type:varchar(128);not null;default:'';index:idx_summary_task_agent_session" json:"agent_session_id,omitempty"`
+	AgentMessageID  int64  `gorm:"column:agent_message_id;not null;default:0" json:"agent_message_id,omitempty"`
+	SnapshotVersion int    `gorm:"column:snapshot_version;type:int;not null;default:0" json:"snapshot_version,omitempty"`
+}
+
+// SummaryBotCreateIdempotency binds one bot request key to the task created
+// for it. The composite unique index is the concurrency authority: duplicate
+// requests must return the original task without dispatching another worker.
+type SummaryBotCreateIdempotency struct {
+	ID             int64  `gorm:"primaryKey;autoIncrement"`
+	SpaceID        string `gorm:"column:space_id;type:varchar(64);not null;uniqueIndex:uk_bot_summary_idempotency"`
+	BotID          string `gorm:"column:bot_id;type:varchar(64);not null;uniqueIndex:uk_bot_summary_idempotency"`
+	IdempotencyKey string `gorm:"column:idempotency_key;type:varchar(128);not null;uniqueIndex:uk_bot_summary_idempotency"`
+	// RequestHash is a sha256 fingerprint of the create request payload
+	// (title, topic, time range, sources, origin channel, include_archived).
+	// When a client reuses the same (space_id, bot_id, idempotency_key) tuple
+	// with a different body, the mismatch surfaces as HTTP 409 instead of
+	// silently returning the original task. Mirrors summary_share_snapshot
+	// which established this contract in the same repo. See issue #181 P1-2.
+	// Default '' matches the migration 20260729-01 backfill for pre-existing
+	// rows.
+	RequestHash string    `gorm:"column:request_hash;type:char(64);not null;default:''"`
+	TaskID      int64     `gorm:"column:task_id;not null"`
+	CreatedAt   time.Time `gorm:"column:created_at;not null"`
+}
+
+func (SummaryBotCreateIdempotency) TableName() string { return "summary_bot_create_idempotency" }
+
+// SummaryAgentSaveIdempotency is the Agent-save analogue of
+// SummaryBotCreateIdempotency (see above): one (space_id, user_id,
+// idempotency_key) tuple binds to exactly one saved task_id. Same
+// same-key-same-body-replay / same-key-different-body-409 contract; the only
+// axis change is the actor — Agent save is user-owned, not bot-owned, so the
+// unique index uses user_id where the bot table uses bot_id (see migration
+// 20260810-01-agent-draft-save.sql).
+type SummaryAgentSaveIdempotency struct {
+	ID             int64     `gorm:"primaryKey;autoIncrement"`
+	SpaceID        string    `gorm:"column:space_id;type:varchar(64);not null;uniqueIndex:uk_agent_save_idempotency"`
+	UserID         string    `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_agent_save_idempotency"`
+	IdempotencyKey string    `gorm:"column:idempotency_key;type:varchar(128);not null;uniqueIndex:uk_agent_save_idempotency"`
+	RequestHash    string    `gorm:"column:request_hash;type:char(64);not null;default:''"`
+	TaskID         int64     `gorm:"column:task_id;not null"`
+	CreatedAt      time.Time `gorm:"column:created_at;not null"`
+}
+
+func (SummaryAgentSaveIdempotency) TableName() string { return "summary_agent_save_idempotency" }
+
+// EffectiveTopic keeps existing tasks compatible while new tasks persist the
+// complete summary instruction separately from the display title.
+func (t SummaryTask) EffectiveTopic() string {
+	if strings.TrimSpace(t.Topic) != "" {
+		return t.Topic
+	}
+	return t.Title
+}
+
+func (SummaryTask) TableName() string { return "summary_task" }
+
+// SummarySource represents a data source for a task.
+type SummarySource struct {
+	ID            int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID        int64  `gorm:"column:task_id;not null;index:idx_task_id;uniqueIndex:uk_summary_source_task_type_id" json:"task_id"`
+	SourceType    int    `gorm:"column:source_type;type:tinyint;not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_type"`
+	SourceID      string `gorm:"column:source_id;type:varchar(64);not null;uniqueIndex:uk_summary_source_task_type_id" json:"source_id"`
+	SourceName    string `gorm:"column:source_name;type:varchar(200);not null;default:''" json:"source_name"`
+	ParticipantID *int64 `gorm:"column:participant_id;index:idx_participant_id" json:"participant_id"`
+	// R9 P1 (PR #190): 1 = row written by worker source backfill from the
+	// pipeline's auto-selected channels. Such rows are excluded from every
+	// user-visible projection (list/detail `sources`, share snapshot, agent
+	// reference-context bullets) because they record the creator's channel
+	// membership while read authorization is any task participant (roster is
+	// mutable after generation). Tier-4 origin derivation still reads them.
+	Derived   bool      `gorm:"column:derived;type:tinyint;not null;default:0" json:"-"`
+	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
+}
+
+func (SummarySource) TableName() string { return "summary_source" }
+
+// SummaryParticipant represents a participant in a by-person task.
+type SummaryParticipant struct {
+	ID               int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID           int64      `gorm:"column:task_id;not null" json:"task_id"`
+	UserID           string     `gorm:"column:user_id;type:varchar(64);not null" json:"user_id"`
+	UserName         string     `gorm:"column:user_name;type:varchar(100);not null;default:''" json:"user_name"`
+	Status           int        `gorm:"column:status;type:tinyint;not null;default:0" json:"status"`
+	ConfirmedAt      *time.Time `gorm:"column:confirmed_at" json:"confirmed_at"`
+	PersonalResultID *int64     `gorm:"column:personal_result_id" json:"personal_result_id"`
+	WorkerStartedAt  *time.Time `gorm:"column:worker_started_at" json:"worker_started_at"`
+	CreatedAt        time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt        time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+func (SummaryParticipant) TableName() string { return "summary_participant" }
+
+// SummaryChunk represents a Map-phase intermediate result.
+type SummaryChunk struct {
+	ID              int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID          int64      `gorm:"column:task_id;not null" json:"task_id"`
+	ChunkIndex      int        `gorm:"column:chunk_index;not null" json:"chunk_index"`
+	ParticipantID   *int64     `gorm:"column:participant_id" json:"participant_id"`
+	SummarySourceID *int64     `gorm:"column:summary_source_id" json:"summary_source_id"`
+	MsgCount        int        `gorm:"column:msg_count;not null;default:0" json:"msg_count"`
+	MsgStartTime    *time.Time `gorm:"column:msg_start_time" json:"msg_start_time"`
+	MsgEndTime      *time.Time `gorm:"column:msg_end_time" json:"msg_end_time"`
+	ChunkSummary    string     `gorm:"column:chunk_summary;type:mediumtext;not null" json:"chunk_summary"`
+	TokenUsed       int        `gorm:"column:token_used;not null;default:0" json:"token_used"`
+	Status          int        `gorm:"column:status;type:tinyint;not null;default:0" json:"status"`
+	CreatedAt       time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt       time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+func (SummaryChunk) TableName() string { return "summary_chunk" }
+
+// Citation represents a reference from a summary back to the original message.
+type Citation struct {
+	Index         int          `json:"index"`
+	Sender        string       `json:"sender"`
+	Content       string       `json:"content"`
+	SentAt        string       `json:"sent_at"`
+	Source        string       `json:"source"`
+	ChannelID     string       `json:"channel_id"`
+	ChannelType   int          `json:"channel_type"`
+	MessageSeq    int64        `json:"message_seq"`
+	ContextBefore []ContextMsg `json:"context_before,omitempty"`
+	ContextAfter  []ContextMsg `json:"context_after,omitempty"`
+}
+
+// ContextMsg represents a surrounding message used as context for a citation.
+type ContextMsg struct {
+	Sender     string `json:"sender"`
+	Content    string `json:"content"`
+	SentAt     string `json:"sent_at"`
+	MessageSeq int64  `json:"message_seq"`
+}
+
+// TeamCitation represents a [Pn] reference in a team summary pointing to a participant.
+//
+// PersonalResultID / TaskID are V5 §6.2 convenience fields: they let the frontend
+// jump straight from a [Pn] badge to the author's single-person report without an
+// extra lookup. They are OPTIONAL (Q4: the frontend can also match by user_id in
+// the members list). team_citations_json is mediumtext, so adding these fields is
+// backward compatible — no DDL. omitempty keeps old rows (and the user_id-only
+// match path) working unchanged.
+type TeamCitation struct {
+	Index            int    `json:"index"`
+	UserID           string `json:"user_id"`
+	UserName         string `json:"user_name"`
+	PersonalResultID int64  `json:"personal_result_id,omitempty"`
+	TaskID           int64  `json:"task_id,omitempty"`
+}
+
+// SummaryResult represents the final summary output.
+type SummaryResult struct {
+	ID                int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID            int64      `gorm:"column:task_id;not null" json:"task_id"`
+	Content           string     `gorm:"column:content;type:mediumtext;not null" json:"content"`
+	CitationsJSON     string     `gorm:"column:citations_json;type:mediumtext" json:"-"`
+	TeamCitationsJSON string     `gorm:"column:team_citations_json;type:mediumtext" json:"-"`
+	TotalMsgCount     int        `gorm:"column:total_msg_count;not null;default:0" json:"total_msg_count"`
+	TotalTokenUsed    int        `gorm:"column:total_token_used;not null;default:0" json:"total_token_used"`
+	ModelVersion      string     `gorm:"column:model_version;type:varchar(50);not null;default:''" json:"model_version"`
+	Version           int        `gorm:"column:version;not null;default:1" json:"version"`
+	OperationType     string     `gorm:"column:operation_type;type:varchar(32);not null;default:'generate'" json:"operation_type"`
+	OperationNote     string     `gorm:"column:operation_note;type:text" json:"operation_note"`
+	ParentResultID    *int64     `gorm:"column:parent_result_id" json:"parent_result_id,omitempty"`
+	CreatedBy         string     `gorm:"column:created_by;type:varchar(64);not null;default:''" json:"created_by"`
+	EditedAt          *time.Time `gorm:"column:edited_at" json:"edited_at"`
+	GeneratedAt       time.Time  `gorm:"column:generated_at;not null" json:"generated_at"`
+	CreatedAt         time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt         time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+// GetCitations deserializes CitationsJSON into a slice of Citation.
+func (r *SummaryResult) GetCitations() []Citation {
+	if r.CitationsJSON == "" {
+		return []Citation{}
+	}
+	var citations []Citation
+	if err := json.Unmarshal([]byte(r.CitationsJSON), &citations); err != nil {
+		return []Citation{}
+	}
+	return citations
+}
+
+// SetCitations serializes a slice of Citation into CitationsJSON.
+func (r *SummaryResult) SetCitations(citations []Citation) {
+	if len(citations) == 0 {
+		r.CitationsJSON = "[]"
+		return
+	}
+	data, err := json.Marshal(citations)
+	if err != nil {
+		r.CitationsJSON = "[]"
+		return
+	}
+	r.CitationsJSON = string(data)
+}
+
+// GetTeamCitations deserializes TeamCitationsJSON into a slice of TeamCitation.
+func (r *SummaryResult) GetTeamCitations() []TeamCitation {
+	if r.TeamCitationsJSON == "" {
+		return []TeamCitation{}
+	}
+	var citations []TeamCitation
+	if err := json.Unmarshal([]byte(r.TeamCitationsJSON), &citations); err != nil {
+		return []TeamCitation{}
+	}
+	return citations
+}
+
+// SetTeamCitations serializes a slice of TeamCitation into TeamCitationsJSON.
+func (r *SummaryResult) SetTeamCitations(citations []TeamCitation) {
+	if len(citations) == 0 {
+		r.TeamCitationsJSON = "[]"
+		return
+	}
+	data, err := json.Marshal(citations)
+	if err != nil {
+		r.TeamCitationsJSON = "[]"
+		return
+	}
+	r.TeamCitationsJSON = string(data)
+}
+
+func (SummaryResult) TableName() string { return "summary_result" }
+
+// SummarySchedule represents a recurring schedule configuration.
+type SummarySchedule struct {
+	ID                    int64  `gorm:"primaryKey;autoIncrement" json:"id"`
+	SpaceID               string `gorm:"column:space_id;type:varchar(64);not null;default:''" json:"space_id"`
+	CreatorID             string `gorm:"column:creator_id;type:varchar(64);not null" json:"creator_id"`
+	Title                 string `gorm:"column:title;type:varchar(2300);not null;default:''" json:"title"`
+	GenerationInstruction string `gorm:"column:generation_instruction;type:text" json:"generation_instruction"`
+	SummaryMode           int    `gorm:"column:summary_mode;type:tinyint;not null" json:"summary_mode"`
+	CronExpr              string `gorm:"column:cron_expr;type:varchar(50);not null" json:"cron_expr"`
+	IntervalDays          int    `gorm:"column:interval_days;type:int;not null;default:0" json:"interval_days"`
+	IntervalMonths        int    `gorm:"column:interval_months;type:int;not null;default:0" json:"interval_months"`
+	RunTime               string `gorm:"column:run_time;type:varchar(5);not null;default:''" json:"run_time"`
+	// DayOfWeek aligns WEEK mode (interval_days multiple of 7) to a specific
+	// weekday: 1=Mon..7=Sun, 0=unconstrained. Ignored for non-week modes.
+	DayOfWeek int `gorm:"column:day_of_week;type:tinyint;not null;default:0" json:"day_of_week"`
+	// DayOfMonth aligns MONTH mode (interval_months>0) to a specific day:
+	// 1..31 (clamped to month end), 0=unconstrained. Ignored for non-month modes.
+	DayOfMonth         int        `gorm:"column:day_of_month;type:tinyint;not null;default:0" json:"day_of_month"`
+	AnchorDOM          int        `gorm:"column:anchor_dom;type:tinyint;not null;default:0" json:"-"`
+	TimeRangeType      int        `gorm:"column:time_range_type;type:tinyint;not null" json:"time_range_type"`
+	SourceConfig       JSON       `gorm:"column:source_config;type:json" json:"source_config"`
+	ParticipantConfig  JSON       `gorm:"column:participant_config;type:json" json:"participant_config"`
+	ConfirmPolicy      int        `gorm:"column:confirm_policy;type:tinyint;not null;default:0" json:"confirm_policy"`
+	ConfirmLeadMinutes int        `gorm:"column:confirm_lead_minutes;type:int;not null;default:0" json:"confirm_lead_minutes"`
+	IsActive           int        `gorm:"column:is_active;type:tinyint;not null;default:1" json:"is_active"`
+	LastRunAt          *time.Time `gorm:"column:last_run_at" json:"last_run_at"`
+	NextRunAt          *time.Time `gorm:"column:next_run_at" json:"next_run_at"`
+	CreatedAt          time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt          time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+	DeletedAt          *time.Time `gorm:"column:deleted_at;index" json:"deleted_at,omitempty"`
+}
+
+func (SummarySchedule) TableName() string { return "summary_schedule" }
+
+// SummaryEvent is used for Worker → API status callback fallback.
+type SummaryEvent struct {
+	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID    int64     `gorm:"column:task_id;not null" json:"task_id"`
+	Status    int       `gorm:"column:status;type:tinyint;not null" json:"status"`
+	Progress  int       `gorm:"column:progress;type:tinyint;not null;default:0" json:"progress"`
+	Message   string    `gorm:"column:message;type:varchar(200);not null;default:''" json:"message"`
+	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
+}
+
+func (SummaryEvent) TableName() string { return "summary_event" }
+
+// SummaryUserRead stores the last team and personal result actually rendered by
+// one user. Team and personal result ids live in different tables, so they must
+// never share a single cursor column.
+type SummaryUserRead struct {
+	ID                        int64      `gorm:"primaryKey;autoIncrement" json:"id"`
+	TaskID                    int64      `gorm:"column:task_id;not null;uniqueIndex:uk_summary_user_read_task_user" json:"task_id"`
+	UserID                    string     `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_summary_user_read_task_user" json:"user_id"`
+	LastReadTeamResultID      *int64     `gorm:"column:last_read_team_result_id" json:"last_read_team_result_id"`
+	LastReadPersonalVersionID *int64     `gorm:"column:last_read_personal_version_id" json:"last_read_personal_version_id"`
+	ReadAt                    *time.Time `gorm:"column:read_at" json:"read_at"`
+	CreatedAt                 time.Time  `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt                 time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+func (SummaryUserRead) TableName() string { return "summary_user_read" }
+
+// TaskEvent is the payload for Worker → API HTTP callback.
+type TaskEvent struct {
+	TaskID       int64  `json:"task_id"`
+	Status       int    `json:"status"`
+	Progress     int    `json:"progress"`
+	Message      string `json:"message"`
+	EventType    string `json:"event_type,omitempty"`
+	TargetUserID string `json:"target_user_id,omitempty"`
+}

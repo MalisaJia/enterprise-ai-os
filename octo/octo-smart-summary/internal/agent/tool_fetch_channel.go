@@ -1,0 +1,216 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+)
+
+// FetchChannelTool fetches full messages from a channel.
+func FetchChannelTool() (Tool, Handler) {
+	schema := Tool{
+		Type: "function",
+		Function: ToolFunction{
+			Name:        "fetch_channel",
+			Description: "从指定频道抓取全量消息（受 max_per_channel 限制）。结果全量存入内部缓存，只返回统计信息和 handle。",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"channel_id": map[string]interface{}{
+						"type":        "string",
+						"description": "频道 ID",
+					},
+					"channel_type": map[string]interface{}{
+						"type":        "integer",
+						"description": "频道类型(WuKongIM 存储层协议)：1=DM(私聊), 2=Group(群), 5=Thread(子区)。**必须显式传递**,禁止省略。",
+					},
+					"time_start": map[string]interface{}{
+						"type":        "string",
+						"description": "起始时间 RFC3339",
+					},
+					"time_end": map[string]interface{}{
+						"type":        "string",
+						"description": "结束时间 RFC3339",
+					},
+					"max_messages": map[string]interface{}{
+						"type":        "integer",
+						"description": "每频道最大消息数，<=0 使用配置默认值",
+					},
+					"include_archived": map[string]interface{}{
+						"type":        "boolean",
+						"description": "当目标是已归档子区（thread status=2）时置 true，否则归档频道会被判为不可达而拒绝。默认 false。",
+					},
+				},
+				"required": []string{"channel_id", "channel_type", "time_start", "time_end"},
+			},
+		},
+	}
+
+	handler := func(ctx context.Context, args json.RawMessage) (string, error) {
+		var req struct {
+			ChannelID       string `json:"channel_id"`
+			ChannelType     int    `json:"channel_type,omitempty"`
+			TimeStart       string `json:"time_start"`
+			TimeEnd         string `json:"time_end"`
+			MaxMessages     int    `json:"max_messages,omitempty"`
+			IncludeArchived bool   `json:"include_archived,omitempty"`
+		}
+		if err := json.Unmarshal(args, &req); err != nil {
+			return "", fmt.Errorf("parse args: %w", err)
+		}
+
+		// Extract uid from context (injected by handler middleware)
+		uidVal := ctx.Value(ContextKeyUID)
+		uid, ok := uidVal.(string)
+		if !ok || uid == "" {
+			return "", fmt.Errorf("missing user identity in context")
+		}
+
+		summaryDB, imDB, _, cfg := GetSummaryDeps()
+		runID, _ := ctx.Value(ContextKeyRunID).(string)
+		recordFetch := func(succeeded, truncated bool) {
+			if !SummaryV2Enabled() || summaryDB == nil || runID == "" || req.ChannelID == "" {
+				return
+			}
+			// WithoutCancel, not ctx: the dominant cause of the failures we are trying
+			// to RECORD is that this very ctx was canceled, and RecordChannelFetch
+			// opens a transaction on it. Recording the loss must not fail for the same
+			// reason the fetch did — the fatal-error hook already reasons this way
+			// (agent_chat.go uses a fresh context for exactly this).
+			recordCtx := context.WithoutCancel(ctx)
+			if err := summaryrun.NewStore(summaryDB).RecordChannelFetch(recordCtx, uid, runID, req.ChannelID, succeeded, truncated); err != nil {
+				log.Printf("[fetch_channel] record coverage failed run=%s channel=%s succeeded=%t: %v", runID, req.ChannelID, succeeded, err)
+			}
+		}
+
+		// channel_type must be explicitly supplied — silently defaulting to 1
+		// (Group) caused SQL mismatch when the real channel was Thread (type=5)
+		// or DM (type=1), returning 0 rows and misleading agent into "no
+		// messages" answers. See CHAT-REFERENCE-BASED-DESIGN-v1 diagnostic.
+		//
+		// These three argument checks record a failed attempt before returning.
+		// They used to sit ABOVE the recordFetch closure, which meant the most
+		// COMMON fetch failures — an empty time_start is why INVALID_ARGUMENT and
+		// commit ae154c9 exist at all — left no trace on the run row: the abandoned
+		// channel appeared in neither attempted_channels nor failed_channels, so the
+		// gate could not see it at all.
+		if req.ChannelType == 0 {
+			log.Printf("[fetch_channel] rejecting call: agent did not supply channel_type. channel=%s", req.ChannelID)
+			recordFetch(false, false)
+			return "", fmt.Errorf("channel_type is required (1=DM, 2=Group, 5=Thread); check reference material's candidate channels for the correct value")
+		}
+
+		timeStart, err := time.Parse(time.RFC3339, req.TimeStart)
+		if err != nil {
+			recordFetch(false, false)
+			return "", fmt.Errorf("parse time_start: %w", err)
+		}
+		timeEnd, err := time.Parse(time.RFC3339, req.TimeEnd)
+		if err != nil {
+			recordFetch(false, false)
+			return "", fmt.Errorf("parse time_end: %w", err)
+		}
+
+		// Security: validate channel accessibility for system-injected uid
+		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
+		if !req.IncludeArchived {
+			options = append(options, pipeline.WithSelectedThreads(SelectedArchivedChannelIDs(ctx)))
+		}
+		accessibleChannels, err := pipeline.GetUserChannels(ctx, uid, imDB, options...)
+		if err != nil {
+			recordFetch(false, false)
+			return "", fmt.Errorf("get user channels: %w", err)
+		}
+
+		// Build set of accessible channel IDs
+		allowedSet := make(map[string]bool)
+		for _, ch := range accessibleChannels {
+			allowedSet[ch.ChannelID] = true
+		}
+
+		if !allowedSet[req.ChannelID] {
+			errResult := map[string]interface{}{
+				"error":      "channel not accessible",
+				"channel_id": req.ChannelID,
+			}
+			errData, _ := json.Marshal(errResult)
+			recordFetch(false, false)
+			return string(errData), fmt.Errorf("channel %s not accessible by user %s", req.ChannelID, uid)
+		}
+
+		maxPerChannel := req.MaxMessages
+		if maxPerChannel <= 0 {
+			maxPerChannel = cfg.MaxMessagesPerChannel
+		}
+
+		messages, coverage, err := pipeline.FetchMessagesFromChannelWithCoverage(ctx, req.ChannelID, req.ChannelType, timeStart.Unix(), timeEnd.Unix(), imDB, cfg.MsgTableCount, uid, maxPerChannel)
+		if err != nil {
+			recordFetch(false, false)
+			return "", fmt.Errorf("fetch messages: %w", err)
+		}
+
+		// Enrich messages with SenderName, SourceName, ChannelType before caching.
+		// This fixes citation metadata loss (SUM-46 Blocker A).
+		// Rationale: pipeline.FetchMessagesFromChannel only fills 5 fields (SenderUID,
+		// ChannelID, Timestamp, SendTime, Content). Citations need SenderName/SourceName/
+		// ChannelType. We enrich here (tool layer) rather than in pipeline because:
+		// (1) tool layer already has accessibleChannels with ChannelName/ChannelType
+		// (2) keeps pipeline focused on message fetching, not metadata resolution
+		// (3) no circular dependency risk
+		enrichMessagesWithMetadata(ctx, messages, req.ChannelID, accessibleChannels, imDB)
+
+		handle := messageCache.Store(messages, uid)
+		// Persist evidence to DB for citation fallback on cache miss (Stage 3 Blocker C).
+		// #161 P1-B (yujiawei): evidence is now the sole discovery source
+		// for CitationIndex in both getSessionMessagePool and
+		// buildCitationsForSession. A silently-dropped write would make this
+		// handle's messages invisible to citation building for the entire
+		// session, so a write failure is escalated as a tool-level error.
+		if err := PersistEvidence(summaryDB, ctx, handle, messages); err != nil {
+			// Record the channel as FAILED, not succeeded. The success record used to
+			// fire before this write, so a channel whose evidence INSERT was lost was
+			// counted in succeeded_channels while its messages were absent from
+			// buildCitationsForSession — the gate saw succeeded == expected and
+			// reported COMPLETE over evidence a third of which was uncitable.
+			recordFetch(false, coverage.Truncated)
+			return "", fmt.Errorf("persist evidence: %w", err)
+		}
+		// Recorded only once the messages are durably discoverable for citations.
+		recordFetch(true, coverage.Truncated)
+
+		result := map[string]interface{}{
+			"total":           len(messages),
+			"messages_handle": handle,
+			"channel_id":      req.ChannelID,
+		}
+		// 缺点八: surface honest coverage so the Planner can tell "this channel
+		// had exactly N messages" apart from "we hit the cap, more may exist".
+		// Gated so flag-off returns the exact legacy 3-key result.
+		if SummaryV2Enabled() {
+			result["returned_count"] = coverage.Returned
+			result["requested_max"] = coverage.RequestedMax
+			result["truncated"] = coverage.Truncated
+			// has_more mirrors truncated: the +1 probe makes it exact — true
+			// iff the window held more than the cap, not "cap-or-exactly-cap".
+			result["has_more"] = coverage.Truncated
+			if coverage.Returned > 0 {
+				result["actual_time_range"] = map[string]interface{}{
+					"first": time.Unix(coverage.FirstTS, 0).Format(time.RFC3339),
+					"last":  time.Unix(coverage.LastTS, 0).Format(time.RFC3339),
+				}
+			}
+		}
+		data, err := json.Marshal(result)
+		if err != nil {
+			return "", fmt.Errorf("marshal result: %w", err)
+		}
+		return string(data), nil
+	}
+
+	return schema, handler
+}

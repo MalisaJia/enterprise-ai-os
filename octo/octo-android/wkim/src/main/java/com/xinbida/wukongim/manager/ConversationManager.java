@@ -1,0 +1,1133 @@
+package com.xinbida.wukongim.manager;
+
+import android.content.ContentValues;
+import android.os.SystemClock;
+import android.text.TextUtils;
+import android.util.Log;
+
+import com.xinbida.wukongim.WKIM;
+import com.xinbida.wukongim.WKIMApplication;
+import com.xinbida.wukongim.db.WKDBHelper;
+import com.xinbida.wukongim.db.ConversationDbManager;
+import com.xinbida.wukongim.db.MsgDbManager;
+import com.xinbida.wukongim.entity.WKChannelType;
+import com.xinbida.wukongim.entity.WKConversationMsg;
+import com.xinbida.wukongim.entity.WKConversationMsgExtra;
+import com.xinbida.wukongim.entity.WKMsg;
+import com.xinbida.wukongim.entity.WKMsgExtra;
+import com.xinbida.wukongim.entity.WKMsgReaction;
+import com.xinbida.wukongim.entity.WKSyncChat;
+import com.xinbida.wukongim.entity.WKSyncConvMsgExtra;
+import com.xinbida.wukongim.entity.WKSyncRecent;
+import com.xinbida.wukongim.entity.WKSpaceMembership;
+import com.xinbida.wukongim.entity.WKUIConversationMsg;
+import com.xinbida.wukongim.interfaces.IAllConversations;
+import com.xinbida.wukongim.interfaces.IDeleteConversationMsg;
+import com.xinbida.wukongim.interfaces.IRefreshConversationMsg;
+import com.xinbida.wukongim.interfaces.IRefreshConversationMsgList;
+import com.xinbida.wukongim.interfaces.ISyncConversationChat;
+import com.xinbida.wukongim.interfaces.ISyncConversationChatBack;
+import com.xinbida.wukongim.message.type.WKConnectStatus;
+import com.xinbida.wukongim.message.type.WKMsgContentType;
+import com.xinbida.wukongim.utils.DispatchQueuePool;
+import com.xinbida.wukongim.utils.WKCommonUtils;
+import com.xinbida.wukongim.utils.WKLoggerUtils;
+
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * 5/21/21 12:12 PM
+ * 最近会话管理
+ */
+public class ConversationManager extends BaseManager {
+    private final DispatchQueuePool dispatchQueuePool = new DispatchQueuePool(3);
+
+    private final String TAG = "ConversationManager";
+
+    /**
+     *  C · SDK 层 sync 去重守卫。Phase 1 诊断识别出 5 条 sync 触发路径
+     * （{@code performSpaceSwitch} / {@code getChatMsg} / {@code connectSuccessCompensate}
+     * / {@code spaceResyncRunnable} / {@code WKConnection.wkConnectionSync}）。
+     * 上层 {@code SpaceSyncCoordinator}（/321）已在 UI 层做了 debounce + 全局重入
+     * 守卫，但 SDK 仍需要自己的 in-flight 防线：其它 SDK 使用方或未来新加的触发点不一定会
+     * 走上层 coordinator，SDK 层 AtomicBoolean 保证任何路径都只能有一条 sync 进行中。
+     *
+     * <p>释放时机：sync 真正完成回调里（成功 / 失败 / 空 syncChat）统一 release。若上游
+     * 网络回调永远不 fire，{@link #SYNC_STUCK_RESET_MS} 超时后允许下次 sync 强制抢占
+     * permit，避免永久卡死。
+     */
+    private final AtomicBoolean syncInFlight = new AtomicBoolean(false);
+    private volatile long syncInFlightSince = 0L;
+    private static final long SYNC_STUCK_RESET_MS = 15_000L;
+
+    /**
+     * GH dmwork-android#251 Round-2：conversation sync 响应里 resolved 的 group
+     * {@code space_id}（channelID → space_id）独立缓存。
+     *
+     * <p><b>为什么不写 {@link com.xinbida.wukongim.entity.WKChannel#remoteExtraMap}：</b>
+     * {@code ChannelManager.updateChannel(WKChannel)} 在 channelInfo 异步水合时会整体
+     * 替换 {@code wkChannelList[i].remoteExtraMap = channel.remoteExtraMap}（见
+     * {@code ChannelManager.java#updateChannel}），channelInfo 自带的 remoteExtraMap
+     * 通常只有 {@code space_id}（不含 {@code my_source_space_id}）→ conv sync 预填的
+     * 两个键会被一次性抹掉，竞态又回来了。改为独立内存缓存后，channelInfo 水合不会
+     * 触碰它，{@link com.chat.base.space.SpaceFilter} 在
+     * {@code channel.remoteExtraMap} 没有权威值时仍能读到 conv sync 给的兜底。
+     *
+     * <p><b>优先级语义</b>：{@code SpaceFilter.DEFAULT_PROVIDER.getChannelSpaceId} /
+     * {@code getMyMembershipSourceSpaceId} 先查权威源（{@code channel.remoteExtraMap}
+     * / member DB），再 fallback 到这两张 map——所以一旦 channelInfo / member sync
+     * 给出真实值，本缓存就自然被"压低优先级"，不会污染最终判定。
+     *
+     * <p>键不带 channelType（{@link #prefillSpaceExtrasFromConvSync} 只对
+     * {@link com.xinbida.wukongim.entity.WKChannelType#GROUP} 写入，读侧也只在 GROUP
+     * 路径上查；保持简洁）。
+     */
+    static final class SpaceCacheSnapshot {
+        final ConcurrentHashMap<String, String> spaceMap;
+        final ConcurrentHashMap<String, String> externalMap;
+        final boolean authoritative;
+
+        SpaceCacheSnapshot(ConcurrentHashMap<String, String> spaceMap,
+                           ConcurrentHashMap<String, String> externalMap,
+                           boolean authoritative) {
+            this.spaceMap = spaceMap;
+            this.externalMap = externalMap;
+            this.authoritative = authoritative;
+        }
+    }
+
+    private volatile SpaceCacheSnapshot spaceCacheSnapshot =
+            new SpaceCacheSnapshot(new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), false);
+
+    /**
+     * 最近一次 {@link #spaceCacheSnapshot} 被刷新/替换/单条预填的 wall-clock 时间(epoch ms).
+     *
+     * <p>诊断用: Space 串消息排查时, 单看 {@code SpaceFilter} 决策日志不够, 还需要知道
+     * "我决策时缓存数据有多新". 这个字段让 review 时能区分:
+     * <ul>
+     *     <li>缓存刚刚刷新(几秒内) → 数据应当权威, 决策错误是逻辑问题</li>
+     *     <li>缓存很久没刷新(几分钟前) → 可能是 stale, 决策错误是 race</li>
+     * </ul>
+     *
+     * <p>0 表示从未刷新(进程刚启动 + 磁盘 cache 也没读到). 用 {@code volatile long} 而非
+     * {@code AtomicLong}: 单次赋值无需 CAS, volatile 保证可见性即可.
+     */
+    private volatile long spaceCacheRefreshedAt = 0L;
+
+    private static final String SPACE_PREFS_NAME = "wk_space_memberships";
+    private static final String PREF_KEY_SPACE_MAP = "space_map";
+    private static final String PREF_KEY_EXTERNAL_MAP = "external_map";
+    private static final String PREF_KEY_UID = "cache_uid";
+    private static final String PREF_KEY_AUTHORITATIVE = "authoritative";
+    private volatile boolean spaceCacheLoadedFromDisk = false;
+    private volatile boolean coldStartSyncDone = false;
+
+    private ConversationManager() {
+    }
+
+    private void ensureSpaceCacheLoaded() {
+        if (!spaceCacheLoadedFromDisk) {
+            spaceCacheLoadedFromDisk = true;
+            loadSpaceCacheFromDisk();
+        }
+    }
+
+    private static class ConversationManagerBinder {
+        static final ConversationManager manager = new ConversationManager();
+    }
+
+    public static ConversationManager getInstance() {
+        return ConversationManagerBinder.manager;
+    }
+
+    //监听刷新最近会话
+    private ConcurrentHashMap<String, IRefreshConversationMsg> refreshMsgMap;
+    private ConcurrentHashMap<String, IRefreshConversationMsgList> refreshMsgListMap;
+
+    //移除某个会话
+    private ConcurrentHashMap<String, IDeleteConversationMsg> iDeleteMsgList;
+    // 同步最近会话
+    private ISyncConversationChat iSyncConversationChat;
+
+    private ConcurrentHashMap<String, Runnable> spaceCacheUpdateListeners;
+
+    public void addOnSpaceCacheUpdateListener(String key, Runnable listener) {
+        if (TextUtils.isEmpty(key) || listener == null) return;
+        if (spaceCacheUpdateListeners == null) {
+            spaceCacheUpdateListeners = new ConcurrentHashMap<>();
+        }
+        spaceCacheUpdateListeners.put(key, listener);
+    }
+
+    public void removeOnSpaceCacheUpdateListener(String key) {
+        if (TextUtils.isEmpty(key) || spaceCacheUpdateListeners == null) return;
+        spaceCacheUpdateListeners.remove(key);
+    }
+
+    private void notifySpaceCacheUpdated() {
+        if (spaceCacheUpdateListeners == null) return;
+        for (Runnable listener : spaceCacheUpdateListeners.values()) {
+            try {
+                listener.run();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /**
+     * 查询会话记录消息
+     *
+     * @return 最近会话集合
+     */
+    public List<WKUIConversationMsg> getAll() {
+        return ConversationDbManager.getInstance().queryAll();
+    }
+
+    public void getAll(IAllConversations iAllConversations) {
+        if (iAllConversations == null) {
+            return;
+        }
+        dispatchQueuePool.execute(() -> {
+            List<WKUIConversationMsg> list = ConversationDbManager.getInstance().queryAll();
+            iAllConversations.onResult(list);
+        });
+    }
+
+    public List<WKConversationMsg> getWithChannelType(byte channelType) {
+        return ConversationDbManager.getInstance().queryWithChannelType(channelType);
+    }
+
+    public List<WKUIConversationMsg> getWithChannelIds(List<String> channelIds) {
+        return ConversationDbManager.getInstance().queryWithChannelIds(channelIds);
+    }
+
+    /**
+     * 查询某条消息
+     *
+     * @param channelID   频道ID
+     * @param channelType 频道类型
+     * @return WKConversationMsg
+     */
+    public WKConversationMsg getWithChannel(String channelID, byte channelType) {
+        return ConversationDbManager.getInstance().queryWithChannel(channelID, channelType);
+    }
+
+    public void updateWithMsg(WKConversationMsg mConversationMsg) {
+        WKMsg msg = MsgDbManager.getInstance().queryMaxOrderSeqMsgWithChannel(mConversationMsg.channelID, mConversationMsg.channelType);
+        if (msg != null) {
+            mConversationMsg.lastClientMsgNO = msg.clientMsgNO;
+            mConversationMsg.lastMsgSeq = msg.messageSeq;
+        }
+        ConversationDbManager.getInstance().updateMsg(mConversationMsg.channelID, mConversationMsg.channelType, mConversationMsg.lastClientMsgNO, mConversationMsg.lastMsgSeq, mConversationMsg.unreadCount);
+    }
+
+    public void updateLastMsgTimestamp(String channelId, byte channelType, long timestamp) {
+        ConversationDbManager.getInstance().updateLastMsgTimestamp(channelId, channelType, timestamp);
+    }
+
+    /**
+     * 删除某个会话记录信息
+     *
+     * @param channelId   频道ID
+     * @param channelType 频道类型
+     */
+    public boolean deleteWitchChannel(String channelId, byte channelType) {
+        return ConversationDbManager.getInstance().deleteWithChannel(channelId, channelType, 1);
+    }
+
+    /**
+     * 清除所有最近会话
+     */
+    public boolean clearAll() {
+        return ConversationDbManager.getInstance().clearEmpty();
+    }
+
+    public void addOnRefreshMsgListListener(String key, IRefreshConversationMsgList listener) {
+        if (TextUtils.isEmpty(key) || listener == null) return;
+        if (refreshMsgListMap == null) {
+            refreshMsgListMap = new ConcurrentHashMap<>();
+        }
+        refreshMsgListMap.put(key, listener);
+    }
+
+    public void removeOnRefreshMsgListListener(String key) {
+        if (TextUtils.isEmpty(key) || refreshMsgListMap == null) return;
+        refreshMsgListMap.remove(key);
+    }
+
+    /**
+     * 监听刷新最近会话
+     *
+     * @param listener 回调
+     */
+    public void addOnRefreshMsgListener(String key, IRefreshConversationMsg listener) {
+        if (TextUtils.isEmpty(key) || listener == null) return;
+        if (refreshMsgMap == null)
+            refreshMsgMap = new ConcurrentHashMap<>();
+        refreshMsgMap.put(key, listener);
+    }
+
+    public void removeOnRefreshMsgListener(String key) {
+        if (TextUtils.isEmpty(key) || refreshMsgMap == null) return;
+        refreshMsgMap.remove(key);
+    }
+
+    /**
+     * 设置刷新最近会话
+     */
+//    public void setOnRefreshMsg(WKUIConversationMsg conversationMsg, boolean isEnd, String from) {
+//        if (refreshMsgMap != null && !refreshMsgMap.isEmpty() && conversationMsg != null) {
+//            runOnMainThread(() -> {
+//                for (Map.Entry<String, IRefreshConversationMsg> entry : refreshMsgMap.entrySet()) {
+//                    entry.getValue().onRefreshConversationMsg(conversationMsg, isEnd);
+//                }
+//            });
+//        }
+//    }
+    public void setOnRefreshMsg(WKUIConversationMsg msg, String from) {
+        List<WKUIConversationMsg> list = new ArrayList<>();
+        list.add(msg);
+        this.setOnRefreshMsg(list, from);
+    }
+
+    public void setOnRefreshMsg(List<WKUIConversationMsg> list, String from) {
+        if (WKCommonUtils.isEmpty(list)) return;
+        //  H3 · 在当前（后台）线程预加载 wkMsg + wkChannel，避免主线程回调中懒加载
+        // 触发 DB 查询导致 ANR。adapter.convert 每 item 调 getWkChannel 36 次 / getWkMsg 15 次，
+        // Space 切换冷启动时 ChannelManager 缓存为空 → 撞上 saveSyncChat 写事务 → 主线程
+        // 卡死 30s → 系统杀进程（用户感知为闪退）。getWkChannel 单独预加载即可消除该窗口。
+        for (int i = 0, size = list.size(); i < size; i++) {
+            list.get(i).getWkMsg();
+            list.get(i).getWkChannel();
+        }
+        if (refreshMsgMap != null && !refreshMsgMap.isEmpty()) {
+            runOnMainThread(() -> {
+                for (int i = 0, size = list.size(); i < size; i++) {
+                    for (Map.Entry<String, IRefreshConversationMsg> entry : refreshMsgMap.entrySet()) {
+                        entry.getValue().onRefreshConversationMsg(list.get(i), i == list.size() - 1);
+                    }
+                }
+            });
+        }
+        if (refreshMsgListMap != null && !refreshMsgListMap.isEmpty()) {
+            runOnMainThread(() -> {
+                for (Map.Entry<String, IRefreshConversationMsgList> entry : refreshMsgListMap.entrySet()) {
+                    entry.getValue().onRefresh(list);
+                }
+            });
+        }
+    }
+
+    //监听删除最近会话监听
+    public void addOnDeleteMsgListener(String key, IDeleteConversationMsg listener) {
+        if (TextUtils.isEmpty(key) || listener == null) return;
+        if (iDeleteMsgList == null) iDeleteMsgList = new ConcurrentHashMap<>();
+        iDeleteMsgList.put(key, listener);
+    }
+
+    public void removeOnDeleteMsgListener(String key) {
+        if (TextUtils.isEmpty(key) || iDeleteMsgList == null) return;
+        iDeleteMsgList.remove(key);
+    }
+
+    // 删除某个最近会话
+    public void setDeleteMsg(String channelID, byte channelType) {
+        if (iDeleteMsgList != null && !iDeleteMsgList.isEmpty()) {
+            runOnMainThread(() -> {
+                for (Map.Entry<String, IDeleteConversationMsg> entry : iDeleteMsgList.entrySet()) {
+                    entry.getValue().onDelete(channelID, channelType);
+                }
+            });
+        }
+    }
+
+    public void updateRedDot(String channelID, byte channelType, int redDot) {
+        boolean result = ConversationDbManager.getInstance().updateRedDot(channelID, channelType, redDot);
+        if (result) {
+            WKUIConversationMsg msg = getUIConversationMsg(channelID, channelType);
+            if (msg != null) {
+                setOnRefreshMsg(msg, "updateRedDot");
+            }
+        }
+    }
+
+    public WKConversationMsgExtra getMsgExtraWithChannel(String channelID, byte channelType) {
+        return ConversationDbManager.getInstance().queryMsgExtraWithChannel(channelID, channelType);
+    }
+
+    /**
+     * 批量查询会话 extras（草稿等），一次 DB 查询替代 N 次单条查询。
+     * 返回 Map 以 channelID:channelType 为复合 key。
+     */
+    public java.util.Map<String, WKConversationMsgExtra> getMsgExtrasForChannels(java.util.List<String> channelIds) {
+        java.util.Map<String, WKConversationMsgExtra> map = new java.util.HashMap<>();
+        java.util.List<WKConversationMsgExtra> list = ConversationDbManager.getInstance().queryMsgExtrasForChannelIds(channelIds);
+        for (WKConversationMsgExtra extra : list) {
+            map.put(extra.channelID + ":" + extra.channelType, extra);
+        }
+        return map;
+    }
+
+    public void updateMsgExtra(WKConversationMsgExtra extra) {
+        boolean result = ConversationDbManager.getInstance().insertOrUpdateMsgExtra(extra);
+        if (result) {
+            WKUIConversationMsg msg = getUIConversationMsg(extra.channelID, extra.channelType);
+            if (msg == null) return;
+            List<WKUIConversationMsg> list = new ArrayList<>();
+            list.add(msg);
+            setOnRefreshMsg(list, "updateMsgExtra");
+        }
+    }
+
+    public WKUIConversationMsg updateWithWKMsg(WKMsg msg) {
+        if (msg == null || TextUtils.isEmpty(msg.channelID)) return null;
+        return ConversationDbManager.getInstance().insertOrUpdateWithMsg(msg, 0);
+    }
+
+    public WKUIConversationMsg getUIConversationMsg(String channelID, byte channelType) {
+        WKConversationMsg msg = ConversationDbManager.getInstance().queryWithChannel(channelID, channelType);
+        if (msg == null) {
+            return null;
+        }
+        return ConversationDbManager.getInstance().getUIMsg(msg);
+    }
+
+    /**
+     * 批量版 {@link #getUIConversationMsg(String, byte)}：同一 channelType 下一次查回多个会话，
+     * 按 channelID 建索引。查不到的 channelID 在 map 里缺席，调用方按 null 走原来的兜底分支，
+     * 与逐条查询语义一致。
+     */
+    public java.util.Map<String, WKUIConversationMsg> getUIConversationMsgs(java.util.List<String> channelIds, byte channelType) {
+        java.util.Map<String, WKUIConversationMsg> map = new java.util.HashMap<>();
+        if (channelIds == null || channelIds.isEmpty()) return map;
+        List<WKConversationMsg> list = ConversationDbManager.getInstance().queryWithChannelIds(channelIds, channelType);
+        for (WKConversationMsg msg : list) {
+            if (msg == null || TextUtils.isEmpty(msg.channelID)) continue;
+            map.put(msg.channelID, ConversationDbManager.getInstance().getUIMsg(msg));
+        }
+        return map;
+    }
+
+    public long getMsgExtraMaxVersion() {
+        return ConversationDbManager.getInstance().queryMsgExtraMaxVersion();
+    }
+
+    public void saveSyncMsgExtras(List<WKSyncConvMsgExtra> list) {
+        List<WKConversationMsgExtra> msgExtraList = new ArrayList<>();
+        for (WKSyncConvMsgExtra msg : list) {
+            msgExtraList.add(syncConvMsgExtraToConvMsgExtra(msg));
+        }
+        ConversationDbManager.getInstance().insertMsgExtras(msgExtraList);
+    }
+
+    private WKConversationMsgExtra syncConvMsgExtraToConvMsgExtra(WKSyncConvMsgExtra extra) {
+        WKConversationMsgExtra msg = new WKConversationMsgExtra();
+        msg.channelID = extra.channel_id;
+        msg.channelType = extra.channel_type;
+        msg.draft = extra.draft;
+        msg.keepOffsetY = extra.keep_offset_y;
+        msg.keepMessageSeq = extra.keep_message_seq;
+        msg.version = extra.version;
+        msg.browseTo = extra.browse_to;
+        msg.draftUpdatedAt = extra.draft_updated_at;
+        return msg;
+    }
+
+
+    public void addOnSyncConversationListener(ISyncConversationChat iSyncConvChatListener) {
+        this.iSyncConversationChat = iSyncConvChatListener;
+    }
+
+    public void setSyncConversationListener(ISyncConversationChatBack iSyncConversationChatBack) {
+        if (iSyncConversationChat == null) {
+            // 上层 listener 还没注册（如 Phase-B postPhaseB 的 WKIMUtils.initIMListener 还在 IO 线程排队）
+            // 仍调一次 onBack(null) 让调用方的回调链能跑——WKConnection.markConnected /
+            // SyncGate.done / SpaceSyncCoordinator.complete 都挂在 onBack 上，
+            // 否则 permit 锁死 10s（STUCK_RESET_MS），冷启动会话列表只剩 SYSTEM_BOTS 兜底。
+            WKLoggerUtils.getInstance().e("未设置同步最近会话事件");
+            if (com.xinbida.wukongim.BuildConfig.DEBUG) android.util.Log.e("MsgDebug", "[SYNC_BUG] iSyncConversationChat is NULL! firing onBack(null) to release upstream permit");
+            if (iSyncConversationChatBack != null) iSyncConversationChatBack.onBack(null);
+            return;
+        }
+        //  C · sync 去重：CAS 抢 permit。5 条触发路径并发打进来时只有 1 条会真正
+        // 发起 syncConversationChat，其余立即短路——但仍调用 onBack(null)，让上层
+        // SpaceSyncCoordinator / SyncGate 的 complete() 有机会触发，避免协调器状态卡住。
+        final long now = SystemClock.elapsedRealtime();
+        if (!syncInFlight.compareAndSet(false, true)) {
+            long startedAt = syncInFlightSince;
+            if (startedAt > 0 && now - startedAt > SYNC_STUCK_RESET_MS) {
+                // 兜底：上一次 sync 回调从未触发（网络超时 / 崩溃路径），15s 后强制抢占。
+                WKLoggerUtils.getInstance().e(TAG,
+                        "setSyncConversationListener stuck > " + SYNC_STUCK_RESET_MS
+                                + "ms, force reset inFlight");
+                syncInFlight.set(false);
+                if (!syncInFlight.compareAndSet(false, true)) {
+                    // 被其它线程抢先了，按正常 drop 处理
+                    WKLoggerUtils.getInstance().e(TAG,
+                            "setSyncConversationListener drop (lost race after stuck-reset)");
+                    if (iSyncConversationChatBack != null) iSyncConversationChatBack.onBack(null);
+                    return;
+                }
+            } else {
+                WKLoggerUtils.getInstance().e(TAG,
+                        "setSyncConversationListener drop (sync already in-flight, age="
+                                + (startedAt == 0 ? -1 : now - startedAt) + "ms)");
+                if (iSyncConversationChatBack != null) iSyncConversationChatBack.onBack(null);
+                return;
+            }
+        }
+        syncInFlightSince = now;
+        final long dbVersion = ConversationDbManager.getInstance().queryMaxVersion();
+        final long version = coldStartSyncDone ? dbVersion : 0;
+        final String lastMsgSeqStr = ConversationDbManager.getInstance().queryLastMsgSeqs();
+        WKLoggerUtils.getInstance().e(TAG,
+                "setSyncConversationListener begin (version=" + version
+                        + ", lastMsgSeq=" + lastMsgSeqStr + ")");
+        if (com.xinbida.wukongim.BuildConfig.DEBUG) {
+            android.util.Log.d("ConvSync", "[ConvSync] sync request: version=" + version);
+        }
+        com.xinbida.wukongim.utils.WKHeapProbe.ensureBallast(PROBE_BALLAST_MB);
+        com.xinbida.wukongim.utils.WKHeapProbe.snapshot("convSync request issued");
+        runOnMainThread(() -> iSyncConversationChat.syncConversationChat(lastMsgSeqStr, 10, version, syncChat -> {
+            com.xinbida.wukongim.utils.WKHeapProbe.snapshot("convSync response parsed conv="
+                    + (syncChat == null || syncChat.conversations == null ? -1 : syncChat.conversations.size()));
+            dispatchQueuePool.execute(() -> saveSyncChat(syncChat, () -> {
+                try {
+                    if (syncChat != null) {
+                        coldStartSyncDone = true;
+                    }
+                    if (iSyncConversationChatBack != null) {
+                        iSyncConversationChatBack.onBack(syncChat);
+                    }
+                } finally {
+                    syncInFlightSince = 0L;
+                    syncInFlight.set(false);
+                }
+            }));
+        }));
+    }
+
+
+    interface ISaveSyncChatBack {
+        void onBack();
+    }
+
+
+    private void saveSyncChat(WKSyncChat syncChat, final ISaveSyncChatBack iSaveSyncChatBack) {
+        //  Phase 2 · T7 埋点：SDK 批量落盘段（conversations + recents + reactions + extras）。
+        // 发生在 dispatchQueuePool（非主线程）。守 BuildConfig.DEBUG 确保 release 无开销。
+        final long yuj312T7Start = com.xinbida.wukongim.BuildConfig.DEBUG
+                ? android.os.SystemClock.elapsedRealtime() : 0L;
+        final int yuj312T7ConvCount = (com.xinbida.wukongim.BuildConfig.DEBUG && syncChat != null
+                && syncChat.conversations != null) ? syncChat.conversations.size() : 0;
+        if (com.xinbida.wukongim.BuildConfig.DEBUG) {
+            android.os.Trace.beginSection("YUJ312-saveSyncChat");
+            android.util.Log.d("YUJ312", "saveSyncChat START convCount=" + yuj312T7ConvCount);
+        }
+        com.xinbida.wukongim.utils.WKHeapProbe.begin("saveSyncChat");
+        try {
+            saveSyncChatImpl(syncChat, iSaveSyncChatBack);
+        } finally {
+            com.xinbida.wukongim.utils.WKHeapProbe.end();
+            if (com.xinbida.wukongim.BuildConfig.DEBUG) {
+                android.os.Trace.endSection();
+                android.util.Log.d("YUJ312", "saveSyncChat END convCount=" + yuj312T7ConvCount
+                        + " +" + (android.os.SystemClock.elapsedRealtime() - yuj312T7Start) + "ms");
+            }
+        }
+    }
+
+    /**
+     * OOM 诊断开关：置 true 可在本地复现「修复前」的行为——即 insertOrReplaceExtra 写完 extra 后
+     * 再把这一批消息全查回来物化一遍。配合 WKHeapProbe 的 peak 做同一账号 A/B，用来量化那一步
+     * 到底吃掉多少内存。<b>常态必须是 false，问题闭环后连同探针一起删。</b>
+     */
+    private static final boolean PROBE_FORCE_EXTRA_REQUERY = false;
+
+    /**
+     * OOM 复现用压舱重量（MB），0 = 关闭。在同步发起前占住这么多堆并一直持有，把本机可用空间
+     * 压到线上大账号那样的紧张程度。用法：先取一个刚好会崩的值确认能复现同一条栈，然后每上一处
+     * 优化就看同一个压舱值是否还崩——崩不崩的分界线就是这处优化买到的余量，单位 MB，量出来的不是估的。
+     * <b>常态必须是 0，问题闭环后连同探针一起删。</b>
+     */
+    private static final int PROBE_BALLAST_MB = 0;
+
+    /**
+     * 会话同步的落盘批大小。一批处理完就把派生列表清空，峰值内存与这个数成正比、与账号的
+     * 会话总数无关。20 个会话 × 每会话最多 30 条 recent ≈ 600 条消息一批，既不会让事务过碎，
+     * 也远低于会撑爆堆的量级。
+     */
+    private static final int SYNC_CHAT_CONVERSATION_BATCH = 20;
+
+    private void saveSyncChatImpl(WKSyncChat syncChat, final ISaveSyncChatBack iSaveSyncChatBack) {
+        if (syncChat == null) {
+            iSaveSyncChatBack.onBack();
+            return;
+        }
+        if (com.xinbida.wukongim.BuildConfig.DEBUG && syncChat.conversations != null) {
+            StringBuilder sb = new StringBuilder("[ConvSync] saveSyncChat: ");
+            for (int di = 0; di < syncChat.conversations.size(); di++) {
+                if (di > 0) sb.append(", ");
+                sb.append(syncChat.conversations.get(di).channel_id)
+                  .append(":").append(syncChat.conversations.get(di).channel_type);
+            }
+            android.util.Log.d("ConvSync", sb.toString());
+        }
+        // 全量 space 缓存必须在 UI 通知之前就绪。原实现放在写 extra 之后、写会话之前；分批之后
+        // 提到循环之前——它与逐条 prefill 互斥（prefill 只在 space_memberships == null 时跑，
+        // 而 applySpaceMemberships 收到 null 直接 return），两者不会交叉，语义不变。
+        applySpaceMemberships(syncChat.space_memberships);
+        // 这四个列表现在只装「当前这一批」会话的数据，每批落盘后 clear()：上一批的 WKMsg
+        // （含 content 字符串和已解析的 baseContentMsgModel）随即不可达，GC 立刻能回收。
+        // 峰值内存因此只与 SYNC_CHAT_CONVERSATION_BATCH 有关，与账号的会话总数无关。
+        // 服务端有没有分页不影响这一点——响应仍然整包收，但派生对象不再同时全量持有。
+        List<WKConversationMsg> conversationMsgList = new ArrayList<>();
+        List<WKMsg> msgList = new ArrayList<>();
+        List<WKMsgReaction> msgReactionList = new ArrayList<>();
+        List<WKMsgExtra> msgExtraList = new ArrayList<>();
+        // 每个会话一条，几百个也只有百来 KB，跨批累积无压力；UI 仍然只在最后刷新一次。
+        List<WKUIConversationMsg> uiMsgList = new ArrayList<>();
+        // OOM 诊断用：本次同步所有 content 字符串的总长度。
+        long probeContentChars = 0;
+        int probeBatchNo = 0;
+        if (WKCommonUtils.isNotEmpty(syncChat.conversations)) {
+            for (int i = 0, size = syncChat.conversations.size(); i < size; i++) {
+                //最近会话消息对象
+                WKConversationMsg conversationMsg = new WKConversationMsg();
+                byte channelType = syncChat.conversations.get(i).channel_type;
+                String channelID = syncChat.conversations.get(i).channel_id;
+                if (channelType == WKChannelType.COMMUNITY_TOPIC) {
+                    String[] str = channelID.split("@");
+                    conversationMsg.parentChannelID = str[0];
+                    conversationMsg.parentChannelType = WKChannelType.COMMUNITY;
+                }
+                // octo-server PR #154 / GH dmwork-android#251：conv sync 响应里 resolved 的
+                // space_id / my_source_space_id 在 GROUP 类型上预填到独立缓存。
+                // 有 space_memberships 全量数据时跳过逐条 prefill，由末尾统一覆盖。
+                if (channelType == WKChannelType.GROUP && syncChat.space_memberships == null) {
+                    String _spaceId = syncChat.conversations.get(i).space_id;
+                    String _mySource = syncChat.conversations.get(i).my_source_space_id;
+                    if (com.xinbida.wukongim.BuildConfig.DEBUG) {
+                        WKLoggerUtils.getInstance().e(TAG, "convSync prefill: ch=" + channelID
+                                + " space_id=" + _spaceId + " my_source=" + _mySource);
+                    }
+                    prefillSpaceExtrasFromConvSync(channelID, channelType, _spaceId, _mySource);
+                }
+                conversationMsg.channelID = syncChat.conversations.get(i).channel_id;
+                conversationMsg.channelType = syncChat.conversations.get(i).channel_type;
+                conversationMsg.lastMsgSeq = syncChat.conversations.get(i).last_msg_seq;
+                conversationMsg.lastClientMsgNO = syncChat.conversations.get(i).last_client_msg_no;
+                conversationMsg.lastMsgTimestamp = syncChat.conversations.get(i).timestamp;
+                conversationMsg.unreadCount = syncChat.conversations.get(i).unread;
+                conversationMsg.version = syncChat.conversations.get(i).version;
+                //聊天消息对象
+                if (syncChat.conversations.get(i).recents != null && WKCommonUtils.isNotEmpty(syncChat.conversations)) {
+                    for (WKSyncRecent wkSyncRecent : syncChat.conversations.get(i).recents) {
+                        WKMsg msg = MsgManager.getInstance().WKSyncRecent2WKMsg(wkSyncRecent);
+                        if (msg.type == WKMsgContentType.WK_INSIDE_MSG) {
+                            continue;
+                        }
+                        if (WKCommonUtils.isNotEmpty(msg.reactionList)) {
+                            msgReactionList.addAll(msg.reactionList);
+                        }
+                        //判断会话列表的fromUID
+                        if (conversationMsg.lastClientMsgNO.equals(msg.clientMsgNO)) {
+                            conversationMsg.isDeleted = msg.isDeleted;
+                        }
+                        if (wkSyncRecent.message_extra != null) {
+                            WKMsgExtra extra = MsgManager.getInstance().WKSyncExtraMsg2WKMsgExtra(msg.channelID, msg.channelType, wkSyncRecent.message_extra);
+                            msgExtraList.add(extra);
+                        }
+                        msgList.add(msg);
+                        if (com.xinbida.wukongim.BuildConfig.DEBUG && msg.content != null) {
+                            probeContentChars += msg.content.length();
+                        }
+                    }
+                }
+
+                conversationMsgList.add(conversationMsg);
+
+                // 消费完就把解析树上这一条的 recents 断掉。分批只让「派生列表」有上界，
+                // 但 FastJson 解出来的 WKSyncChat 树本身要活到 onBack 回调，
+                // recents 又是整棵树里最大的一块（content 字符串全在这），不断引用的话
+                // 峰值仍然与账号会话总数成正比，分批等于白做。
+                // 安全性：recents 全仓只有上面那一处消费；onBack 的三个实现只读
+                // conversations.size()（见 ChatFragment / WKIMUtils 的 sync 回调）。
+                syncChat.conversations.get(i).recents = null;
+
+                // 攒够一批（或到末尾）就落盘并清空，让这一批的对象立刻变成可回收。
+                if (conversationMsgList.size() >= SYNC_CHAT_CONVERSATION_BATCH || i == size - 1) {
+                    probeBatchNo++;
+                    flushSyncChatBatch(conversationMsgList, msgList, msgExtraList,
+                            msgReactionList, uiMsgList, probeBatchNo);
+                    conversationMsgList.clear();
+                    msgList.clear();
+                    msgExtraList.clear();
+                    msgReactionList.clear();
+                }
+            }
+        }
+        if (WKCommonUtils.isNotEmpty(uiMsgList)) {
+            com.xinbida.wukongim.utils.WKHeapProbe.mark("all batches done",
+                    "batches=" + probeBatchNo + " uiMsg=" + uiMsgList.size()
+                            + " contentChars=" + probeContentChars);
+            setOnRefreshMsg(uiMsgList, "saveSyncChat");
+        }
+
+        if (WKCommonUtils.isNotEmpty(syncChat.cmds)) {
+            try {
+                for (int i = 0, size = syncChat.cmds.size(); i < size; i++) {
+                    JSONObject jsonObject = new JSONObject();
+                    jsonObject.put("cmd", syncChat.cmds.get(i).cmd);
+                    JSONObject json = new JSONObject(syncChat.cmds.get(i).param);
+                    jsonObject.put("param", json);
+                    CMDManager.getInstance().handleCMD(jsonObject);
+                }
+            } catch (JSONException e) {
+                WKLoggerUtils.getInstance().e(TAG, "saveSyncChat cmd not json struct");
+            }
+        }
+        WKIM.getInstance().getConnectionManager().setConnectionStatus(WKConnectStatus.syncCompleted, "");
+        iSaveSyncChatBack.onBack();
+    }
+
+    /**
+     * 把一批会话及其派生数据落盘。顺序与分批前保持一致：extra → message → conversation → reaction。
+     *
+     * <p>调用方在本方法返回后 {@code clear()} 这些列表，因此本方法不得持有任何入参的引用。
+     */
+    private void flushSyncChatBatch(List<WKConversationMsg> conversationMsgList,
+                                    List<WKMsg> msgList,
+                                    List<WKMsgExtra> msgExtraList,
+                                    List<WKMsgReaction> msgReactionList,
+                                    List<WKUIConversationMsg> uiMsgList,
+                                    int batchNo) {
+        if (WKCommonUtils.isNotEmpty(msgExtraList)) {
+            // needUpdatedMsgs=false：这里不用返回值。带上它会把刚写的这批消息重新查库并把每条
+            // content 解析成 JSONObject + content model，纯浪费（线上有崩溃栈就停在那一步）。
+            MsgDbManager.getInstance().insertOrReplaceExtra(msgExtraList, PROBE_FORCE_EXTRA_REQUERY);
+        }
+        if (WKCommonUtils.isNotEmpty(msgList)) {
+            MsgDbManager.getInstance().insertMsgs(msgList);
+        }
+        saveConversationBatch(conversationMsgList, uiMsgList);
+        if (WKCommonUtils.isNotEmpty(msgReactionList)) {
+            MsgManager.getInstance().saveMsgReactions(msgReactionList);
+        }
+        com.xinbida.wukongim.utils.WKHeapProbe.mark("batch " + batchNo,
+                "conv=" + conversationMsgList.size()
+                        + " msg=" + msgList.size()
+                        + " extra=" + msgExtraList.size()
+                        + " reaction=" + msgReactionList.size());
+    }
+
+    /**
+     * 写一批会话到 conversation 表，并把对应的 UI 模型追加到 {@code uiMsgList}。
+     *
+     * <p>分批后这里由一次大事务变成每批一次事务：某一批失败时前面几批已经提交，是部分成功而不是
+     * 整体回滚。对「会话列表」这种可由下次同步自愈的数据，部分成功优于全丢。
+     */
+    private void saveConversationBatch(List<WKConversationMsg> conversationMsgList,
+                                       List<WKUIConversationMsg> uiMsgList) {
+        if (WKCommonUtils.isEmpty(conversationMsgList)) return;
+        WKDBHelper txHelper = WKIMApplication.getInstance().getDbHelper();
+        if (txHelper == null || txHelper.isClosed()) return;
+        boolean began = false;
+        try {
+            List<ContentValues> cvList = new ArrayList<>();
+            for (int i = 0, size = conversationMsgList.size(); i < size; i++) {
+                ContentValues cv = ConversationDbManager.getInstance().getInsertSyncCV(conversationMsgList.get(i));
+                cvList.add(cv);
+                WKUIConversationMsg uiMsg = ConversationDbManager.getInstance().getUIMsg(conversationMsgList.get(i));
+                if (uiMsg != null) {
+                    uiMsgList.add(uiMsg);
+                }
+            }
+            txHelper.beginTransaction();
+            began = true;
+            for (ContentValues cv : cvList) {
+                ConversationDbManager.getInstance().insertSyncMsg(cv);
+            }
+            txHelper.setTransactionSuccessful();
+        } catch (Throwable t) {
+            // ⚠️⚠️ 这一段的 Error 语义必须与 main 完全一致，不许动。
+            //
+            // main 上这里是 catch (Exception ignored)：Error 不在捕获范围 → 直接抛出去 →
+            // DispatchQueuePool 线程崩 → Bugly 收到崩溃报告。线上那 6 条 OOM 栈
+            // （saveSyncChatImpl → insertOrReplaceExtra → queryWithMsgIds）就是这么捞到的，
+            // 是我们发现 OOM 的唯一渠道。把 Error 吞掉 = 线上 OOM 变成「半截数据 + 一片安静」。
+            //
+            // rethrow 必须放在最前面，早于任何字符串拼接：堆已经耗尽时，拼一条日志本身
+            // 就可能再抛一个 OOM，把原始堆栈顶掉，Bugly 收到的会是一条毫无意义的栈。
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            // 到这里只剩 Exception。main 上是 catch (Exception ignored) + 一条不带异常信息的
+            // 日志，失败了只能靠猜；而且会话没写进库 → queryLastMsgSeqs 游标停在原地 →
+            // 下次同步服务端返回同样大的全量包 → 用户卡在这个循环里。至少让失败可见。
+            // 门控：WKLoggerUtils 走 WKIM.isDebug()，本仓库 setDebug(true) 写死，
+            // 不包 BuildConfig.DEBUG 的话 release 里照样打印。
+            if (com.xinbida.wukongim.BuildConfig.DEBUG) {
+                WKLoggerUtils.getInstance().e(TAG,
+                        "saveConversationBatch failed (size=" + conversationMsgList.size() + "): " + t);
+            }
+        } finally {
+            if (began) {
+                try {
+                    txHelper.endTransaction();
+                } catch (Exception ignored) {
+                    // 只兜 Exception（比如事务已结束的 IllegalStateException）。
+                    // 这里同样不能写成 catch (Throwable)：endTransaction 抛 OOM 时若被吞掉，
+                    // 那条 Error 就到不了 Bugly——main 上这里连 try 都没有，Error 直接往上走。
+                }
+            }
+        }
+    }
+
+    /**
+     * 老后端 fallback：把 conversation sync 响应里逐条的 space_id / my_source_space_id
+     * 写入 {@link #spaceCacheSnapshot} 的当前 map。仅在 space_memberships 字段缺失时使用。
+     *
+     * <p>新后端返回 space_memberships 时由 {@link #applySpaceMemberships} 原子替换整个快照。
+     */
+    private void prefillSpaceExtrasFromConvSync(String channelID,
+                                                byte channelType,
+                                                String spaceId,
+                                                String mySourceSpaceId) {
+        // 注意：这里刻意不走 android.text.TextUtils#isEmpty —— 它在 host unit test
+        // （returnDefaultValues=true）下被 stub 成始终返回 false，会让 stale-cache 路径
+        // 失去测试覆盖。用纯 Java 判定保持语义在 stub 环境下也可断言。
+        if (channelID == null || channelID.isEmpty()) return;
+        boolean hasSpaceId = spaceId != null && !spaceId.isEmpty();
+        boolean hasMySource = mySourceSpaceId != null && !mySourceSpaceId.isEmpty();
+
+        try {
+            SpaceCacheSnapshot snapshot = spaceCacheSnapshot;
+            if (hasSpaceId) {
+                snapshot.spaceMap.put(channelID, spaceId);
+            } else {
+                snapshot.spaceMap.remove(channelID);
+            }
+            if (hasMySource) {
+                snapshot.externalMap.put(channelID, mySourceSpaceId);
+            } else {
+                snapshot.externalMap.remove(channelID);
+            }
+            spaceCacheRefreshedAt = System.currentTimeMillis();
+        } catch (Throwable t) {
+            // 单条 conv 的预填失败不应阻断批量落盘；下一次 sync 或 channelInfo 异步路径会补齐。
+            WKLoggerUtils.getInstance().e(TAG, "prefillSpaceExtrasFromConvSync failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * 用服务端返回的全量 space_memberships 覆盖内存缓存，彻底消除 Space 消息串问题。
+     *
+     * <p>权威性语义（PR #75 review @Jerry-Xin 提出的边界）：
+     * <ul>
+     *   <li>{@code memberships == null}：老后端未部署此字段，跳过不处理（authoritative
+     *       保持原值，向后兼容）。</li>
+     *   <li>{@code memberships.isEmpty()}：新后端权威返回"无 memberships"，应当标记
+     *       {@code authoritative=true} 并持久化，否则 SpaceFilter 的
+     *       {@code my-row-not-cached-fail-open} 路径会继续展示陈旧 / 跨 Space 会话。</li>
+     *   <li>非空 list：新后端权威覆盖，{@code authoritative=true}（已有逻辑）。</li>
+     * </ul>
+     */
+    public void applySpaceMemberships(List<WKSpaceMembership> memberships) {
+        if (memberships == null) return;
+        if (memberships.isEmpty()) {
+            spaceCacheSnapshot = new SpaceCacheSnapshot(
+                    new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), true);
+            spaceCacheRefreshedAt = System.currentTimeMillis();
+            saveSpaceCacheToDisk(new ConcurrentHashMap<>(), new ConcurrentHashMap<>());
+            try {
+                com.xinbida.wukongim.diag.WKDiagWriter.write("MEMBERSHIP",
+                        "action=apply-empty before=cleared after=0/0 authoritative=true");
+            } catch (Throwable ignored) {
+            }
+            notifySpaceCacheUpdated();
+            return;
+        }
+        try {
+            int beforeSpace = spaceCacheSnapshot.spaceMap.size();
+            int beforeExt = spaceCacheSnapshot.externalMap.size();
+            ConcurrentHashMap<String, String> newSpaceMap = new ConcurrentHashMap<>();
+            ConcurrentHashMap<String, String> newExternalMap = new ConcurrentHashMap<>();
+            for (WKSpaceMembership m : memberships) {
+                if (m == null || m.channel_id == null || m.channel_id.isEmpty()) continue;
+                if (m.space_id != null && !m.space_id.isEmpty()) {
+                    newSpaceMap.put(m.channel_id, m.space_id);
+                }
+                if (m.my_source_space_id != null && !m.my_source_space_id.isEmpty()) {
+                    newExternalMap.put(m.channel_id, m.my_source_space_id);
+                }
+            }
+            spaceCacheSnapshot = new SpaceCacheSnapshot(newSpaceMap, newExternalMap, true);
+            spaceCacheRefreshedAt = System.currentTimeMillis();
+            saveSpaceCacheToDisk(newSpaceMap, newExternalMap);
+            try {
+                com.xinbida.wukongim.diag.WKDiagWriter.write("MEMBERSHIP",
+                        "action=apply-full entries=" + memberships.size()
+                                + " before=" + beforeSpace + "/" + beforeExt
+                                + " after=" + newSpaceMap.size() + "/" + newExternalMap.size()
+                                + " authoritative=true");
+            } catch (Throwable ignored) {
+            }
+            if (com.xinbida.wukongim.BuildConfig.DEBUG) {
+                String caller = Thread.currentThread().getStackTrace().length > 3
+                        ? Thread.currentThread().getStackTrace()[3].toString() : "unknown";
+                android.util.Log.d("ConvSync", "[SpaceMemberships] applied by " + caller
+                        + ": " + memberships.size() + " entries, spaceMap=" + newSpaceMap.size()
+                        + " externalMap=" + newExternalMap.size());
+                for (WKSpaceMembership m : memberships) {
+                    if (m != null && m.channel_id != null) {
+                        android.util.Log.d("ConvSync", "[SpaceMemberships] channel_id=" + m.channel_id
+                                + " space_id=" + m.space_id
+                                + " my_source_space_id=" + m.my_source_space_id);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            WKLoggerUtils.getInstance().e(TAG, "applySpaceMemberships failed: " + t.getMessage());
+        }
+        notifySpaceCacheUpdated();
+    }
+
+    /**
+     * GH dmwork-android#251 Round-3：清空 conv sync 预填的 space 缓存。
+     *
+     * <p>这两张 map 是进程内单例缓存，跨用户必须显式清空，否则 logout 后再 init 另一个
+     * 账号时，SpaceFilter 会读到上个用户的 {@code my_source_space_id} 做错判（典型表现：
+     * 切号后某个群在新账号的 Space 视图里被错误地隐藏 / 显示）。
+     *
+     * <p>调用点：
+     * <ul>
+     *   <li>{@code ConnectionManager.logoutChat()} —— 与 {@code ChannelManager.clearARMCache()}
+     *       同级，确保退出登录时进程内所有用户态缓存全清。</li>
+     *   <li>{@code WKIM.init(context, uid, token)} —— 二次 init 通常意味着切号，
+     *       容错性地再清一次，避免 logout 路径被绕过时（如崩溃恢复）的残留。</li>
+     * </ul>
+     */
+    public void clearConvSyncSpaceCache() {
+        try {
+            int beforeSpace = spaceCacheSnapshot.spaceMap.size();
+            int beforeExt = spaceCacheSnapshot.externalMap.size();
+            spaceCacheSnapshot = new SpaceCacheSnapshot(new ConcurrentHashMap<>(), new ConcurrentHashMap<>(), false);
+            // 清空视为"没数据", 时间戳归零, 让诊断日志能区分"刚清空"与"从未加载".
+            spaceCacheRefreshedAt = 0L;
+            spaceCacheLoadedFromDisk = false;
+            coldStartSyncDone = false;
+            try {
+                com.xinbida.wukongim.diag.WKDiagWriter.write("MEMBERSHIP",
+                        "action=clear before=" + beforeSpace + "/" + beforeExt + " after=0/0");
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable t) {
+            WKLoggerUtils.getInstance().e(TAG, "clearConvSyncSpaceCache failed: " + t.getMessage());
+        }
+    }
+
+    private void loadSpaceCacheFromDisk() {
+        try {
+            android.content.Context ctx = WKIMApplication.getInstance().getContext();
+            if (ctx == null) return;
+            android.content.SharedPreferences prefs = ctx.getSharedPreferences(SPACE_PREFS_NAME, android.content.Context.MODE_PRIVATE);
+            String cachedUid = prefs.getString(PREF_KEY_UID, null);
+            String currentUid = WKIMApplication.getInstance().getUid();
+            if (cachedUid == null || !cachedUid.equals(currentUid)) {
+                clearSpaceCacheFromDisk();
+                return;
+            }
+            String spaceJson = prefs.getString(PREF_KEY_SPACE_MAP, null);
+            String extJson = prefs.getString(PREF_KEY_EXTERNAL_MAP, null);
+            if (spaceJson == null && extJson == null) return;
+            ConcurrentHashMap<String, String> spaceMap = new ConcurrentHashMap<>();
+            ConcurrentHashMap<String, String> extMap = new ConcurrentHashMap<>();
+            if (spaceJson != null) {
+                org.json.JSONObject obj = new org.json.JSONObject(spaceJson);
+                java.util.Iterator<String> keys = obj.keys();
+                while (keys.hasNext()) {
+                    String key = keys.next();
+                    spaceMap.put(key, obj.getString(key));
+                }
+            }
+            if (extJson != null) {
+                org.json.JSONObject obj = new org.json.JSONObject(extJson);
+                java.util.Iterator<String> keys = obj.keys();
+                while (keys.hasNext()) {
+                    String key = keys.next();
+                    extMap.put(key, obj.getString(key));
+                }
+            }
+            spaceCacheSnapshot = new SpaceCacheSnapshot(spaceMap, extMap,
+                    prefs.getBoolean(PREF_KEY_AUTHORITATIVE, false));
+            spaceCacheRefreshedAt = System.currentTimeMillis();
+            if (com.xinbida.wukongim.BuildConfig.DEBUG) {
+                android.util.Log.d("ConvSync", "[loadSpaceCacheFromDisk] spaceMap=" + spaceMap.size()
+                        + " externalMap=" + extMap.size());
+            }
+        } catch (Throwable t) {
+            WKLoggerUtils.getInstance().e(TAG, "loadSpaceCacheFromDisk failed: " + t.getMessage());
+        }
+    }
+
+    private void saveSpaceCacheToDisk(ConcurrentHashMap<String, String> spaceMap,
+                                      ConcurrentHashMap<String, String> extMap) {
+        try {
+            android.content.Context ctx = WKIMApplication.getInstance().getContext();
+            if (ctx == null) return;
+            org.json.JSONObject spaceObj = new org.json.JSONObject();
+            for (java.util.Map.Entry<String, String> e : spaceMap.entrySet()) {
+                spaceObj.put(e.getKey(), e.getValue());
+            }
+            org.json.JSONObject extObj = new org.json.JSONObject();
+            for (java.util.Map.Entry<String, String> e : extMap.entrySet()) {
+                extObj.put(e.getKey(), e.getValue());
+            }
+            String uid = WKIMApplication.getInstance().getUid();
+            boolean auth = spaceCacheSnapshot.authoritative;
+            ctx.getSharedPreferences(SPACE_PREFS_NAME, android.content.Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(PREF_KEY_UID, uid)
+                    .putBoolean(PREF_KEY_AUTHORITATIVE, auth)
+                    .putString(PREF_KEY_SPACE_MAP, spaceObj.toString())
+                    .putString(PREF_KEY_EXTERNAL_MAP, extObj.toString())
+                    .apply();
+        } catch (Throwable t) {
+            WKLoggerUtils.getInstance().e(TAG, "saveSpaceCacheToDisk failed: " + t.getMessage());
+        }
+    }
+
+    private void clearSpaceCacheFromDisk() {
+        try {
+            android.content.Context ctx = WKIMApplication.getInstance().getContext();
+            if (ctx == null) return;
+            ctx.getSharedPreferences(SPACE_PREFS_NAME, android.content.Context.MODE_PRIVATE)
+                    .edit()
+                    .clear()
+                    .apply();
+        } catch (Throwable t) {
+            WKLoggerUtils.getInstance().e(TAG, "clearSpaceCacheFromDisk failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * GH dmwork-android#251 Round-2：读 conv sync 写入的 group {@code space_id}。
+     *
+     * <p>{@code SpaceFilter.DEFAULT_PROVIDER.getChannelSpaceId} 在
+     * {@code channel.remoteExtraMap[space_id]} 没有值（channelInfo 还没水合 / 没回此字段）
+     * 时调用本方法做 fallback。channelInfo 水合后 remoteExtraMap 已含权威 space_id，
+     * 优先级自然回正。
+     *
+     * @return conv sync 缓存的 space_id，缺失时返回 {@code null}
+     */
+    @androidx.annotation.Nullable
+    public String getConvSyncSpaceId(String channelID) {
+        if (TextUtils.isEmpty(channelID)) return null;
+        ensureSpaceCacheLoaded();
+        SpaceCacheSnapshot snapshot = spaceCacheSnapshot;
+        String result = snapshot.spaceMap.get(channelID);
+        if (com.xinbida.wukongim.BuildConfig.DEBUG) {
+            android.util.Log.d("ConvSync", "[getConvSyncSpaceId] channelID=" + channelID
+                    + " result=" + result
+                    + " spaceMap.size=" + snapshot.spaceMap.size());
+        }
+        return result;
+    }
+
+    /**
+     * GH dmwork-android#251 Round-2：读 conv sync 写入的当前用户
+     * {@code my_source_space_id}。
+     *
+     * <p>{@code SpaceFilter.DEFAULT_PROVIDER.getMyMembershipSourceSpaceId} 在 member DB
+     * 还没 sync 到本地（{@code my-row-not-cached}）时调用本方法做 fallback；
+     * member DB 一旦补齐，优先读 member DB。
+     *
+     * @return conv sync 缓存的 my_source_space_id，缺失时返回 {@code null}
+     */
+    @androidx.annotation.Nullable
+    public String getConvSyncMySourceSpaceId(String channelID) {
+        if (TextUtils.isEmpty(channelID)) return null;
+        ensureSpaceCacheLoaded();
+        SpaceCacheSnapshot snapshot = spaceCacheSnapshot;
+        String result = snapshot.externalMap.get(channelID);
+        if (com.xinbida.wukongim.BuildConfig.DEBUG) {
+            android.util.Log.d("ConvSync", "[getConvSyncMySourceSpaceId] channelID=" + channelID
+                    + " result=" + result
+                    + " externalMap.size=" + snapshot.externalMap.size()
+                    + " spaceMap.contains=" + snapshot.spaceMap.containsKey(channelID));
+        }
+        return result;
+    }
+
+    public boolean isSpaceCacheAuthoritative() {
+        ensureSpaceCacheLoaded();
+        return spaceCacheSnapshot.authoritative;
+    }
+
+    /**
+     * <b>内部诊断 API — 请勿在业务代码中调用。</b>
+     *
+     * <p>仅供 Space 串消息排查期间 {@code SpaceFilter.diagLog} / {@code DiagSink} 写日志使用。
+     * 待 server PR #154 cross-space 诊断闭环上线、SpaceFilter 决策切换到 realtime msg
+     * payload 中的权威 space_id 后，本方法连同 {@link SpaceCacheStats} 会一并删除——
+     * 任何依赖这个 API 写业务的代码都会在那时编译失败。
+     *
+     * <p>诊断用: 返回 space cache 当前状态快照. 任意线程可调, 无锁(读 volatile 字段).
+     *
+     * @param channelID 要查询的频道 ID(可空). 非空时 {@link SpaceCacheStats#containsChannelId}
+     *                  反映 spaceMap 是否含有该 ID.
+     * @hide
+     */
+    @androidx.annotation.NonNull
+    @androidx.annotation.RestrictTo(androidx.annotation.RestrictTo.Scope.LIBRARY_GROUP_PREFIX)
+    public SpaceCacheStats getSpaceCacheStats(@androidx.annotation.Nullable String channelID) {
+        ensureSpaceCacheLoaded();
+        SpaceCacheSnapshot snap = spaceCacheSnapshot;
+        boolean contains = channelID != null && !channelID.isEmpty()
+                && snap.spaceMap.containsKey(channelID);
+        return new SpaceCacheStats(
+                snap.spaceMap.size(),
+                snap.externalMap.size(),
+                spaceCacheRefreshedAt,
+                snap.authoritative,
+                contains);
+    }
+
+    /**
+     * <b>内部诊断 DTO — 请勿在业务代码中引用。</b> 见 {@link #getSpaceCacheStats(String)} 注释,
+     * 与该方法同生命周期, 排查结束后一并删除.
+     *
+     * @hide
+     */
+    @androidx.annotation.RestrictTo(androidx.annotation.RestrictTo.Scope.LIBRARY_GROUP_PREFIX)
+    public static final class SpaceCacheStats {
+        /** 当前 spaceMap 条目数(我所在的群数, 含 my_source 关系). */
+        public final int spaceMapSize;
+        /** 当前 externalMap 条目数(我以外部成员身份加入的群数). */
+        public final int externalMapSize;
+        /** 最近一次 cache 替换/单条预填的 epoch ms. 0 = 从未刷新. */
+        public final long refreshedAt;
+        /** 当前 cache 是否是权威源(true 表示来自 space_memberships 全量响应). */
+        public final boolean authoritative;
+        /** 查询的 channelID 是否在 spaceMap 里. 调用时 channelID 为 null 则为 false. */
+        public final boolean containsChannelId;
+
+        SpaceCacheStats(int spaceMapSize, int externalMapSize, long refreshedAt,
+                        boolean authoritative, boolean containsChannelId) {
+            this.spaceMapSize = spaceMapSize;
+            this.externalMapSize = externalMapSize;
+            this.refreshedAt = refreshedAt;
+            this.authoritative = authoritative;
+            this.containsChannelId = containsChannelId;
+        }
+    }
+}

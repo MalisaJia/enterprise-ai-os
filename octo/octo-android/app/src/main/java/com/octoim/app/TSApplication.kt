@@ -1,0 +1,318 @@
+/*
+ * Copyright 2026-present OctoIM contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.octoim.app
+
+import android.app.Activity
+import android.app.ActivityManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.ContentResolver
+import android.content.Context
+import android.content.Intent
+import android.content.res.Configuration
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.Process
+import android.text.TextUtils
+import androidx.multidex.MultiDexApplication
+import com.chat.base.WKBaseApplication
+import com.chat.base.config.WKApiConfig
+import com.chat.base.config.WKConfig
+import com.chat.base.config.WKConstants
+import com.chat.base.config.WKSharedPreferencesUtil
+import com.chat.base.endpoint.EndpointManager
+import com.chat.base.ui.Theme
+import com.chat.base.utils.ActManagerUtils
+import com.chat.base.utils.WKPlaySound
+import com.chat.base.utils.WKTimeUtils
+import com.chat.base.utils.language.WKMultiLanguageUtil
+import com.chat.login.WKLoginApplication
+import com.chat.push.WKPushApplication
+import com.chat.scan.WKScanApplication
+import com.chat.uikit.TabActivity
+import com.chat.uikit.WKUIKitApplication
+import com.chat.uikit.chat.manager.WKIMUtils
+import com.chat.uikit.user.service.UserModel
+import kotlin.system.exitProcess
+
+class TSApplication : MultiDexApplication() {
+    override fun onCreate() {
+        super.onCreate()
+        val processName = getProcessName(this, Process.myPid())
+        if (processName != null) {
+            val defaultProcess = processName == getAppPackageName()
+            if (defaultProcess) {
+                initAll()
+                // Space 串消息排查: 启动初始上下文 dump. 仅当用户开启过诊断模式才会真正落盘
+                // (DiagSink.isEnabled() 内部 gate, 未开启即纳秒级 no-op).
+                logBootDiagnostics(processName)
+            }
+        }
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            override fun onActivityCreated(p0: Activity, p1: Bundle?) {
+            }
+
+            override fun onActivityStarted(p0: Activity) {
+            }
+
+            override fun onActivityResumed(p0: Activity) {
+                ActManagerUtils.getInstance().currentActivity = p0
+            }
+
+            override fun onActivityPaused(p0: Activity) {
+            }
+
+            override fun onActivityStopped(p0: Activity) {
+            }
+
+            override fun onActivitySaveInstanceState(p0: Activity, p1: Bundle) {
+            }
+
+            override fun onActivityDestroyed(p0: Activity) {
+            }
+        })
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (applicationContext != null && applicationContext.resources != null && applicationContext.resources.configuration != null && applicationContext.resources.configuration.uiMode != newConfig.uiMode) {
+            WKMultiLanguageUtil.getInstance().setConfiguration()
+            Theme.applyTheme()
+            killAppProcess()
+        }
+    }
+
+    private fun killAppProcess() {
+        ActManagerUtils.getInstance().clearAllActivity()
+        Process.killProcess(Process.myPid())
+        exitProcess(0)
+    }
+
+    override fun attachBaseContext(base: Context?) {
+        super.attachBaseContext(WKMultiLanguageUtil.getInstance().attachBaseContext(base))
+    }
+
+    private fun initAll() {
+        WKMultiLanguageUtil.getInstance().init(this)
+        WKBaseApplication.getInstance().init(getAppPackageName(), this)
+        Theme.applyTheme()
+        initApi()
+        WKLoginApplication.getInstance().init(this)
+        WKScanApplication.getInstance().init(this)
+        WKUIKitApplication.getInstance().init(this)
+        WKPushApplication.getInstance().init(getAppPackageName(), this)
+        addAppFrontBack()
+        addListener()
+        //  R2 fix (review): DebugTools class 不存在于任何 source,
+        // kian-dev 侧 引用的是未提交的本地 debug 工具类。
+        // backport 时要么折版 (debug only) 要么删掉; 选删掉以简化,
+        // 如果需要 debug 工具可以后续独立 PR 添加。
+        // DebugTools.init(this)
+    }
+
+    private fun initApi() {
+        var apiURL = WKSharedPreferencesUtil.getInstance().getSP("api_base_url")
+        if (TextUtils.isEmpty(apiURL)) {
+            apiURL = BuildConfig.API_BASE_URL
+            WKApiConfig.initBaseURL(apiURL)
+            WKApiConfig.baseWebUrl = BuildConfig.WEB_BASE_URL
+        } else {
+            WKApiConfig.initBaseURLIncludeIP(apiURL)
+        }
+        WKApiConfig.termsUrl = if (BuildConfig.TERMS_URL.isEmpty()) WKApiConfig.baseWebUrl + "user_agreement.html" else BuildConfig.TERMS_URL
+        WKApiConfig.privacyUrl = if (BuildConfig.PRIVACY_URL.isEmpty()) WKApiConfig.baseWebUrl + "privacy_policy.html" else BuildConfig.PRIVACY_URL
+    }
+
+    private fun getAppPackageName(): String {
+        return packageName  // 动态获取实际的 applicationId
+    }
+
+    private fun getProcessName(cxt: Context, pid: Int): String? {
+        val am = cxt.getSystemService(ACTIVITY_SERVICE) as ActivityManager
+        val runningApps = am.runningAppProcesses ?: return null
+        for (app in runningApps) {
+            if (app.pid == pid) {
+                return app.processName
+            }
+        }
+        return null
+    }
+
+    private fun addAppFrontBack() {
+        val helper = AppFrontBackHelper()
+        helper.register(this, object : AppFrontBackHelper.OnAppStatusListener {
+            override fun onFront() {
+                // 对齐 iOS appDidBecomeActive：App 回前台时强制清除当前会话残留 typing。
+                // 后台/断连期间 bot 真实回复经 conversation-sync 直接落库，不走收消息隐式清除，
+                // 故回前台需显式 reset。ChatActivity 不在前台时该 endpoint 未注册，invoke 为 no-op。
+                EndpointManager.getInstance().invoke("reset_typing_on_foreground", null)
+                if (!TextUtils.isEmpty(WKConfig.getInstance().token)) {
+                    if (WKBaseApplication.getInstance().disconnect) {
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            EndpointManager.getInstance()
+                                .invoke("chow_check_lock_screen_pwd", null)
+                        }, 1000)
+                    }
+                    WKIMUtils.getInstance().initIMListener()
+                    WKUIKitApplication.getInstance().startChat()
+                    UserModel.getInstance().getOnlineUsers()
+
+                }
+            }
+
+            override fun onBack() {
+                val result = EndpointManager.getInstance().invoke("rtc_is_calling", null)
+                var isCalling = false
+                if (result != null) {
+                    isCalling = result as Boolean
+                }
+                if (WKBaseApplication.getInstance().disconnect && !isCalling) {
+                    WKUIKitApplication.getInstance().stopConn()
+                }
+                WKIMUtils.getInstance().removeListener()
+                WKSharedPreferencesUtil.getInstance()
+                    .putLong("lock_start_time", WKTimeUtils.getInstance().currentSeconds)
+
+            }
+        })
+    }
+
+    private fun addListener() {
+        createNotificationChannel()
+        EndpointManager.getInstance().setMethod("main_show_home_view") { `object` ->
+            if (`object` != null) {
+                val from = `object` as Int
+                val intent = Intent(applicationContext, MainActivity::class.java)
+                intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_CLEAR_TASK or Intent.FLAG_ACTIVITY_NEW_TASK)
+                intent.putExtra("from", from)
+                startActivity(intent)
+            }
+            null
+        }
+        EndpointManager.getInstance().setMethod("show_tab_home") {
+            val intent = Intent(applicationContext, TabActivity::class.java)
+            intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            startActivity(intent)
+            null
+        }
+        EndpointManager.getInstance().setMethod("show_space_guide") {
+            val intent = Intent(applicationContext, SpaceGuideActivity::class.java)
+            intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            startActivity(intent)
+            null
+        }
+        EndpointManager.getInstance().setMethod("play_new_msg_Media") {
+            WKPlaySound.getInstance().playRecordMsg(R.raw.newmsg)
+            null
+        }
+    }
+
+
+    private fun createNotificationChannel() {
+        // Create the NotificationChannel, but only on API 26+ because
+        // the NotificationChannel class is new and not in the support library
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val name: CharSequence = applicationContext.getString(R.string.new_msg_notification)
+            val description = applicationContext.getString(R.string.new_msg_notification_desc)
+            val importance = NotificationManager.IMPORTANCE_DEFAULT
+            val channel = NotificationChannel(WKConstants.newMsgChannelID, name, importance)
+            channel.description = description
+            channel.enableVibration(true) //是否有震动
+            channel.setSound(
+                Uri.parse(ContentResolver.SCHEME_ANDROID_RESOURCE + "://" + applicationContext.packageName + "/" + R.raw.newmsg),
+                Notification.AUDIO_ATTRIBUTES_DEFAULT
+            )
+            // Register the channel with the system; you can't change the importance
+            // or other notification behaviors after this
+            val notificationManager = applicationContext.getSystemService(
+                NotificationManager::class.java
+            )
+            notificationManager.createNotificationChannel(channel)
+        }
+        createNotificationRTCChannel()
+    }
+
+    private fun createNotificationRTCChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val name: CharSequence = applicationContext.getString(R.string.new_rtc_notification)
+            val description = applicationContext.getString(R.string.new_rtc_notification_desc)
+            val importance = NotificationManager.IMPORTANCE_DEFAULT
+            val channel = NotificationChannel(WKConstants.newRTCChannelID, name, importance)
+            channel.description = description
+            channel.enableVibration(true)
+            channel.vibrationPattern = longArrayOf(0, 100, 100, 100, 100, 100)
+            channel.setSound(
+                Uri.parse(ContentResolver.SCHEME_ANDROID_RESOURCE + "://" + applicationContext.packageName + "/" + R.raw.newrtc),
+                Notification.AUDIO_ATTRIBUTES_DEFAULT
+            )
+            // Register the channel with the system; you can't change the importance
+            // or other notification behaviors after this
+            val notificationManager = applicationContext.getSystemService(
+                NotificationManager::class.java
+            )
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    /**
+     * Space 串消息排查: 启动时把决策上下文 dump 到诊断日志, 让我们 review 时不用问
+     * 用户"重启时 currentSpaceId 是什么".
+     *
+     * <p>DiagSink 内部 gate, 未开启诊断模式时这些调用是纳秒级 no-op, 不影响冷启动耗时.
+     */
+    private fun logBootDiagnostics(processName: String) {
+        try {
+            com.chat.base.utils.DiagSink.write(
+                "BOOT",
+                "process=" + processName +
+                    " sdk=" + Build.VERSION.SDK_INT +
+                    " device=" + Build.MANUFACTURER + "/" + Build.MODEL +
+                    " appPkg=" + getAppPackageName()
+            )
+        } catch (t: Throwable) {
+            // 防御性: BOOT 路径不能因诊断日志失败而崩
+        }
+        try {
+            val uid = WKConfig.getInstance().uid ?: ""
+            val currentSpaceId = com.chat.base.space.SpaceFilter.getCurrentSpaceId()
+            val currentSpaceName = com.chat.base.space.SpaceNameLookup.nameOf(currentSpaceId)
+            // appconfig 可能还未加载, 容错读
+            val sysBotsCount = try {
+                WKConfig.getInstance().appConfig?.system_bot_uids?.size ?: -1
+            } catch (t: Throwable) {
+                -1
+            }
+            com.chat.base.utils.DiagSink.write(
+                "BOOT",
+                "uid.len=" + uid.length +
+                    " currentSpaceId='" + currentSpaceId + "'" +
+                    " currentSpaceName='" + (currentSpaceName ?: "") + "'" +
+                    " systemBotsCount=" + sysBotsCount
+            )
+        } catch (t: Throwable) {
+            com.chat.base.utils.DiagSink.write(
+                "BOOT",
+                "read uid/space failed: " + t.javaClass.simpleName + ":" + t.message
+            )
+        }
+    }
+
+}

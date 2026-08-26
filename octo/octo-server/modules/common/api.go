@@ -1,0 +1,1257 @@
+package common
+
+import (
+	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/searchbackend"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+)
+
+// Common Common
+type Common struct {
+	ctx *config.Context
+	log.Log
+	db               *db
+	appConfigDB      *appConfigDB
+	systemSettings   *SystemSettings
+	readinessChecker readinessChecker
+	catalogReadiness func() error
+	threadOn         int // 缓存 DM_THREAD_ON 环境变量
+}
+
+// New New
+func New(ctx *config.Context) *Common {
+	var threadOn int
+	if t := strings.ToLower(os.Getenv("DM_THREAD_ON")); t == "true" || t == "1" {
+		threadOn = 1
+	}
+	database := newDB(ctx.DB())
+	// 启动期即解析内嵌表情清单:内嵌 JSON 若损坏会在此处 panic(fail-fast),而不是拖到首个
+	// 请求才暴露。sync.Once 在 panic 后也会标记 done,所以必须在启动期触发一次,否则线上会
+	// 出现"首请求 panic、之后返回零值 manifest/空 ETag"的退化。handler 仍调用它(此后为 no-op)。
+	loadEmojiManifest()
+	return &Common{
+		ctx:              ctx,
+		db:               database,
+		appConfigDB:      newAppConfigDB(ctx),
+		systemSettings:   EnsureSystemSettings(ctx),
+		readinessChecker: newDependencyReadinessChecker(ctx, database),
+		catalogReadiness: currentCardTemplateCatalogReadinessCheck(),
+		Log:              log.NewTLog("common"),
+		threadOn:         threadOn,
+	}
+}
+
+// SystemSettings exposes the shared admin-tunable settings reader for
+// callers that already hold a *Common. New consumers in other packages
+// should prefer common.EnsureSystemSettings(ctx) directly.
+func (cn *Common) SystemSettings() *SystemSettings {
+	return cn.systemSettings
+}
+
+// Route 路由配置
+func (cn *Common) Route(r *wkhttp.WKHttp) {
+	common := r.Group("/v1/common", cn.ctx.AuthMiddleware(r))
+	{
+		common.POST("/appversion", cn.addAppVersion)             // 添加APP版本
+		common.GET("/appversion/:os/:version", cn.getNewVersion) // 获取最新版本
+		common.GET("/appversion/list", cn.appVersionList)        // 版本列表
+		common.GET("/chatbg", cn.chatBgList)                     // 聊天背景列表
+		common.GET("/appmodule", cn.appModule)                   // app模块列表
+	}
+	commonNoAuth := r.Group("/v1/common")
+	{
+		commonNoAuth.GET("/countries", cn.countriesList)
+
+		commonNoAuth.GET("/appconfig", cn.appConfig) // app配置
+		// commonNoAuth.GET("/keepalive", cn.getKeepAliveVideo)   // 获取后台运行引导视频
+		commonNoAuth.GET("/updater/:os/:version", cn.updater)  // 版本更新检查（兼容tauri）
+		commonNoAuth.GET("/pcupdater/:os", cn.getPCNewVersion) // pc版本更新检查
+		commonNoAuth.GET("/changelog", cn.changelog)           // 版本更新日志（公开）
+		commonNoAuth.GET("/emojis", cn.emojiManifest)          // 内置自定义表情清单（公开，客户端动态渲染，见 emoji.go）
+	}
+
+	r.GET("/v1/health", cn.health)
+	r.GET("/v1/ready", cn.ready)
+
+	appConfigM, err := cn.insertAppConfigIfNeed()
+	if err != nil {
+		cn.Error("初始化应用配置失败", zap.Error(err))
+		panic(err)
+	}
+	if appConfigM == nil {
+		cn.Error("初始化应用配置返回空结果")
+		panic(errors.New("初始化应用配置返回空结果"))
+	}
+	// 设置系统私钥（支持加密存储，向后兼容明文）
+	privateKey, err := decryptKey(appConfigM.RSAPrivateKey)
+	if err != nil {
+		cn.Error("解密RSA私钥失败", zap.Error(err))
+		panic(err)
+	}
+	cn.ctx.GetConfig().AppRSAPrivateKey = privateKey
+	cn.ctx.GetConfig().AppRSAPubKey = appConfigM.RSAPublicKey
+
+	// 启动期校验:DB 已写入 login.local_off=1 但部署没有任何第三方登录
+	// 提供方,LocalLoginOff() 会自动回退为 false 避免锁死。把这个状态作为
+	// error 日志显式打出,让运维一眼能看到"开关写了但当前不生效"。
+	// 此处直接读 snapshot 是安全的:Load 刚刚完成,值就是 DB 当前值。
+	cn.systemSettings.LogLocalLoginOffSafetyOverrideIfActive(
+		cn.systemSettings.RawLocalLoginOffFromSnapshot())
+}
+
+// 获取后台运行引导视频
+func (cn *Common) getKeepAliveVideo(c *wkhttp.Context) {
+	videoName := c.Query("video_name")
+	if videoName == "" {
+		c.ResponseError(errors.New("视频名称不能为空"))
+		return
+	}
+
+	// Sanitize: extract base filename to prevent path traversal
+	videoName = filepath.Base(videoName)
+
+	// Validate file extension
+	if !strings.HasSuffix(strings.ToLower(videoName), ".mp4") {
+		c.ResponseError(errors.New("仅支持mp4格式"))
+		return
+	}
+
+	videoPath := filepath.Join("assets", "resources", "keepalive", videoName)
+
+	// Verify resolved path stays within the expected directory
+	absPath, err := filepath.Abs(videoPath)
+	if err != nil {
+		c.Writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	baseDir, err := filepath.Abs("assets/resources/keepalive")
+	if err != nil {
+		c.Writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if !strings.HasPrefix(absPath, baseDir+string(filepath.Separator)) {
+		c.ResponseError(errors.New("非法文件路径"))
+		return
+	}
+
+	c.Header("Content-Type", "video/mp4")
+	videoBytes, err := os.ReadFile(videoPath)
+	if err != nil {
+		cn.Error("视频不存在", zap.Error(err))
+		c.Writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if _, err = c.Writer.Write(videoBytes); err != nil {
+		cn.Error("写入视频数据失败", zap.Error(err))
+	}
+}
+
+// 获取pc最新版本
+func (cn *Common) getPCNewVersion(c *wkhttp.Context) {
+	os := c.Param("os")
+	tempOS := ""
+	if os == "latest-mac.yml" {
+		tempOS = "mac"
+	}
+	if os == "latest-linux.yml" {
+		tempOS = "linx"
+	}
+	if os == "latest.yml" {
+		tempOS = "windows"
+	}
+	model, err := cn.db.queryNewVersion(tempOS)
+	if err != nil {
+		cn.Error("查询最新版本错误", zap.Error(err))
+		c.ResponseError(errors.New("查询最新版本错误"))
+		return
+	}
+	if model == nil {
+		c.Status(http.StatusNoContent)
+		return
+	}
+	downloadURL := fmt.Sprintf("%s/%s", cn.ctx.GetConfig().External.APIBaseURL, model.DownloadURL)
+	c.JSON(http.StatusOK, gin.H{
+		"version":      model.AppVersion,
+		"path":         downloadURL,
+		"sha512":       model.Signature,
+		"releaseNotes": model.UpdateDesc,
+	})
+	// if os == "latest-mac.yml" || os == "latest-linux.yml" || os == "latest.yml" {
+
+	// }
+}
+func (cn *Common) updater(c *wkhttp.Context) {
+	os := c.Param("os")
+	oldVersion := c.Param("version")
+
+	model, err := cn.db.queryNewVersion(os)
+	if err != nil {
+		cn.Error("查询最新版本错误", zap.Error(err))
+		c.ResponseError(errors.New("查询最新版本错误"))
+		return
+	}
+	if model == nil || model.AppVersion == oldVersion {
+		c.Status(http.StatusNoContent)
+		return
+	}
+	if os == "latest-mac.yml" || os == "latest-linux.yml" || os == "latest.yml" {
+		c.JSON(http.StatusOK, gin.H{
+			"version":      model.AppVersion,
+			"path":         model.DownloadURL,
+			"sha512":       model.Signature,
+			"releaseNotes": model.UpdateDesc,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"url":       model.DownloadURL,
+		"version":   model.AppVersion,
+		"notes":     model.UpdateDesc,
+		"pub_date":  time.Time(model.UpdatedAt).Format("2006-01-02T15:04:05Z"),
+		"signature": model.Signature,
+	})
+}
+
+// 查询app模块
+func (cn *Common) appModule(c *wkhttp.Context) {
+	modules, err := cn.db.queryAppModule()
+	if err != nil {
+		cn.Error("查询所有app模块错误", zap.Error(err))
+		c.ResponseError(errors.New("查询所有app模块错误"))
+		return
+	}
+	list := make([]*appModuleResp, 0)
+	if len(modules) > 0 {
+		for _, module := range modules {
+			list = append(list, &appModuleResp{
+				SID:    module.SID,
+				Name:   module.Name,
+				Desc:   module.Desc,
+				Status: module.Status,
+			})
+		}
+	}
+	c.Response(list)
+}
+
+// 查询聊天背景列表
+func (cn *Common) chatBgList(c *wkhttp.Context) {
+	list, err := cn.db.queryChatBgs()
+	if err != nil {
+		cn.Error("查询所有聊天背景错误", zap.Error(err))
+		c.ResponseError(errors.New("查询所有聊天背景错误"))
+		return
+	}
+	resps := make([]*chatBgResp, 0)
+	if len(list) == 0 {
+		c.Response(resps)
+		return
+	}
+	for index, model := range list {
+		var lightColors = make([]string, 0)
+		var darkColors = make([]string, 0)
+		if model.IsSvg == 1 && index < len(defaultColorsLight) {
+			lightColors = defaultColorsLight[index]
+		}
+		if model.IsSvg == 1 && index < len(defaultColorsDark) {
+			darkColors = defaultColorsDark[index]
+		}
+		resps = append(resps, &chatBgResp{
+			Cover:       model.Cover,
+			Url:         model.Url,
+			IsSvg:       model.IsSvg,
+			LightColors: lightColors,
+			DarkColors:  darkColors,
+		})
+	}
+	c.Response(resps)
+}
+func (cn *Common) insertAppConfigIfNeed() (*appConfigModel, error) {
+
+	appConfigM, err := cn.appConfigDB.query()
+	if err != nil {
+		return nil, err
+	}
+	if appConfigM != nil {
+		return appConfigM, nil
+	}
+
+	privateKeyBuff := new(bytes.Buffer)
+	publicKeyBuff := new(bytes.Buffer)
+
+	bits := 2048
+	// 生成私钥文件
+	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
+	if err != nil {
+		return nil, err
+	}
+	derStream := x509.MarshalPKCS1PrivateKey(privateKey)
+	block := &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: derStream,
+	}
+	err = pem.Encode(privateKeyBuff, block)
+	if err != nil {
+		return nil, err
+	}
+	// 生成公钥文件
+	publicKey := &privateKey.PublicKey
+	derPkix, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		return nil, err
+	}
+	block = &pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: derPkix,
+	}
+	err = pem.Encode(publicKeyBuff, block)
+	if err != nil {
+		return nil, err
+	}
+
+	// Encrypt private key if master key is configured
+	encPrivateKey, err := encryptKey(privateKeyBuff.String())
+	if err != nil {
+		return nil, fmt.Errorf("encrypt private key: %w", err)
+	}
+
+	appConfigM = &appConfigModel{
+		RSAPrivateKey: encPrivateKey,
+		RSAPublicKey:  publicKeyBuff.String(),
+		Version:       1,
+		SuperToken:    util.GenerUUID(),
+		SuperTokenOn:  0,
+		SearchByPhone: 1,
+	}
+	err = cn.appConfigDB.insert(appConfigM)
+	return appConfigM, err
+}
+
+// boolToFlag normalises a bool getter result to the 0/1 int flag used by
+// existing appconfig JSON fields (phone_search_off, shortno_edit_off, ...).
+// Keeps the wire shape int across the response so frontend doesn't need a
+// special "boolean-or-int" decode path for one field.
+func boolToFlag(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func (cn *Common) appConfig(c *wkhttp.Context) {
+	versionStr := c.Query("version")
+	appConfigM, err := cn.appConfigDB.query()
+	if err != nil {
+		cn.Error("查询应用配置失败！", zap.Error(err))
+		c.ResponseError(errors.New("查询应用配置失败！"))
+		return
+	}
+	if appConfigM == nil {
+		cn.Error("应用配置为空")
+		c.ResponseError(errors.New("应用配置为空"))
+		return
+	}
+	versionI64, err := strconv.ParseInt(versionStr, 10, 64)
+	if err != nil && versionStr != "" {
+		cn.Warn("解析版本号失败", zap.String("version", versionStr), zap.Error(err))
+	}
+	// 消息搜索开关：search_enabled / messages_search_on 同源同值。前者保留向后兼容，
+	// 后者是收敛后的真源 key（与 octo-web ChannelSearch、octo-admin messages_search
+	// 命名一致）。两个分支共用同一计算结果，避免 Resolve 被调用多次。
+	searchEnabled := searchbackend.Resolve(cn.ctx.GetConfig().ZincSearch.SearchOn).SearchEnabled()
+	octoAssistantUIDs := parseOctoAssistantUIDs()
+	messageReaction := buildMessageReactionCapability(
+		cn.systemSettings.MessageReactionReadEnabled(),
+		cn.systemSettings.MessageReactionWriteEnabled(),
+	)
+	if versionI64 != 0 && int(versionI64) >= appConfigM.Version {
+		c.JSON(http.StatusOK, &appConfigResp{
+			Version:                appConfigM.Version,
+			SystemBotUIDs:          spacepkg.SystemBotList(),
+			LocalLoginOff:          boolToFlag(cn.systemSettings.LocalLoginOff()),
+			ScanLoginEnabled:       cn.systemSettings.ScanLoginEnabled(),
+			DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
+			SearchEnabled:          searchEnabled,
+			MessagesSearchOn:       searchEnabled,
+			StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
+			StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
+			DocsOn:                 cn.systemSettings.DocsEnabled(),
+			DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
+			DriveOn:                cn.systemSettings.DriveEnabled(),
+			MailOn:                 cn.systemSettings.MailEnabled(),
+			DmloopOn:               cn.systemSettings.DmloopEnabled(),
+			DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
+			TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
+			OctoAssistantUIDs:      octoAssistantUIDs,
+			MessageReaction:        messageReaction,
+			// Sticker 上限:短路分支同样下发,让老客户端在管理台放宽/收窄后
+			// 也能立刻拿到最新值。
+			StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
+		})
+		return
+	}
+	var phoneSearchOff int
+	var shortnoEditOff int
+	var revokeSecond int
+	if cn.ctx.GetConfig().PhoneSearchOff {
+		phoneSearchOff = 1
+	}
+	if cn.ctx.GetConfig().ShortNo.EditOff {
+		shortnoEditOff = 1
+	}
+	if appConfigM.RevokeSecond == 0 {
+		revokeSecond = -1
+	} else {
+		revokeSecond = appConfigM.RevokeSecond
+	}
+
+	c.JSON(http.StatusOK, &appConfigResp{
+		Version:                        appConfigM.Version,
+		PhoneSearchOff:                 phoneSearchOff,
+		ShortnoEditOff:                 shortnoEditOff,
+		WebURL:                         cn.ctx.GetConfig().External.WebLoginURL,
+		RevokeSecond:                   revokeSecond,
+		RegisterInviteOn:               appConfigM.RegisterInviteOn,
+		SendWelcomeMessageOn:           appConfigM.SendWelcomeMessageOn,
+		InviteSystemAccountJoinGroupOn: appConfigM.InviteSystemAccountJoinGroupOn,
+		RegisterUserMustCompleteInfoOn: appConfigM.RegisterUserMustCompleteInfoOn,
+		CanModifyApiUrl:                appConfigM.CanModifyApiUrl,
+		ThreadOn:                       cn.threadOn,
+		DestroyCoolingOffDays:          destroyCoolingOffDaysOrDefault(appConfigM.DestroyCoolingOffDays),
+		OIDCAccountURL:                 oidcAccountURL(),
+		OIDCResetPasswordURL:           oidcResetPasswordURL(),
+		OIDCProviders:                  oidcProviders(),
+		// YUJ-219-A / GH#1283：单一真源下发系统 Bot UID 列表，替代三端硬编码。
+		SystemBotUIDs:          spacepkg.SystemBotList(),
+		LocalLoginOff:          boolToFlag(cn.systemSettings.LocalLoginOff()),
+		ScanLoginEnabled:       cn.systemSettings.ScanLoginEnabled(),
+		DisableUserCreateSpace: boolToFlag(cn.systemSettings.SpaceDisableUserCreate()),
+		SearchEnabled:          searchEnabled,
+		MessagesSearchOn:       searchEnabled,
+		StickerCustomEnabled:   cn.systemSettings.StickerCustomEnabled(),
+		StickerHandleRequired:  cn.systemSettings.StickerHandleRequired(),
+		DocsOn:                 cn.systemSettings.DocsEnabled(),
+		DocsSearchOn:           cn.systemSettings.DocsSearchEnabled(),
+		DriveOn:                cn.systemSettings.DriveEnabled(),
+		MailOn:                 cn.systemSettings.MailEnabled(),
+		DmloopOn:               cn.systemSettings.DmloopEnabled(),
+		DmpersonalOn:           cn.systemSettings.DmpersonalEnabled(),
+		TrackingEnabled:        cn.systemSettings.TrackingEnabled(),
+		OctoAssistantUIDs:      octoAssistantUIDs,
+		MessageReaction:        messageReaction,
+		// Sticker 上限:客户端本地预校验用,兜底仍在服务端 modules/file 侧。
+		StickerUploadLimits: buildStickerUploadLimitsResp(cn.systemSettings),
+	})
+}
+
+func buildMessageReactionCapability(read, write bool) messageReactionCapabilityResp {
+	return messageReactionCapabilityResp{Read: read, Write: write}
+}
+
+// buildStickerUploadLimitsResp 从 SystemSettings 派生一份 stickerUploadLimitsResp
+// 快照。两个 handler 分支(version-shortcut / full-refresh)都用它,避免字段
+// 组装漂移。SystemSettings.StickerUpload* getter 各自内部已做 hard-cap clamp,
+// 拿到的都是安全值。
+func buildStickerUploadLimitsResp(s *SystemSettings) stickerUploadLimitsResp {
+	return stickerUploadLimitsResp{
+		MaxSizeKB:      s.StickerUploadMaxSizeKB(),
+		MaxDimension:   s.StickerUploadMaxDimension(),
+		AllowedFormats: s.StickerUploadAllowedFormats(),
+	}
+}
+
+// parseOctoAssistantUIDs 从 env DM_OCTO_ASSISTANT_UIDS 解析 Octo Assistant UID
+// 列表。逗号分隔,过滤空串。env 未设或为空时返回空切片(不是 nil,保证 JSON
+// 序列化为 [] 而非 null,前端 Array.isArray 判断一致)。
+//
+// 与 DM_OIDC_* 系列 env 同形态:运维在部署清单里配 UID 列表,后端作为单一真源
+// 通过 appconfig 下发,前端据此判别 octo_assistant_opened vs app_opened 事件。
+func parseOctoAssistantUIDs() []string {
+	raw := os.Getenv("DM_OCTO_ASSISTANT_UIDS")
+	if raw == "" {
+		return []string{}
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// oidcProviders 返回 OIDC provider 元数据数组,让前端不再硬编码 provider id/name/authorize_path。
+//
+// 单 provider 设计期下数组长度恒为 0 或 1:OIDC 启用时返回一个元素;关闭则空数组。
+// 用 omitempty 让关闭状态下整个字段从 JSON 里消失,与现有 oidc_account_url 保持一致。
+//
+// 字段来源:
+//   - id   : DM_OIDC_PROVIDER_ID (默认 "oidc"),与 oidc 模块路由路径段保持一致
+//   - name : DM_OIDC_PROVIDER_NAME (默认 "SSO"),前端用于按钮/菜单文案
+//   - authorize_path : 由 id 拼出 /v1/auth/oidc/<id>/authorize
+//   - account_url / reset_password_url : 复用顶层老字段的取值逻辑
+func oidcProviders() []oidcProviderResp {
+	if !oidcEnabled() {
+		return nil
+	}
+	id := os.Getenv("DM_OIDC_PROVIDER_ID")
+	if id == "" || !providerIDRe.MatchString(id) {
+		// 与 oidc 模块 LoadConfig 同义:非法 ID 视为未配置,回退到默认值,
+		// 避免畸形值进 authorize_path 把前端引到不存在的路由。
+		id = "oidc"
+	}
+	name := os.Getenv("DM_OIDC_PROVIDER_NAME")
+	if name == "" {
+		name = "SSO"
+	}
+	return []oidcProviderResp{{
+		ID:               id,
+		Name:             name,
+		AuthorizePath:    "/v1/auth/oidc/" + id + "/authorize",
+		AccountURL:       oidcAccountURL(),
+		ResetPasswordURL: oidcResetPasswordURL(),
+	}}
+}
+
+// providerIDRe 与 oidc/config.go 保持一致,避免 common 模块反向依赖 oidc 包。
+// 两处同一来源是 ops env,语义统一即可。
+var providerIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// oidcAccountURL 返回 OIDC 账户中心首页 URL，仅在 OIDC 启用时下发。
+//
+// 优先级:DM_OIDC_ACCOUNT_URL  >  DM_OIDC_PROVIDER_ISSUER  >  DM_OIDC_AEGIS_ISSUER。
+// 多数标准 OIDC IdP（Aegis/Keycloak/...）的 issuer 即账户首页，可省一份配置；
+// AEGIS_ISSUER 是过渡 alias，迁移完成后随 oidc 模块同步删除。
+func oidcAccountURL() string {
+	if !oidcEnabled() {
+		return ""
+	}
+	if v := os.Getenv("DM_OIDC_ACCOUNT_URL"); v != "" {
+		return v
+	}
+	if v := os.Getenv("DM_OIDC_PROVIDER_ISSUER"); v != "" {
+		return v
+	}
+	return os.Getenv("DM_OIDC_AEGIS_ISSUER")
+}
+
+// oidcResetPasswordURL 返回 OIDC 修改/重置密码 URL，仅在 OIDC 启用时下发。
+// issuer 不一定等于重置密码页，这里不做回退，缺省即不下发，前端隐藏对应入口。
+func oidcResetPasswordURL() string {
+	if !oidcEnabled() {
+		return ""
+	}
+	return os.Getenv("DM_OIDC_RESET_PASSWORD_URL")
+}
+
+// oidcEnabled reports whether OIDC is intended to be on. Parsing must match
+// modules/oidc/config.go:getBool (strconv.ParseBool) byte-for-byte and stay
+// in lockstep with isOIDCFullyConfigured in system_settings.go — diverging
+// here causes a front-end lockout where local_login_off=1 hides the local
+// card while oidc_providers / oidc_account_url are silently omitted because
+// this function rejects spellings like "T" or "True" that the OIDC module
+// itself accepts. See PR #104 P0 (Jerry-Xin).
+func oidcEnabled() bool {
+	v := os.Getenv("DM_OIDC_ENABLED")
+	if v == "" {
+		return false
+	}
+	enabled, err := strconv.ParseBool(v)
+	return err == nil && enabled
+}
+
+// 兼容历史 app_config 行（NOT NULL DEFAULT 7 在迁移前的行为）：值 ≤ 0 时回退为 7。
+func destroyCoolingOffDaysOrDefault(v int) int {
+	if v > 0 {
+		return v
+	}
+	return 7
+}
+
+func (cn *Common) countriesList(c *wkhttp.Context) {
+	c.JSON(http.StatusOK, Countrys())
+}
+
+// 添加app版本
+//
+// 发版会设置客户端的下载来源（DownloadURL），属供应链敏感写操作，因此要求
+// superAdmin —— 普通 admin 定位为只读运营位，不应能改动全体用户的客户端来源。
+// 路由仍保留在 /v1/common（历史调用方依赖），仅收紧角色门槛。
+// 拒绝路径走 i18n 信封并返回通用 403（ErrSharedForbidden），不泄露"需要更高
+// 角色"的具体原因（反枚举），与 space 管理端的 requireSuperAdmin 保持一致。
+func (cn *Common) addAppVersion(c *wkhttp.Context) {
+	if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+		httperr.ResponseErrorL(c, errcode.ErrSharedForbidden, nil, nil)
+		return
+	}
+	var req appVersionReq
+	if err := c.BindJSON(&req); err != nil {
+		c.ResponseError(errors.New("请求数据格式有误！"))
+		return
+	}
+	if err := cn.check(req); err != nil {
+		c.ResponseError(err)
+		return
+	}
+	_, err := cn.db.insertAppVersion(&appVersionModel{
+		AppVersion:  req.AppVersion,
+		OS:          req.OS,
+		IsForce:     req.IsForce,
+		UpdateDesc:  req.UpdateDesc,
+		DownloadURL: req.DownloadURL,
+		Signature:   req.Signature,
+	})
+	if err != nil {
+		cn.Error("添加更新记录错误", zap.Error(err))
+		c.ResponseError(errors.New("添加更新记录错误"))
+		return
+	}
+	c.ResponseOK()
+}
+
+// 获取最新版本
+func (cn *Common) getNewVersion(c *wkhttp.Context) {
+	os := c.Param("os")
+	version := c.Param("version")
+	if os == "" {
+		c.ResponseError(errors.New("平台类型不能为空"))
+		return
+	}
+	if version == "" {
+		c.ResponseError(errors.New("版本号不能为空"))
+		return
+	}
+	model, err := cn.db.queryNewVersion(os)
+	if err != nil {
+		cn.Error("查询最新版本错误", zap.Error(err))
+		c.ResponseError(errors.New("查询最新版本错误"))
+		return
+	}
+	if model == nil || model.AppVersion == version {
+		c.Response(map[string]interface{}{})
+		return
+	}
+	c.Response(&appVersionResp{
+		AppVersion:  model.AppVersion,
+		OS:          model.OS,
+		DownloadURL: model.DownloadURL,
+		IsForce:     model.IsForce,
+		UpdateDesc:  model.UpdateDesc,
+		CreatedAt:   model.CreatedAt.String(),
+	})
+}
+
+// 查询总记录
+func (cn *Common) appVersionList(c *wkhttp.Context) {
+	err := c.CheckLoginRole()
+	if err != nil {
+		c.ResponseError(err)
+		return
+	}
+	pageIndex, pageSize := c.GetPage()
+	list, err := cn.db.queryAppVersionListWithPage(uint64(pageSize), uint64(pageIndex))
+	if err != nil {
+		cn.Error("查询版本列表错误", zap.Error(err))
+		c.ResponseError(errors.New("查询版本列表错误"))
+		return
+	}
+	count, err := cn.db.queryCount()
+	if err != nil {
+		cn.Error("查询总数量错误", zap.Error(err))
+		c.ResponseError(errors.New("查询总数量错误"))
+		return
+	}
+	resps := make([]*appVersionResp, 0)
+	if len(list) == 0 {
+		c.Response(map[string]interface{}{
+			"count": count,
+			"list":  resps,
+		})
+		return
+	}
+
+	for _, model := range list {
+		resps = append(resps, &appVersionResp{
+			AppVersion:  model.AppVersion,
+			OS:          model.OS,
+			IsForce:     model.IsForce,
+			UpdateDesc:  model.UpdateDesc,
+			DownloadURL: model.DownloadURL,
+			CreatedAt:   model.CreatedAt.String(),
+		})
+	}
+	c.Response(map[string]interface{}{
+		"count": count,
+		"list":  resps,
+	})
+}
+
+// changelog 公开版本更新日志
+func (cn *Common) changelog(c *wkhttp.Context) {
+	list, err := cn.db.queryAppVersionListWithPage(200, 1)
+	if err != nil {
+		cn.Error("查询版本列表错误", zap.Error(err))
+		c.ResponseError(errors.New("查询版本列表错误"))
+		return
+	}
+	resps := make([]*appVersionResp, 0, len(list))
+	for _, model := range list {
+		resps = append(resps, &appVersionResp{
+			AppVersion:  model.AppVersion,
+			OS:          model.OS,
+			IsForce:     model.IsForce,
+			UpdateDesc:  model.UpdateDesc,
+			DownloadURL: model.DownloadURL,
+			CreatedAt:   model.CreatedAt.String(),
+		})
+	}
+	c.Response(resps)
+}
+
+func (cn *Common) check(req appVersionReq) error {
+	if req.AppVersion == "" {
+		return errors.New("请输入版本号")
+	}
+	if req.UpdateDesc == "" {
+		return errors.New("请输入更新说明")
+	}
+	if req.OS == "" {
+		return errors.New("请输入升级平台")
+	}
+	if req.OS == "android" && req.DownloadURL == "" {
+		return errors.New("Android平台请传入下载地址")
+	}
+	return nil
+}
+
+type appModuleResp struct {
+	SID    string `json:"sid"`
+	Name   string `json:"name"`
+	Desc   string `json:"desc"`
+	Status int    `json:"status"` // 模块状态 1.可选 0.不可选 2.选中不可编辑
+}
+
+type chatBgResp struct {
+	Cover       string   `json:"cover"`
+	Url         string   `json:"url"`
+	IsSvg       int      `json:"is_svg"`
+	LightColors []string `json:"light_colors"`
+	DarkColors  []string `json:"dark_colors"`
+}
+
+type appConfigResp struct {
+	Version                        int    `json:"version"`
+	WebURL                         string `json:"web_url"`
+	PhoneSearchOff                 int    `json:"phone_search_off"`
+	ShortnoEditOff                 int    `json:"shortno_edit_off"`
+	RevokeSecond                   int    `json:"revoke_second"`
+	AppleSignIn                    int    `json:"apple_sign_in"`
+	RegisterInviteOn               int    `json:"register_invite_on"`                  // 开启注册邀请机制
+	SendWelcomeMessageOn           int    `json:"send_welcome_message_on"`             // 开启注册登录发送欢迎语
+	InviteSystemAccountJoinGroupOn int    `json:"invite_system_account_join_group_on"` // 开启系统账号加入群聊
+	RegisterUserMustCompleteInfoOn int    `json:"register_user_must_complete_info_on"` // 注册用户必须填写完整信息
+	CanModifyApiUrl                int    `json:"can_modify_api_url"`                  // 允许修改api地址
+	ThreadOn                       int    `json:"thread_on"`                           // 子区功能开关
+	DestroyCoolingOffDays          int    `json:"destroy_cooling_off_days"`            // 注销冷静期天数（默认 7）
+	OIDCAccountURL                 string `json:"oidc_account_url,omitempty"`          // OIDC 账户中心首页 URL（保留兼容老前端，新前端读 oidc_providers[].account_url）
+	OIDCResetPasswordURL           string `json:"oidc_reset_password_url,omitempty"`   // OIDC 修改/重置密码 URL（保留兼容老前端）
+	// OIDCProviders 单 provider 元数据数组（本期长度 ≤ 1）。让前端不再硬编码 provider id/name/authorize_path，
+	// 接入新 IdP 时只改部署 env 即可。OIDC 关闭时整个字段被 omitempty 隐去。
+	OIDCProviders []oidcProviderResp `json:"oidc_providers,omitempty"`
+
+	// SystemBotUIDs 下发系统 Bot UID 列表（目前 botfather / u_10000 / fileHelper）。
+	//
+	// 背景 (YUJ-219-A / GH#1283，对应 analysis-report.md §4.2)：
+	// 三端（Android / iOS / Web）原先各自硬编码系统 Bot 集合，跨端漂移：
+	//   - 后端 pkg/space/query.go :: SystemBots = {botfather, u_10000, fileHelper}
+	//   - Android ChatActivity.SYSTEM_BOTS = {"botfather"}    ← 漏 u_10000 / fileHelper
+	//   - iOS 仅用 WKApp.config.botfatherUID                  ← 也只有 botfather
+	// 结果：Android 端点开 u_10000 / fileHelper 时本地 filter 完全失效，
+	// 跨 Space 历史消息全量暴露。
+	//
+	// 解法：后端作为单一真源通过 appconfig 下发 SystemBotUIDs；各端启动时
+	// 消费此字段并替换硬编码常量，保持与后端 SystemBotList() 完全一致。
+	// 未来系统 Bot 列表调整（加新 Bot / 改名）只需改后端，无需同步三端。
+	SystemBotUIDs []string `json:"system_bot_uids"`
+
+	// LocalLoginOff 控制前端是否隐藏"本地账号登录"卡片（用户名 / 手机号 / 邮箱
+	// 三种本地登录方式的统一开关）。值来源于 system_setting login.local_off，
+	// 默认 0；为 1 时前端只渲染 SSO/第三方登录入口。
+	//
+	// 与 app_config.version 解耦：即使客户端命中 version 短路分支，也必须能拿到
+	// 最新值，否则 admin 切换开关后老客户端会被本地缓存住。和 SystemBotUIDs 同理。
+	LocalLoginOff int `json:"local_login_off"`
+
+	// ScanLoginEnabled is the client-facing view of login.scan_enabled. Unlike
+	// a display-only toggle, the same setting is enforced by every server-side
+	// scan-login entry point. It is deliberately present in both appconfig
+	// branches so an app_config version cache cannot hide a live policy change.
+	ScanLoginEnabled bool `json:"scan_login_enabled"`
+
+	// DisableUserCreateSpace 控制客户端是否隐藏「创建空间」入口。
+	// 来源 system_setting space.disable_user_create,回退到 env
+	// DM_SPACE_DISABLE_USER_CREATE,默认 0(允许创建)。
+	//
+	// 与 app_config.version 解耦的原因同 LocalLoginOff：admin 在管理台 toggle
+	// 后老客户端命中 version 短路分支仍必须看到最新值，否则被本地缓存住失去
+	// 实时性。后端 POST /v1/space/create 也走同一个 getter 校验,客户端隐藏
+	// 与服务端拒绝由单一真源驱动,不存在前后端漂移。
+	DisableUserCreateSpace int `json:"disable_user_create_space"`
+
+	// SearchEnabled 告知客户端当前部署是否启用消息搜索（OCTO_SEARCH_BACKEND
+	// != disabled）。为 false 时前端应隐藏搜索入口，而不是每次调用搜索接口
+	// 再吃一个 SEARCH_DISABLED 错误（YUJ-4667 步骤 2 / YUJ-4662 §7-#10）。
+	//
+	// 与 app_config.version 解耦的原因同 LocalLoginOff / DisableUserCreateSpace：
+	// 运维切 backend 后老客户端命中 version 短路分支也必须拿到最新值。
+	SearchEnabled bool `json:"search_enabled"`
+
+	// MessagesSearchOn 与 SearchEnabled 同源同值，是消息搜索功能开关下发给前端
+	// 的「收敛后」key。Web 端 (octo-web ChannelSearch) 读 messages_search_on，
+	// 与 octo-admin 的 messages_search 命名保持一致；旧端仍读 search_enabled。
+	// 两字段并存：search_enabled 保留作向后兼容，messages_search_on 为新真源 key。
+	// 下发 bool，前端 parseRemoteBool(true) 即可正确开关，无需 0/1 特判。
+	MessagesSearchOn bool `json:"messages_search_on"`
+
+	// StickerCustomEnabled 告知客户端是否展示自定义贴纸管理入口。值来源于
+	// system_setting sticker.custom_enabled；默认 false,便于新能力先隐藏、再从
+	// 管理台灰度放开。本字段只表达展示策略，不改变 /v1/sticker/user 的服务端权限。
+	//
+	// 与 app_config.version 解耦的原因同 LocalLoginOff / SearchEnabled：运维切展示
+	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
+	StickerCustomEnabled bool `json:"sticker_custom_enabled"`
+
+	// StickerHandleRequired 告知客户端：新增自定义贴纸（POST /v1/sticker/user）时是否
+	// 必须携带上传句柄 handle（即 /v1/file/upload?type=sticker 返回的 sticker_handle）。
+	// 值来源于 system_setting sticker.handle_required（SystemSettings.StickerHandleRequired），
+	// 与签名「能力」OCTO_MASTER_KEY 解耦——master key 在场不代表强制带 handle，避免老客户端被
+	// 隐式打挂（P0: Sticker Handle Enforcement Rollout）。为 true 时客户端必须先上传拿
+	// sticker_handle 再注册；为 false（兼容期/默认）客户端可不带，服务端暂放行并观测。
+	// 放 system_setting 而非 env 的原因：策略可在管理台热切、60s 多实例收敛、免重启回滚。
+	//
+	// 与 app_config.version 解耦的原因同 LocalLoginOff / SearchEnabled：运维切策略后老
+	// 客户端命中 version 短路分支也必须拿到最新值，否则被本地缓存住失去实时性，故两个
+	// 分支都下发。
+	StickerHandleRequired bool `json:"sticker_handle_required"`
+
+	// DocsOn 告知客户端是否展示文档(docs)模块入口。值来源于 system_setting
+	// docs.enabled；默认 false —— 新增的 octo-docs-backend 服务尚未上线，先隐藏入口，
+	// 上线后由管理台切 docs.enabled 灰度放开。本字段只表达展示策略，不承担服务端鉴权。
+	//
+	// 与 app_config.version 解耦的原因同 LocalLoginOff / SearchEnabled：运维切展示
+	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
+	DocsOn bool `json:"docs_on"`
+
+	// DocsSearchOn 告知客户端是否展示云文档全文搜索。值来源于 system_setting
+	// docs.search_enabled；默认 false —— 与 docs_on 解耦，搜索端点由 octo-docs-backend
+	// 独立提供，可晚于 docs 模块上线，上线+索引就绪后才放量。仅表达展示策略，鉴权
+	// 在 octo-docs-backend 自身，本字段不承担鉴权。与 app_config.version 解耦的原因同 DocsOn。
+	DocsSearchOn bool `json:"docs_search_on"`
+
+	// DriveOn 告知客户端是否展示网盘(drive)模块入口。值来源于 system_setting
+	// drive.enabled；默认 false —— 独立部署的 octo-drive 服务尚未上线，先隐藏入口，
+	// 上线后由管理台切 drive.enabled 灰度放开。只表达展示策略，服务端鉴权在 octo-drive
+	// 自身，本字段不承担任何鉴权。与 app_config.version 解耦的原因同 DocsOn：运维切展示
+	// 策略后老客户端命中 version 短路分支也必须拿到最新值，故两个分支都下发。
+	DriveOn bool `json:"drive_on"`
+
+	// MailOn 告知客户端是否展示 Agent Mail 模块入口。值来源于 system_setting
+	// mail.enabled，默认 false。该字段只表达展示策略，不替代 octo-server 网关及
+	// octo-mail 的身份、Space 和邮箱权限校验。两个 appconfig 分支均下发该字段，
+	// 避免 app_config.version 缓存阻止开关及时生效。
+	MailOn bool `json:"mail_on"`
+
+	// dmloop.enabled / dmpersonal.enabled；默认 false —— loop(回路)与「我的/运行时」入口在
+	// 后端服务就绪前先隐藏,上线后由管理台切对应 system_setting 灰度放开。两者分开:
+	// 「我的」将重设计脱离 loop、可独立放量。只表达展示策略,不承担服务端鉴权。与 app_config.version
+	// 解耦(同 DocsOn):运维切策略后老客户端命中 version 短路分支也须拿到最新值,故两分支都下发。
+	DmloopOn     bool `json:"dmloop_on"`
+	DmpersonalOn bool `json:"dmpersonal_on"`
+
+	// TrackingEnabled 告知客户端是否开启前端埋点(octo-dap)采集。值来源于 system_setting
+	// tracking.enabled；默认 false —— 埋点层随发布上线但静默(fail-closed)，octo-web 只有拿到
+	// 此字段为真才开始采集。collector 与 TRACK_API_URL egress 在集群内验证通过前运维保持关闭。
+	// 只表达采集策略，不承担服务端鉴权(collector 自身鉴权)。与 app_config.version 解耦的原因
+	// 同 DocsOn：运维切策略后老客户端命中 version 短路分支也须拿到最新值，故两分支都下发。
+	TrackingEnabled bool `json:"tracking_enabled"`
+
+	// OctoAssistantUIDs 下发 Octo Assistant 的 UID 列表，供前端判别当前打开的
+	// 应用 bot 是否为 Octo Assistant（YUJ-277 / octo-dap S3 埋点）。前端根据此
+	// 列表决定发 octo_assistant_opened 还是 app_opened 事件。
+	//
+	// 来源：env DM_OCTO_ASSISTANT_UIDS（逗号分隔），解析时过滤空串。默认 []
+	// （env 未设或为空）。与 app_config.version 解耦的原因同 TrackingEnabled：
+	// 运维调整 UID 列表后老客户端命中 version 短路分支也必须拿到最新值，故两个
+	// 分支都下发。
+	OctoAssistantUIDs []string `json:"octo_assistant_uids"`
+
+	// MessageReaction is the deployment-wide default capability for ordinary
+	// Web/iOS/Android clients. It is intentionally identity-agnostic because
+	// /v1/common/appconfig is public; Bot-specific overrides belong to the
+	// authenticated Bot profile contract.
+	MessageReaction messageReactionCapabilityResp `json:"message_reaction"`
+
+	// StickerUploadLimits 是自定义贴纸上传的操作端可调上限，与 sticker.upload_*
+	// system_setting 同源（SystemSettings.StickerUpload{MaxSizeKB,MaxDimension,
+	// AllowedFormats}）。用途：让客户端在选图后本地预校验（提示"最大 X MB / 最长
+	// Y px / 支持 gif/png..."），避免大图/非法扩展名先跑完 HTTP 上传才被服务端拒
+	// —— 尤其对移动端流量友好。
+	//
+	// 客户端预校验只是 UX 优化；服务端 modules/file 侧仍对每个 sticker upload
+	// 请求做同一份 stickerLimits 快照兜底（size/format/dimension 三层），客户端
+	// 缓存过期或被绕过都不影响安全边界。默认值与 PR #544 之前的历史硬编码严格
+	// 等价（1024 KB / 512 px / [.gif,.png,.jpg,.jpeg,.webp]），运营不动 knob
+	// 时行为完全无回归。
+	//
+	// 与 app_config.version 解耦的原因同 StickerHandleRequired / DocsOn：运维在
+	// 管理台放宽/收窄上限后，老客户端命中 version 短路分支也必须拿到最新值，否则
+	// 被本地缓存住失去实时性，故两个分支都下发。
+	//
+	// 独立命名空间（不叫 sticker_upload_*）的原因：三个字段是一组"上限"，一起
+	// 生效、一起提示；单独包一层让客户端解析和展示逻辑天然聚合，未来若加非上限
+	// 类的 sticker upload 字段（例如上传行为 toggle）也不会污染这个 object。
+	// 现有的 sticker_custom_enabled / sticker_handle_required 是平铺 bool，形态
+	// 与 limits object 差异明显，风格分裂可接受；语义相近的字段（同为 upload
+	// 上限）优先聚合，与 OIDCProviders 这类 nested resp 同思路。
+	//
+	// 不下发压缩相关 knob（compress_enabled / compress_target_kb /
+	// compress_max_concurrency / compress_timeout_ms）—— 这些是服务端"影子"参数，
+	// 响应字段结构不变、无对应客户端行为，曝光只会泄露实现细节。
+	StickerUploadLimits stickerUploadLimitsResp `json:"sticker_upload_limits"`
+}
+
+type messageReactionCapabilityResp struct {
+	Read  bool `json:"read"`
+	Write bool `json:"write"`
+}
+
+// stickerUploadLimitsResp 是 appConfigResp.sticker_upload_limits 的形状。
+// 三个字段一起下发,一起用于客户端预校验。字段名不再带 sticker_upload_ 前缀
+// —— 已经在命名空间下。allowed_formats 内每项含前导点、小写、按输入 CSV
+// 顺序保留(见 SystemSettings.StickerUploadAllowedFormats 契约)。
+type stickerUploadLimitsResp struct {
+	MaxSizeKB      int      `json:"max_size_kb"`
+	MaxDimension   int      `json:"max_dimension"`
+	AllowedFormats []string `json:"allowed_formats"`
+}
+
+type oidcProviderResp struct {
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	AuthorizePath    string `json:"authorize_path"`
+	AccountURL       string `json:"account_url,omitempty"`
+	ResetPasswordURL string `json:"reset_password_url,omitempty"`
+}
+
+type appVersionReq struct {
+	AppVersion  string `json:"app_version"`  // 版本号
+	OS          string `json:"os"`           // 平台 android｜ios
+	IsForce     int    `json:"is_force"`     // 是否强制更新
+	UpdateDesc  string `json:"update_desc"`  // 更新说明
+	DownloadURL string `json:"download_url"` // 下载地址
+	Signature   string `json:"signature"`    // 文件签名
+}
+
+type appVersionResp struct {
+	AppVersion  string `json:"app_version"`  // 版本号
+	OS          string `json:"os"`           // 平台 android｜ios
+	IsForce     int    `json:"is_force"`     // 是否强制更新
+	UpdateDesc  string `json:"update_desc"`  // 更新说明
+	DownloadURL string `json:"download_url"` // 下载地址
+	CreatedAt   string `json:"created_at"`   //更新时间
+}
+
+// Country Country
+type Country struct {
+	Code string `json:"code"`
+	Icon string `json:"icon"`
+	Name string `json:"name"`
+}
+
+var defaultColorsLight = [][]string{
+	{"a6B0CDEB", "a69FB0EA", "a6BBEAD5", "a6B2E3DD"},
+	{"a640CDDE", "a6AC86ED", "a6E984D8", "a6EFD359"},
+	{"a6DBDDBB", "a66BA587", "a6D5D88D", "a688B884"},
+	{"a6DAEACB", "a6A2B4FF", "a6ECCBFF", "a6B9E2FF"},
+	{"a6B2B1EE", "a6D4A7C9", "a66C8CD4", "a64CA3D4"},
+	{"a6DCEB92", "a68FE1D6", "a667A3F2", "a685D685"},
+	{"a68ADBF2", "a6888DEC", "a6E39FEA", "a6679CED"},
+	{"a6FFC3B2", "a6E2C0FF", "a6FFE7B2", "a6FDFF8C"},
+	{"a697BEEB", "a6B1E9EA", "a6C6B1EF", "a6EFB7DC"},
+	{"a6E4B2EA", "a68376C2", "a6EAB9D9", "a6B493E6"},
+	{"a6D1A3E2", "a6EDD594", "a6E5A1D0", "a6ECD893"},
+	{"a6EAA36E", "a6F0E486", "a6F29EBF", "a6E8C06E"},
+	{"a67EC289", "a6E4D573", "a6AFD677", "a6F0C07A"},
+}
+var defaultColorsDark = [][]string{
+	{"a6A4DBFF", "a6009FDD", "a6527BDD", "a673B6DD"},
+	{"a6FEC496", "a6DD6CB9", "a6962FBF", "a64F5BD5"},
+	{"a6E4B2EA", "a68376C2", "a6EAB9D9", "a6B493E6"},
+	{"a6EAA36E", "a6F0E486", "a6F29EBF", "a6E8C06E"},
+	{"a68ADBF2", "a6888DEC", "a6E39FEA", "a6679CED"},
+	{"a6E4B2EA", "a68376C2", "a6EAB9D9", "a6B493E6"},
+	{"a627FF03", "a6FC31FF", "a600FEFF", "a6FFFC00"},
+	{"a6FEC496", "a6DD6CB9", "a6962FBF", "a64F5BD5"},
+	{"a6EAA36E", "a6F0E486", "a6F29EBF", "a6E8C06E"},
+	{"a6FAF4D2", "a6CEA668", "a6DDB56D", "a6BAA161"},
+	{"a6A4DBFF", "a6009FDD", "a6527BDD", "a673B6DD"},
+	{"a6E4B2EA", "a68376C2", "a6EAB9D9", "a6B493E6"},
+	{"a6EAA36E", "a6F0E486", "a6F29EBF", "a6E8C06E"},
+}
+
+// Countrys Countrys
+func Countrys() []*Country {
+
+	return []*Country{
+		{
+			Code: "0086",
+			Icon: "🇨🇳",
+			Name: "中国",
+		},
+		{
+			Code: "001",
+			Icon: "🇺🇸",
+			Name: "美国",
+		},
+		{
+			Code: "00853",
+			Icon: "🇲🇴",
+			Name: "中国澳门",
+		},
+		{
+			Code: "001",
+			Icon: "🇨🇦",
+			Name: "加拿大",
+		},
+		{
+			Code: "007",
+			Icon: "🇰🇿",
+			Name: "哈萨克斯坦",
+		},
+		{
+			Code: "00998",
+			Icon: "🇺🇿",
+			Name: "乌兹别克斯坦",
+		},
+		{
+			Code: "00996",
+			Icon: "🇰🇬",
+			Name: "吉尔吉斯斯坦",
+		},
+		{
+			Code: "0090",
+			Icon: "🇹🇷",
+			Name: "土耳其",
+		},
+		{
+			Code: "0033",
+			Icon: "🇫🇷",
+			Name: "法国",
+		},
+		{
+			Code: "0049",
+			Icon: "🇩🇪",
+			Name: "德国",
+		},
+		{
+			Code: "0044",
+			Icon: "🇬🇧",
+			Name: "英国",
+		},
+		{
+			Code: "0039",
+			Icon: "🇮🇹",
+			Name: "意大利",
+		},
+		{
+			Code: "00886",
+			Icon: "🇹🇼",
+			Name: "中国台湾",
+		},
+		{
+			Code: "0060",
+			Icon: "🇲🇾",
+			Name: "马来西亚",
+		},
+		{
+			Code: "0062",
+			Icon: "🇮🇩",
+			Name: "印度尼西亚",
+		},
+		{
+			Code: "0061",
+			Icon: "🇦🇺",
+			Name: "澳大利亚",
+		},
+		{
+			Code: "0064",
+			Icon: "🇳🇿",
+			Name: "新西兰",
+		},
+		{
+			Code: "0063",
+			Icon: "🇵🇭",
+			Name: "菲律宾",
+		},
+		{
+			Code: "0065",
+			Icon: "🇸🇬",
+			Name: "新加坡",
+		},
+		{
+			Code: "0066",
+			Icon: "🇹🇭",
+			Name: "泰国",
+		},
+		{
+			Code: "00673",
+			Icon: "🇧🇳",
+			Name: "文莱",
+		},
+		{
+			Code: "0081",
+			Icon: "🇯🇵",
+			Name: "日本",
+		},
+		{
+			Code: "0082",
+			Icon: "🇰🇷",
+			Name: "韩国",
+		},
+		{
+			Code: "0084",
+			Icon: "🇻🇳",
+			Name: "越南",
+		},
+		{
+			Code: "00852",
+			Icon: "🇭🇰",
+			Name: "中国香港",
+		},
+		{
+			Code: "00855",
+			Icon: "🇰🇭",
+			Name: "柬埔寨",
+		},
+		{
+			Code: "00856",
+			Icon: "🇱🇦",
+			Name: "老挝",
+		},
+		{
+			Code: "00880",
+			Icon: "🇧🇩",
+			Name: "孟加拉国",
+		},
+		{
+			Code: "0091",
+			Icon: "🇮🇳",
+			Name: "印度",
+		},
+		{
+			Code: "0094",
+			Icon: "🇱🇰",
+			Name: "斯里兰卡",
+		},
+		{
+			Code: "0095",
+			Icon: "🇲🇲",
+			Name: "缅甸",
+		},
+		{
+			Code: "00960",
+			Icon: "🇲🇻",
+			Name: "马尔代夫",
+		},
+		{
+			Code: "00976",
+			Icon: "🇲🇳",
+			Name: "蒙古",
+		},
+		{
+			Code: "00975",
+			Icon: "🇧🇹",
+			Name: "不丹",
+		},
+		{
+			Code: "007",
+			Icon: "🇷🇺",
+			Name: "俄罗斯",
+		},
+		{
+			Code: "0030",
+			Icon: "🇬🇷",
+			Name: "希腊",
+		},
+		{
+			Code: "0031",
+			Icon: "🇳🇱",
+			Name: "荷兰",
+		},
+		{
+			Code: "0034",
+			Icon: "🇪🇸",
+			Name: "西班牙",
+		},
+		{
+			Code: "00351",
+			Icon: "🇵🇹",
+			Name: "葡萄牙",
+		},
+		{
+			Code: "00353",
+			Icon: "🇮🇪",
+			Name: "爱尔兰",
+		},
+		{
+			Code: "0041",
+			Icon: "🇨🇭",
+			Name: "瑞士",
+		},
+		{
+			Code: "0045",
+			Icon: "🇩🇰",
+			Name: "丹麦",
+		},
+		{
+			Code: "0046",
+			Icon: "🇸🇪",
+			Name: "瑞典",
+		},
+		{
+			Code: "0047",
+			Icon: "🇳🇴",
+			Name: "挪威",
+		},
+		{
+			Code: "0055",
+			Icon: "🇧🇷",
+			Name: "巴西",
+		},
+	}
+}

@@ -1,0 +1,3807 @@
+import {
+  Channel,
+  ChannelTypeGroup,
+  ChannelTypePerson,
+  ConversationAction,
+  WKSDK,
+  Mention,
+  Message,
+  MessageContent,
+  Reminder,
+  ReminderType,
+  Reply,
+  MessageText,
+  MessageContentType,
+  MediaMessageContent,
+  TaskStatus,
+  MessageTask,
+  MessageStatus,
+  ChannelInfo,
+} from "wukongimjssdk";
+import React, { Component, HTMLProps } from "react";
+import { isConversationDisbanded } from "../../Utils/groupDisband";
+import { ForwardService, ForwardOptions, ForwardResult } from "../../Service/ForwardService";
+import { interpretForwardResult, ForwardToastScope, ForwardToastKind } from "../../Service/forwardResultToast";
+
+import Provider from "../../Service/Provider";
+import { Dap } from "../../Service/Dap";
+import ConversationVM from "./vm";
+import { isMessageAuthorAi } from "./replyAiIdentity";
+import "./index.css";
+import { EmojiInfo, MentionInfo } from "../../Messages/Text/MarkdownContent";
+import MarkdownContent from "../../Messages/Text/MarkdownContent";
+import { MessageWrap, Part, PartType } from "../../Service/Model";
+import WKApp from "../../App";
+import { RevokeCell } from "../../Messages/Revoke";
+import {
+  MAX_REEDIT_FILE_BYTES,
+  canReeditRevokedMessage,
+  getReeditableMessageBlocks,
+  remoteReeditFileToFile,
+  restoreReeditableMessageBlocks,
+} from "../../Messages/Revoke/reeditableMessage";
+import {
+  MessageContentTypeConst,
+  ChannelTypeCommunityTopic,
+} from "../../Service/Const";
+import ConversationContext from "./context";
+import {
+  buildMessageMentions as buildMentionRenderInfo,
+  readMentionFlags,
+} from "../../Utils/mentionRender";
+import {
+  ChatComposer,
+  ComposeDraftWriteQueue,
+  ComposeRecoveryStore,
+  createConversationChatSendHandler,
+  createDefaultChatComposerExtensions,
+  captureSendTarget,
+  disposeComposeRecoveryObjectUrls,
+  imageBlockToPasteFile,
+  reconcileRecoveredSendTarget,
+  type ComposeRecoveryRecord,
+  type RecoveredComposeHydration,
+  type ChatSendSettlement,
+  type ChatComposerSendTransaction,
+  type ChatComposerViewHost,
+  type EditorContentBlock,
+  type MessageInputContext,
+  type PendingSendDraft,
+} from "../../features/chat-composer";
+import {
+  tryConsumeInitialCompose,
+  type ComposeHost,
+  type InitialCompose,
+  type InitialComposeState,
+} from "./initialCompose";
+import { BotCommand } from "../SlashCommandMenu";
+import ContextMenus, { ContextMenusContext, type ContextMenusTrigger } from "../ContextMenus";
+import classNames from "classnames";
+import WKAvatar from "../WKAvatar";
+import AiBadge from "../AiBadge";
+import { IconClose, IconEdit, IconReply } from "@douyinfe/semi-icons";
+import { Toast, Spin } from "@douyinfe/semi-ui";
+import { AtSign, UserRound } from "lucide-react";
+import { wkConfirm } from "../WKModal";
+import { FlameMessageCell } from "../../Messages/Flame";
+import FoldSessionCard, { FoldSessionCardParticipant } from "./FoldSessionCard";
+import { BeatLoader } from "react-spinners";
+import { ConversationRenderItem, FoldSessionViewModel } from "./vm";
+import {
+  getFoldSessionSummaryState,
+  isFoldSessionSummaryMessage,
+} from "./foldSessionSummary";
+import {
+  getScrollAnchorOffsetY,
+  shouldShowScrollToBottom,
+  shouldPulldownOnWheel,
+  TOP_HISTORY_TRIGGER_OFFSET,
+} from "./historyScroll";
+import {
+  FileContent,
+  formatFileSize,
+  getFileIconInfo,
+  getExtension,
+  resolveSafeFileUrl,
+} from "../../Messages/File";
+import { ImageContent } from "../../Messages/Image";
+import {
+  RichTextBlock,
+  RichTextImagePlaceholder,
+  createRichTextContent,
+  makeTextBlock,
+  makeImageBlock,
+} from "../../Messages/RichText/RichTextContent";
+import { formatMessageTimestamp } from "../../Utils/time";
+import { isSafeUrl } from "../../Utils/security";
+import { resolveExternalForViewer } from "../../Utils/externalViewer";
+import {
+  isConversationViewportVisible,
+  isOwnedConversationSingleton,
+  shouldMarkConversationRead,
+} from "../../features/notifications";
+import { downloadFile } from "../../Utils/download";
+import Lightbox from "yet-another-react-lightbox";
+import Download from "yet-another-react-lightbox/plugins/download";
+import { buildChatContext, ChatContextChannelInfo } from "./chatContext";
+import {
+  resolveDraftAfterSend,
+  resolveDraftToPersist,
+} from "../../Utils/draftLifecycle";
+import {
+  isSuccessfulSendAck,
+  messageStatusWaitResult,
+  taskStatusWaitResult,
+} from "../../Utils/sendWaitResult";
+import { parseThreadChannelId } from "../../Service/Thread";
+import { stripSpacePrefix } from "../../Service/SpacePrefix";
+import FoldSessionExpandedList from "./FoldSessionExpandedList";
+import { captureSelectionWithinContainer } from "./copySelection";
+import VoiceFeedback from "../../Service/VoiceFeedback";
+import {
+  uploadChatMedia,
+} from "../../Service/UploadCredentials";
+import { isMessageSelectable } from "../../Service/messageSelection";
+import { isIncomingWebhookSender } from "../../Service/IncomingWebhook";
+import type { WebhookIssuePreviewTarget } from "../../bridge/message/webhookPreview";
+import { I18nContext, t } from "../../i18n";
+import {
+  InteractiveCardContent,
+  InteractiveCardForwardBlockedError,
+  cloneInteractiveCardContentForForward,
+  isInteractiveCardForwardable,
+} from "../../Messages/InteractiveCard/InteractiveCardContent";
+import {
+  classifyCardSender,
+  isTrustedCardSender,
+} from "../../Messages/InteractiveCard/senderTrust";
+import {
+  addImChannelInfoListener,
+  fetchImChannelInfo,
+  getImChannelInfo,
+} from "../../im-runtime/channelRuntime";
+import {
+  SummaryCardContent,
+  SummaryCardForwardBlockedError,
+} from "../../Messages/SummaryCard/SummaryCardContent";
+
+function forwardBlockedMessageKey(error: unknown): string | null {
+  if (error instanceof InteractiveCardForwardBlockedError) {
+    return "base.conversation.forward.interactiveCardBlocked";
+  }
+  if (error instanceof SummaryCardForwardBlockedError) {
+    return "base.conversation.forward.cardBlocked";
+  }
+  return null;
+}
+
+export function classifyAssistantIntentText(text: string | undefined): string {
+  if (!text) return "other";
+  if (/总结|摘要|概括|summariz|summary/i.test(text)) return "summary";
+  if (/分析|解读|analyz|analysis/i.test(text)) return "analysis";
+  if (
+    text.includes("```") ||
+    /写(段|个|一)?代码|代码实现|生成代码|帮我(写|实现).*(函数|方法|代码|脚本)|报错|编译|\bdebug\b|\bfunction\b|\bclass\b|\bdef\b/i.test(text)
+  ) {
+    return "code_gen";
+  }
+  if (text.includes("?") || text.includes("？")) return "qa";
+  return "other";
+}
+
+export async function deleteSelectedConversationMessages(
+  vm: Pick<ConversationVM, "deleteMessages" | "unCheckAllMessages"> & { editOn: boolean },
+  messages: Message[],
+): Promise<void> {
+  if (messages.length === 0) return;
+  try {
+    await vm.deleteMessages(messages);
+    vm.editOn = false;
+    vm.unCheckAllMessages();
+  } catch (error) {
+    Toast.error(t("base.conversation.deleteConfirm.failed"));
+    throw error;
+  }
+}
+
+/**
+ * 取消息的有效内容：如果消息被编辑过，返回编辑后的 contentEdit；否则返回原始 content
+ */
+function getEffectiveContent(message: Message): MessageContent {
+  const content =
+    message.remoteExtra?.isEdit && message.remoteExtra?.contentEdit
+      ? message.remoteExtra.contentEdit
+      : message.content;
+  if (content instanceof InteractiveCardContent) {
+    if (!isInteractiveCardForwardable(content)) {
+      throw new InteractiveCardForwardBlockedError();
+    }
+    const trustedForwardSource = isTrustedCardSender(
+      classifyCardSender(message.fromUID)
+    )
+      ? message.fromUID
+      : content.forwardedFromUID;
+    if (
+      trustedForwardSource &&
+      isTrustedCardSender(classifyCardSender(trustedForwardSource))
+    ) {
+      return cloneInteractiveCardContentForForward(
+        content,
+        trustedForwardSource
+      );
+    }
+  }
+  if (content instanceof SummaryCardContent && content.shareId) {
+    throw new SummaryCardForwardBlockedError();
+  }
+  return content;
+}
+
+/**
+ * 从本地图片文件读取像素尺寸（用 FileReader → Image，绝不依赖远端 URL）。
+ *
+ * Why: RichText image block 的 width/height 是 schema 必填>0（供端上占位排版）。
+ * 若从刚上传的 downloadUrl 读尺寸，CDN read-after-write 延迟可能让 Image 读到 0×0，
+ * 注入非法块。纯图片发送路径(sendImageFile)本就从本地文件量尺寸，这里保持一致。
+ */
+function readLocalImageSize(
+  file: File
+): Promise<{ width: number; height: number }> {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const dataUrl = reader.result as string;
+      if (!dataUrl) {
+        resolve({ width: 0, height: 0 });
+        return;
+      }
+      const img = new Image();
+      img.onload = () =>
+        resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      img.onerror = () => resolve({ width: 0, height: 0 });
+      img.src = dataUrl;
+    };
+    reader.onerror = () => resolve({ width: 0, height: 0 });
+    reader.readAsDataURL(file);
+  });
+}
+
+function offsetMentionEntities(
+  entities: Array<{ uid: string; offset: number; length: number }> | undefined,
+  baseOffset: number
+): Array<{ uid: string; offset: number; length: number }> {
+  if (!Array.isArray(entities)) return [];
+  return entities
+    .filter(
+      (entity) =>
+        entity &&
+        typeof entity.uid === "string" &&
+        Number.isFinite(entity.offset) &&
+        Number.isFinite(entity.length) &&
+        entity.offset >= 0 &&
+        entity.length > 0
+    )
+    .map((entity) => ({
+      uid: entity.uid,
+      offset: baseOffset + entity.offset,
+      length: entity.length,
+    }));
+}
+
+const foldSessionAvatarIcon = new URL(
+  "./fold-session-avatar.svg",
+  import.meta.url
+).href;
+
+const FoldImage: React.FC<{ src: string }> = ({ src }) => {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <div className="wk-fold-img" onClick={() => setOpen(true)}>
+      <img src={src} alt="" />
+      <Lightbox
+        open={open}
+        close={() => setOpen(false)}
+        slides={[{ src, alt: "", download: src }]}
+        plugins={[Download]}
+        carousel={{ finite: true }}
+        controller={{ closeOnBackdropClick: true }}
+        render={{ buttonPrev: () => null, buttonNext: () => null }}
+      />
+    </div>
+  );
+};
+
+export interface ConversationProps {
+  channel: Channel;
+  /** 辅助会话（例如侧边 Thread）不占用主会话的全局单例。 */
+  isAuxiliary?: boolean;
+  chatBg?: string; // 聊天背景
+  shouldShowHistorySplit?: boolean;
+  initLocateMessageSeq?: number;
+  onContext?: (ctx: ConversationContext) => void;
+  onOpenThreadPanel?: (threadChannelId: string, threadName: string) => void;
+  onOpenWebhookPreview?: (target: WebhookIssuePreviewTarget) => void;
+  onSelectionStateChange?: (state: {
+    editOn: boolean;
+    checkedCount: number;
+  }) => void;
+  /** 展示在输入框上方的轻量提示。 */
+  inputNotice?: React.ReactNode;
+  /** 当前会话发送完成后的回调。 */
+  onMessageSent?: () => void;
+  /**
+   * 一次性初始编排（plan Task 4）：挂载/就绪后按 restoreDraft → addPendingAttachments → send
+   * 顺序装入并可自动发送恰好一次。同一 requestId 只消费一次；已有草稿/待发送附件则拒绝覆盖。
+   */
+  initialCompose?: InitialCompose;
+  /** 初始编排状态变化回调（prepared/sent/failed）。 */
+  onInitialComposeStateChange?: (
+    requestId: string,
+    state: InitialComposeState,
+    reason?: string
+  ) => void;
+  /** 当前正在预览的文件消息 ID（用于文件卡片激活态） */
+  activePreviewMessageId?: string | null;
+}
+
+const ConversationSelectionStateBridge: React.FC<{
+  editOn: boolean;
+  checkedCount: number;
+  onChange?: (state: { editOn: boolean; checkedCount: number }) => void;
+}> = ({ editOn, checkedCount, onChange }) => {
+  React.useEffect(() => {
+    if (onChange) {
+      onChange({ editOn, checkedCount });
+    }
+  }, [checkedCount, editOn]);
+  return null;
+};
+
+interface ConversationState {
+  inputExpanded: boolean;
+  contextMenuMessageID: string | null;
+  recoveredComposes: ComposeRecoveryRecord[];
+}
+
+interface ConversationSendTransactionContext {
+  channel: Channel;
+  channelKey: string;
+  vm: ConversationVM;
+}
+
+const composeRecoveryStore = new ComposeRecoveryStore<ComposeRecoveryRecord>({
+  dispose: disposeComposeRecoveryObjectUrls,
+});
+const composeDraftWriteQueue = new ComposeDraftWriteQueue();
+
+function hasSameComposeRecoveryResources(
+  left: ComposeRecoveryRecord,
+  right: ComposeRecoveryRecord,
+): boolean {
+  return (
+    left.editorAttachments.length === right.editorAttachments.length &&
+    left.editorAttachments.every(
+      (item, index) =>
+        item.id === right.editorAttachments[index]?.id &&
+        item.file === right.editorAttachments[index]?.file,
+    ) &&
+    left.editorObjectUrls.length === right.editorObjectUrls.length &&
+    left.editorObjectUrls.every(
+      (item, index) =>
+        item.id === right.editorObjectUrls[index]?.id &&
+        item.url === right.editorObjectUrls[index]?.url,
+    ) &&
+    left.topAttachments.length === right.topAttachments.length &&
+    left.topAttachments.every(
+      (item, index) =>
+        item.id === right.topAttachments[index]?.id &&
+        item.file === right.topAttachments[index]?.file &&
+        item.previewUrl === right.topAttachments[index]?.previewUrl,
+    )
+  );
+}
+
+export class Conversation
+  extends Component<ConversationProps, ConversationState>
+  implements ConversationContext
+{
+  static contextType = I18nContext;
+  declare context: React.ContextType<typeof I18nContext>;
+
+  private static openChannelOwner?: symbol;
+  // 缓存各会话的引用/回复状态，切换会话时保留
+  private static replyStateCache: Map<
+    string,
+    { message: Message; handlerType: number }
+  > = new Map();
+  private static readonly REPLY_STATE_CACHE_MAX_SIZE = 50;
+  vm!: ConversationVM;
+  contextMenusContext!: ContextMenusContext;
+  avatarMenusContext!: ContextMenusContext; // 点击头像弹出的菜单
+  _messageInputContext!: MessageInputContext;
+  private _pendingInsertText?: string;
+  private _pendingRestoreDraft?: string;
+  scrollTimer: number | null = null;
+  updateBrowseToMessageSeqAndReminderDoneing: boolean = false;
+  private _dragFileCallback?: (file: File) => void;
+  private _cachedSelectedText: string | null = null;
+  private _beforeUnloadHandler: () => void;
+  private _guardId: symbol = Symbol("pendingAttachmentGuard");
+  // 监听 channelInfo 变化：群解散时 status 翻转为 2，需重渲染以隐藏成员栏/置灰发送框
+  private _channelInfoListener?: (channelInfo: ChannelInfo) => void;
+  private _unsubscribeChannelInfoListener?: () => void;
+  private _addAttachmentFn?: (
+    files: File[],
+    source?: "paste" | "upload"
+  ) => void | Promise<void>;
+  // plan Task 4: instance-level one-shot guard so a re-render / remount / prop re-pass of the
+  // SAME requestId never re-loads or re-sends the initial compose (§5 risk 1).
+  private _consumedComposeIds: Set<string> = new Set();
+  private _initialComposeGeneration = 0;
+  private _initialComposeMounted = false;
+  private readonly _openChannelOwner = Symbol("openChannelOwner");
+  private _ownedOpenChannel?: Channel;
+  private _lastAttentionCheckedMessageSeq = 0;
+  private _unsubscribeVmAttentionListener?: () => void;
+  private _unsubscribeComposeRecovery?: () => void;
+  private readonly _composeRecoveryOwner = Symbol("composeRecoveryOwner");
+  private readonly _chatComposerExtensions =
+    createDefaultChatComposerExtensions<Message>();
+  private readonly _chatComposerViewHost: ChatComposerViewHost = {
+    track: (event) => Dap.shared.track(event, {}),
+    getChannel: () => {
+      const channel = this.channel();
+      return {
+        id: channel.channelID,
+        type: channel.channelType,
+        key: `${channel.channelID}:${channel.channelType}`,
+        isDirect: channel.channelType === ChannelTypePerson,
+      };
+    },
+    getChannelTitle: () =>
+      getImChannelInfo(WKSDK.shared(), this.channel())?.title,
+    subscribeChannelTitle: (listener) => {
+      const channel = this.channel();
+      const channelInfoListener = (channelInfo: ChannelInfo) => {
+        if (channelInfo.channel.isEqual(channel)) {
+          listener(channelInfo.title || "");
+        }
+      };
+      const unsubscribe = addImChannelInfoListener(
+        WKSDK.shared(),
+        channelInfoListener,
+      );
+      const cached = getImChannelInfo(WKSDK.shared(), channel);
+      if (cached) listener(cached.title || "");
+      else fetchImChannelInfo(WKSDK.shared(), channel).catch(() => {});
+      return unsubscribe;
+    },
+    resolveMemberAvatar: (uid) =>
+      WKApp.shared.avatarChannel(new Channel(uid, ChannelTypePerson)),
+    resolveMemberExternal: (member) =>
+      resolveExternalForViewer({
+        homeSpaceId: member.orgData?.home_space_id,
+        homeSpaceName: member.orgData?.home_space_name,
+        isExternalLegacy:
+          member.orgData?.is_external === true
+            ? 1
+            : member.orgData?.is_external === false
+              ? 0
+              : member.orgData?.is_external,
+        sourceSpaceNameLegacy: member.orgData?.source_space_name,
+      }),
+    resolveImageUrl: (url, opts) =>
+      WKApp.dataSource.commonDataSource.getImageURL(url, opts),
+    openSecretCreate: (value) => {
+      WKApp.mittBus.emit("wk:open-secrets", { create: true, value });
+    },
+    voice: {
+      getSpaceId: () => WKApp.shared.currentSpaceId,
+      subscribeSpaceChange: (listener) => {
+        WKApp.mittBus.on("space-changed", listener);
+        return () => WKApp.mittBus.off("space-changed", listener);
+      },
+    },
+  };
+  private _attentionRefreshHandler = () => {
+    const run = () => this.updateBrowseToMessageSeqAndReminderDoneIfNeed();
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+    else window.setTimeout(run, 0);
+  };
+  private _vmAttentionListener = () => {
+    const latestMessageSeq = this.vm.lastMessage?.messageSeq || 0;
+    if (latestMessageSeq <= this._lastAttentionCheckedMessageSeq) return;
+    this._lastAttentionCheckedMessageSeq = latestMessageSeq;
+    this._attentionRefreshHandler();
+  };
+  private onOpenThreadPanel?: (
+    threadChannelId: string,
+    threadName: string
+  ) => void;
+  private onOpenWebhookPreview?: (target: WebhookIssuePreviewTarget) => void;
+
+  constructor(props: any) {
+    super(props);
+    this.state = {
+      inputExpanded: false,
+      contextMenuMessageID: null as string | null,
+      recoveredComposes: [],
+    };
+    this.onOpenThreadPanel = props.onOpenThreadPanel;
+    this.onOpenWebhookPreview = props.onOpenWebhookPreview;
+    this._beforeUnloadHandler = () => {
+      // Use sendBeacon for reliable delivery during page unload
+      if (this.vm && this.vm.needSetUnread) {
+        const apiURL = WKApp.apiClient.config.apiURL;
+        const url = `${apiURL}conversation/clearUnread`;
+        const data = JSON.stringify({
+          channel_id: this.props.channel.channelID,
+          channel_type: this.props.channel.channelType,
+          unread: this.vm.unreadCount > 0 ? this.vm.unreadCount : 0,
+        });
+        const token = WKApp.loginInfo.token || "";
+        fetch(url, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", token: token },
+          body: data,
+          keepalive: true,
+        });
+      }
+      this.dealloc();
+    };
+  }
+
+  private captureChatComposerSendTransaction =
+    (): ChatComposerSendTransaction<Message> => {
+      const vm = this.vm;
+      const channel = vm.channel;
+      const channelKey = this.composeRecoveryKey(channel);
+      const context: ConversationSendTransactionContext = {
+        channel,
+        channelKey,
+        vm,
+      };
+      const onMessageSent = this.props.onMessageSent;
+      const send = createConversationChatSendHandler<Message>(
+        {
+          conversation: {
+            sendMessage: (content) => this.sendMessage(content, channel, vm),
+            editMessage: (
+              messageID,
+              messageSeq,
+              channelID,
+              channelType,
+              content,
+            ) =>
+              vm.editMessage(
+                messageID,
+                messageSeq,
+                channelID,
+                channelType,
+                content,
+              ),
+          },
+          channel: () => channel,
+          sendTextAndWaitAck: (content, onEnqueued) =>
+            this.sendTextAndWaitAck(content, channel, onEnqueued, vm),
+          sendMediaAndWait: (content, onEnqueued) =>
+            this.sendMediaAndWait(content, channel, onEnqueued, vm),
+          sendRichTextMixed: (blocks, reply, onEnqueued) =>
+            this.sendRichTextMixed(
+              blocks,
+              reply,
+              onEnqueued,
+              channel,
+              vm,
+            ),
+          resolveReplyFromName: (message) => {
+            const channelInfo = getImChannelInfo(
+              WKSDK.shared(),
+              new Channel(message.fromUID, ChannelTypePerson),
+            );
+            return channelInfo?.title || "";
+          },
+          submitVoiceFeedback: (text) => VoiceFeedback.shared()?.submitAll(text),
+        },
+        { operationRegistry: this._chatComposerExtensions.send.operations },
+      );
+
+      return {
+        channelKey,
+        captureSendTarget: () =>
+          captureSendTarget<Message>({
+            getReplyMessage: () => vm.currentReplyMessage,
+            setReplyMessage: (message) => {
+              vm.currentReplyMessage = message;
+            },
+            getHandlerType: () => vm.currentHandlerType,
+            setHandlerType: (handlerType) => {
+              vm.currentHandlerType = handlerType;
+            },
+          }),
+        captureSendDraft: () => {
+          const remoteDraft = vm.currentConversation?.remoteExtra?.draft || "";
+          return {
+            revision: composeRecoveryStore.captureDraftRevision(
+              channelKey,
+              remoteDraft,
+            ),
+            remoteDraft,
+            protectedPendingAttemptIds: [
+              ...composeRecoveryStore.matchPendingDraft(
+                channelKey,
+                remoteDraft,
+              ),
+            ],
+          };
+        },
+        onCaptureAborted: (sendDraft) => {
+          if (!sendDraft) return;
+          composeRecoveryStore.releaseDraftRevision(
+            channelKey,
+            sendDraft.revision,
+          );
+        },
+        send,
+        onSendSettled: async (settlement) => {
+          try {
+            if (!settlement.outcome.editorConsumed) return;
+            if (!settlement.restoreFailed) {
+              await this.clearDraftAfterSend(settlement, context);
+            }
+            if (
+              this._initialComposeMounted &&
+              this.composeRecoveryKey() === channelKey
+            ) {
+              onMessageSent?.();
+            }
+          } finally {
+            if (settlement.sendDraft) {
+              composeRecoveryStore.releaseDraftRevision(
+                channelKey,
+                settlement.sendDraft.revision,
+              );
+            }
+          }
+        },
+      };
+    };
+
+  async sendMessage(
+    content: MessageContent,
+    channel?: Channel,
+    vm: ConversationVM = this.vm
+  ): Promise<Message> {
+    // const { channel } = this.props
+    let c = channel;
+    if (!c) {
+      c = this.props.channel;
+    }
+    // 解散守卫（中央检查）：群/子区解散后只读，禁止发送。覆盖输入框发送、转发、
+    // 媒体发送等所有走 Conversation.sendMessage 的入口。与后端 403 对齐。
+    if (isConversationDisbanded(c)) {
+      Toast.error(t("base.conversation.disband.inputNotice"));
+      return Promise.reject(new Error("group disbanded"));
+    }
+    const message = await vm.sendMessage(content, c);
+
+    // 埋点：octo_assistant_queried（octo-dap S3 / YUJ-277）
+    // 判别：当前会话是 1v1、bot.uid 在 octoAssistantUids 中,且本次发送是文本消息。
+    // 只计文本发送 —— 贴图/文件/转发媒体等经同一 sendMessage 漏斗但不是「提问」,
+    // 计进来会虚高 query 量并全部落 intent_tag=other(见 #1452 review P2)。
+    if (c.channelType === ChannelTypePerson && content instanceof MessageText) {
+      // Space 部署下 Person channelID 形如 s<32hex>_<uid>,而 octoAssistantUids 存的是裸 uid
+      // (兄弟事件 octo_assistant_opened 走 bot.uid 裸值)。不 strip 则 includes() 恒 false,
+      // 进会话列表打开的助手 DM 永远不发 query,造成 opened 有、queried 无的畸形漏斗(#1452 P1-2)。
+      // stripSpacePrefix 对非 Space 部署幂等。
+      const botUid = stripSpacePrefix(c.channelID);
+      if (WKApp.remoteConfig.octoAssistantUids.includes(botUid)) {
+        const intentTag = this.classifyAssistantIntent(content);
+        Dap.shared.track("octo_assistant_queried", { intent_tag: intentTag });
+      }
+    }
+
+    return message;
+  }
+
+  /**
+   * 启发式分类用户向 Octo Assistant 发送的消息意图（octo-dap S3 / YUJ-277）。
+   * 不采原文，只返回分类标签：
+   * - summary：含"总结"/"摘要"/"概括"
+   * - analysis：含"分析"/"解读"
+   * - code_gen：含代码围栏(```)或明确的写码信号
+   * - qa：含问号
+   * - other：其他
+   *
+   * 顺序：显式意图动词(summary/analysis)先判,code_gen 收紧到「代码围栏或强代码信号」——
+   * 旧实现把 code_gen 排在最前且关键词含 code/let/const/var 等日常英文词,会把
+   * "总结一下这段 code" 误判 code_gen、把 "Let me know…" 误判 code_gen(见 #1452 review P2)。
+   */
+  private classifyAssistantIntent(content: MessageContent): string {
+    if (!(content instanceof MessageText)) {
+      return "other";
+    }
+    return classifyAssistantIntentText((content as MessageText).text);
+  }
+
+  // 统一上报转发结果。区分「全部失败」与「部分失败（带计数）」，全部成功不提示。
+  // scope 决定分母维度：'targets' 对齐 fowardMessageUI / onMergeForward 的历史语义
+  // （分母 = 目标 channel 数）；'messages' 对齐 onForward 多选（分母 = messages × channels）。
+  private showForwardResult(
+    result: ForwardResult,
+    scope: ForwardToastScope,
+  ): ForwardToastKind {
+    const state = interpretForwardResult(result, scope);
+    if (state.kind === "success") return "success";
+    if (state.kind === "all-failed") {
+      Toast.error(t("base.conversation.forward.allFailed"));
+      return "all-failed";
+    }
+    Toast.error(
+      t("base.conversation.forward.partialFailed", {
+        values: { failed: state.failed, total: state.total },
+      }),
+    );
+    return "partial";
+  }
+
+  // 转发到当前会话时，需要保留本地"发送中"气泡（vm.fillOrder + addSendMessageToQueue）。
+  // 转发到其他会话时不入本地 sendQueue —— 静态 sendQueue 只服务当前会话的乐观 UI，
+  // 塞入非当前会话消息属历史噪声（老 vm.sendMessage 无条件入队，遗留至今）。本次
+  // ForwardService 重构一并修正。
+  private buildForwardOptions(overrides?: Partial<ForwardOptions>): ForwardOptions {
+    return {
+      spaceId: WKApp.shared.currentSpaceId,
+      onSent: (message, channel) => {
+        if (channel.isEqual(this.props.channel)) {
+          const wrap = new MessageWrap(message);
+          this.vm.fillOrder(wrap);
+          this.vm.addSendMessageToQueue(wrap);
+        }
+      },
+      ...overrides,
+    };
+  }
+
+  fowardMessageUI(message: Message): void {
+    WKApp.shared.baseContext.showConversationSelect(async (channels: Channel[]) => {
+      try {
+        // buildContent 每 channel 调一次；InteractiveCardForwardBlockedError 从
+        // getEffectiveContent 抛出会被 ForwardService Phase 1 abort 上抛到此处。
+        const result = await ForwardService.send(
+          channels,
+          () => getEffectiveContent(message),
+          this.buildForwardOptions(),
+        );
+        const kind = this.showForwardResult(result, "targets");
+        // 全部目标失败(如群已解散)不计转发,与 smart_summary_forwarded 同口径(见二审 P2-2)。
+        if (kind !== "all-failed") Dap.shared.track("message_forwarded", {
+            object_id: message.messageID,
+            message_id: message.messageID,
+            // is_ai_msg:被转发消息的作者是否 AI/bot(与 message_replied 同源判据),
+            // 供区分 AI 消息转发漏斗(session.go ai_msg_forward)。见 #1452 review。
+            is_ai_msg: isMessageAuthorAi(message.fromUID),
+        });
+      } catch (e) {
+        console.error("[forward] build content failed", e);
+        const blockedMessageKey = forwardBlockedMessageKey(e);
+        Toast.error(t(blockedMessageKey ?? "base.conversation.forward.allFailed"));
+      }
+    });
+  }
+
+  openThreadPanel(threadChannelId: string, threadName: string): void {
+    this.onOpenThreadPanel?.(threadChannelId, threadName);
+  }
+  openWebhookPreview(target: WebhookIssuePreviewTarget): void {
+    this.onOpenWebhookPreview?.(target);
+  }
+  getActivePreviewMessageId(): string | null {
+    return this.props.activePreviewMessageId ?? null;
+  }
+  replyToMessageId(messageId: string): void {
+    const messageWrap = this.vm.findMessageWithMessageID(messageId);
+    if (messageWrap) {
+      this.reply(messageWrap.message, 1);
+    }
+  }
+
+  private addReplyMention(fromUID: string): void {
+    if (
+      this.props.channel.channelType === ChannelTypePerson ||
+      fromUID === WKApp.loginInfo.uid
+    ) {
+      return;
+    }
+    const channelInfo = getImChannelInfo(
+      WKSDK.shared(),
+      new Channel(fromUID, ChannelTypePerson)
+    );
+    this._messageInputContext?.addMention(fromUID, channelInfo?.title || "");
+  }
+
+  replyToFileMessage(info: {
+    messageId: string;
+    messageSeq: number;
+    fromUID: string;
+    conversationDigest: string;
+    channelId: string;
+    channelType: number;
+  }): void {
+    // 首先尝试从当前消息列表中查找（如果找到则使用完整信息）
+    const messageWrap = this.vm.findMessageWithMessageID(info.messageId);
+    if (messageWrap) {
+      this.reply(messageWrap.message, 1);
+      return;
+    }
+
+    // 消息不在当前列表中，使用传入的信息构造 Message 对象
+    // 用于设置回复状态
+    const channel = new Channel(info.channelId, info.channelType);
+    // 使用 MessageText 作为 content，它有正确的 encode() 方法
+    // SDK 在序列化 reply.content 时会调用 content.encode()，普通对象没有这个方法会导致回复内容丢失
+    // MessageText 的 conversationDigest getter 返回的就是 text，所以传入 conversationDigest 作为 text 即可
+    // 注意：MessageText 的 contentType 是文本类型，与原始消息类型可能不同，但 ReplyView 只读取 conversationDigest，所以不影响显示
+    // Message 构造函数会将 remoteExtra 默认初始化为空的 MessageExtra，不会导致 isEdit 为 truthy
+    const fakeMessage = new Message();
+    fakeMessage.messageID = info.messageId;
+    fakeMessage.messageSeq = info.messageSeq;
+    fakeMessage.fromUID = info.fromUID;
+    fakeMessage.channel = channel;
+    fakeMessage.content = new MessageText(info.conversationDigest);
+
+    this.addReplyMention(info.fromUID);
+
+    // 设置回复状态
+    this.vm.currentHandlerType = 1;
+    this.vm.currentReplyMessage = fakeMessage;
+    // 自动聚焦输入框
+    this._messageInputContext?.focus();
+  }
+  async resendMessage(message: Message): Promise<Message> {
+    // 解散守卫（中央检查）：群/子区解散后全员只读，禁止重发。失败气泡的重试入口
+    // 最终都走这里，单点拦截即可覆盖 Base/Image 等所有重试 UI。与后端 403 对齐。
+    if (isConversationDisbanded(message.channel)) {
+      Toast.error(t("base.conversation.disband.inputNotice"));
+      return Promise.reject(new Error("group disbanded"));
+    }
+    await this.vm.deleteMessagesFromLocal([message]);
+    const newMessage = await this.vm.sendMessage(
+      message.content,
+      message.channel
+    );
+    return newMessage;
+  }
+
+  async reeditRevokedMessage(message: MessageWrap): Promise<void> {
+    if (!canReeditRevokedMessage(message, WKApp.loginInfo.uid)) return;
+    const input = this.messageInputContext();
+    if (!input) return;
+
+    await restoreReeditableMessageBlocks(
+      getReeditableMessageBlocks(message),
+      {
+        restoreBlock: async (block) => {
+          if (block.type === "content") {
+            input.insertContent(block.content);
+            return;
+          }
+          if (block.type === "image") {
+            const file = await imageBlockToPasteFile(
+              block,
+              WKApp.dataSource.commonDataSource.getImageURL.bind(
+                WKApp.dataSource.commonDataSource
+              )
+            );
+            if (!file) {
+              input.insertContent([
+                { type: "text", text: RichTextImagePlaceholder },
+              ]);
+              Toast.error(t("base.revoke.reeditAttachmentFailed"));
+              return;
+            }
+            await input.addAttachment([file], "paste");
+            return;
+          }
+
+          const fileUrl = resolveSafeFileUrl(block);
+          const file = fileUrl
+            ? await remoteReeditFileToFile({ ...block, url: fileUrl })
+            : null;
+          if (!file) {
+            Toast.error(
+              t("base.revoke.reeditFileFailed", {
+                values: {
+                  name: block.name,
+                  max: formatFileSize(MAX_REEDIT_FILE_BYTES),
+                },
+              })
+            );
+            return;
+          }
+          await input.addAttachment([file], "upload");
+        },
+        onBlockError: (block, error) => {
+          console.error(
+            `[revoke] failed to restore ${block.type} block`,
+            error
+          );
+          Toast.error(t("base.revoke.reeditBlockFailed"));
+        },
+        onComplete: () => input.focus(),
+      }
+    );
+  }
+
+  /**
+   * 发送媒体消息并等待上传完成 + 服务端 ack 后才返回。
+   * 保证多条消息严格顺序发送，且本地回显排序正确（每条消息的 messageSeq 确定后再发下一条）。
+   * 超时 30s 自动 resolve（避免网络断开时永久阻塞）。
+   *
+   * 返回值语义 (octo-web#1280)：**是否已入队**（本地气泡已出现在消息列表），
+   * 不是「服务端已确认」。等待 ack 只为排序；ack 失败/超时的消息会带失败标记与
+   * 重发入口（Messages/Base + MediaMessageUploadTask.restart），若把它当失败上报，
+   * MessageInput 会把已经可见的内容塞回输入框（#1280 的主要投诉）。
+   */
+  private async sendMediaAndWait(
+    content: MessageContent,
+    channel?: Channel,
+    onEnqueued?: () => void,
+    vm: ConversationVM = this.vm
+  ): Promise<boolean> {
+    // 非媒体消息（或无文件需上传）无需等待上传，直接发送并等 ack
+    if (
+      !(content instanceof MediaMessageContent) ||
+      !(content as MediaMessageContent).file
+    ) {
+      return this.sendTextAndWaitAck(content, channel, onEnqueued, vm);
+    }
+
+    const TIMEOUT = 30_000;
+    let settled = false;
+    let clientSeq: number | null = null;
+    let ackSucceeded = false;
+    let uploadSucceeded = false;
+
+    const { promise, resolve } = (() => {
+      let res: (sent: boolean) => void;
+      const p = new Promise<boolean>((r) => {
+        res = r;
+      });
+      return { promise: p, resolve: res! };
+    })();
+
+    const done = (sent: boolean) => {
+      if (settled) return;
+      settled = true;
+      pendingAcks = []; // 释放暂存引用
+      queueMicrotask(() => {
+        WKSDK.shared().taskManager.removeListener(taskListener);
+        WKSDK.shared().chatManager.removeMessageStatusListener(ackListener);
+      });
+      clearTimeout(timer);
+      resolve(sent);
+    };
+
+    const timer = setTimeout(() => done(false), TIMEOUT);
+
+    // ── 所有 listener 在 sendMessage 之前注册，避免快速完成时错过事件 ──
+
+    const markUploadSuccess = () => {
+      uploadSucceeded = true;
+      if (ackSucceeded) {
+        done(true);
+      }
+    };
+
+    const taskListener = (task: any) => {
+      if (settled) return;
+      if (
+        task instanceof MessageTask &&
+        clientSeq !== null &&
+        task.message.clientSeq === clientSeq &&
+        (task.status === TaskStatus.success || task.status === TaskStatus.fail)
+      ) {
+        if (task.status === TaskStatus.fail) {
+          done(false);
+          return;
+        }
+        markUploadSuccess();
+      }
+    };
+    WKSDK.shared().taskManager.addListener(taskListener);
+
+    let pendingAcks: any[] = [];
+    const ackListener = (ackPacket: any) => {
+      if (settled) return;
+      if (clientSeq === null) {
+        pendingAcks.push(ackPacket);
+        return;
+      }
+      if (ackPacket.clientSeq === clientSeq) {
+        if (!isSuccessfulSendAck(ackPacket)) {
+          done(false);
+          return;
+        }
+        ackSucceeded = true;
+        if (uploadSucceeded) {
+          done(true);
+        }
+      }
+    };
+    WKSDK.shared().chatManager.addMessageStatusListener(ackListener);
+
+    // 发送消息（内部会 addTask → task.start()，所有 listener 已就绪）
+    let enqueued = false;
+    let message: Message;
+    try {
+      message = await this.sendMessage(content, channel, vm);
+    } catch (err) {
+      // 未入队：调用方据此保留草稿供重试。
+      done(false);
+      throw err;
+    }
+    // 已入队：本地气泡已经出现在消息列表里，之后无论上传/ack 成功与否，
+    // 用户都能在气泡上重发，输入框不应再把这条内容拿回来 (octo-web#1280)。
+    enqueued = true;
+    onEnqueued?.();
+    clientSeq = message.clientSeq;
+
+    // sendMessage 返回后主动检查
+    if (!settled) {
+      const taskMap = (WKSDK.shared().taskManager as any).taskMap as
+        | Map<string, { status: TaskStatus }>
+        | undefined;
+      const task = taskMap?.get(message.clientMsgNo);
+      const taskResult = taskStatusWaitResult(
+        task?.status,
+        TaskStatus.success,
+        TaskStatus.fail
+      );
+      if (taskResult === false) {
+        done(false);
+      }
+      if (!settled && taskResult === true) {
+        markUploadSuccess();
+      }
+
+      // 检查暂存的 ack（ack 在 clientSeq 赋值前到达的情况）
+      const found = pendingAcks.some((p) => p.clientSeq === clientSeq);
+      const matchedAck = pendingAcks.find((p) => p.clientSeq === clientSeq);
+      pendingAcks = []; // 立即释放无关 ack 引用
+      if (found) {
+        if (!isSuccessfulSendAck(matchedAck)) {
+          done(false);
+        } else {
+          ackSucceeded = true;
+          if (uploadSucceeded) {
+            done(true);
+          }
+        }
+      }
+      // 最终 fallback：检查 message.status（VM 可能已经处理了 ack）
+      const statusResult = messageStatusWaitResult(
+        message.status,
+        MessageStatus.Normal,
+        MessageStatus.Fail
+      );
+      if (!settled && statusResult === false) {
+        done(false);
+      }
+      if (!settled && statusResult === true) {
+        ackSucceeded = true;
+        if (uploadSucceeded) done(true);
+      }
+    }
+
+    // 等 upload+ack 结果（或超时）只为保证发送顺序；对外只告知「是否已入队」。
+    const delivered = await promise;
+    if (!delivered) {
+      console.warn(
+        "[Conversation] media message not confirmed (upload/ack failed or timed out); the bubble keeps its failure state and can be resent"
+      );
+    }
+    return enqueued;
+  }
+
+  /**
+   * 发送文本消息并等待服务端 ack 回来后才返回。
+   * 用于连续发送多条消息时保证本地回显顺序与服务端一致：
+   * 每条消息拿到 messageSeq 后 order 被正确设置，再发下一条时 fillOrder 不会乱。
+   * 超时 10s 自动 resolve（文本消息不需要上传，ack 应该很快回来）。
+   *
+   * 返回值语义同 sendMediaAndWait (octo-web#1280)：**是否已入队**。ack 超时
+   * （慢网/丢 ack）不再上报失败，否则已经发出去的文字会被塞回输入框。
+   */
+  private async sendTextAndWaitAck(
+    content: MessageContent,
+    channel?: Channel,
+    onEnqueued?: () => void,
+    vm: ConversationVM = this.vm
+  ): Promise<boolean> {
+    const TIMEOUT = 10_000;
+    let settled = false;
+    let clientSeq: number | null = null;
+
+    const { promise, resolve } = (() => {
+      let res: (sent: boolean) => void;
+      const p = new Promise<boolean>((r) => {
+        res = r;
+      });
+      return { promise: p, resolve: res! };
+    })();
+
+    const done = (sent: boolean) => {
+      if (settled) return;
+      settled = true;
+      pendingAcks = []; // 释放暂存引用
+      queueMicrotask(() => {
+        WKSDK.shared().chatManager.removeMessageStatusListener(statusListener);
+      });
+      clearTimeout(timer);
+      resolve(sent);
+    };
+
+    const timer = setTimeout(() => done(false), TIMEOUT);
+
+    // 在 sendMessage 之前注册 listener，避免快速 ack 竞态
+    let pendingAcks: any[] = [];
+    const statusListener = (ackPacket: any) => {
+      if (settled) return;
+      if (clientSeq === null) {
+        pendingAcks.push(ackPacket);
+        return;
+      }
+      if (ackPacket.clientSeq === clientSeq) {
+        done(isSuccessfulSendAck(ackPacket));
+      }
+    };
+    WKSDK.shared().chatManager.addMessageStatusListener(statusListener);
+
+    let enqueued = false;
+    let message: Message;
+    try {
+      message = await this.sendMessage(content, channel, vm);
+    } catch (err) {
+      // 未入队（例如发送前编码抛错）→ 调用方保留草稿供重试。
+      done(false);
+      throw err;
+    }
+    // 已入队：气泡已在消息列表，ack 结果只影响气泡状态，不影响输入框 (#1280)。
+    enqueued = true;
+    onEnqueued?.();
+    clientSeq = message.clientSeq;
+
+    // fallback：检查暂存的 ack 或已处理的 status
+    if (!settled) {
+      const found = pendingAcks.some((p) => p.clientSeq === clientSeq);
+      const matchedAck = pendingAcks.find((p) => p.clientSeq === clientSeq);
+      pendingAcks = []; // 立即释放无关 ack 引用
+      if (found) {
+        done(isSuccessfulSendAck(matchedAck));
+      }
+      const statusResult = messageStatusWaitResult(
+        message.status,
+        MessageStatus.Normal,
+        MessageStatus.Fail
+      );
+      if (!settled && statusResult !== undefined) {
+        done(statusResult);
+      }
+    }
+
+    // 等 ack（或超时）只为保证发送顺序；对外只告知「是否已入队」。
+    const delivered = await promise;
+    if (!delivered) {
+      console.warn(
+        "[Conversation] text message not acked (failed or timed out); the bubble keeps its failure state and can be resent"
+      );
+    }
+    return enqueued;
+  }
+
+  /**
+   * 图文混排发送：把编辑器里穿插的 text / image 块聚合成单条 RichText(=14) 消息。
+   *
+   * 仅在「同时含文本和图片、且无非图片文件块」时触发（见 onSend）。纯文本仍走
+   * 文本消息(type=1)、纯图片仍走 ImageContent(type=2)，避免回退已落地的发送路径。
+   *
+   * - blocks schema 复用 #218 接收侧 RichTextContent 同一份定义（makeTextBlock /
+   *   makeImageBlock），wire-format 与 octo-lib 权威 schema byte-match。
+   * - 原子性：单条 RichText 是一个整体，任一图片上传失败 / URL 不安全 / 本地尺寸读取
+   *   失败 → 整条消息发送中止（抛错），调用方不清草稿、用户可重试，绝不静默丢图。
+   * - 图片尺寸取**本地文件**（与纯图片路径一致），不依赖刚上传的 downloadUrl，避免
+   *   CDN read-after-write 延迟导致 width/height=0 违反 image schema 必填>0。
+   * - 上传成功后图片 URL 走 isSafeUrl(http/https only)（与接收侧对称，防 javascript:/
+   *   data:/file: 注入）。
+   * - plain 由 createRichTextContent 本地占位，server #232 Finalize 重算覆盖。
+   * - mention：合并各文本块的 all/uids/humans/ais/entities 到顶层。entities
+   *   的 offset 映射到最终 plain 文本（image block 计为 "[图片]"），让接收端
+   *   RichText 文本块可以复用普通文本的 mention 高亮/点击逻辑。
+   *
+   * 返回 true 表示消息已入队；任一图片块准备失败则抛错（已 Toast 具体原因）。
+   */
+  private async sendRichTextMixed(
+    editorBlocks: EditorContentBlock[],
+    reply?: Reply,
+    onEnqueued?: () => void,
+    channel: Channel = this.channel(),
+    vm: ConversationVM = this.vm
+  ): Promise<boolean> {
+    const contentBlocks: RichTextBlock[] = [];
+
+    // 合并 mention（跨多个文本块）。
+    let mentionAll = false;
+    const mentionUids = new Set<string>();
+    let mentionHumans = false;
+    let mentionAis = false;
+    const mentionEntities: Array<{
+      uid: string;
+      offset: number;
+      length: number;
+    }> = [];
+    let plainOffset = 0;
+
+    // 单张图片准备失败 → Toast 具体原因后抛错，让整条消息原子失败（草稿保留可重试）。
+    const failImage = (file: File, message: string): never => {
+      Toast.error(
+        t("base.conversation.upload.imageFailed", {
+          values: { name: file.name, message },
+        })
+      );
+      const e = new Error(
+        `richtext mixed image prepare failed: ${file.name}`
+      ) as Error & { toasted?: boolean };
+      // 标记已 Toast，调用方 catch 不再重复弹通用错误。
+      e.toasted = true;
+      throw e;
+    };
+
+    for (const block of editorBlocks) {
+      if (block.type === "text") {
+        if (block.text) {
+          contentBlocks.push(makeTextBlock(block.text));
+        }
+        const m = block.mention;
+        if (m) {
+          if (m.all) mentionAll = true;
+          if (m.humans) mentionHumans = true;
+          if (m.ais) mentionAis = true;
+          m.uids?.forEach((uid) => mentionUids.add(uid));
+          mentionEntities.push(
+            ...offsetMentionEntities(m.entities, plainOffset)
+          );
+        }
+        plainOffset += block.text.length;
+      } else if (block.type === "image") {
+        const file = block.file;
+        // 1. 先从本地文件读尺寸（schema 必填>0，且不受 CDN 延迟影响）。
+        const { width, height } = await readLocalImageSize(file);
+        if (width <= 0 || height <= 0) {
+          failImage(
+            file,
+            t("base.conversation.upload.imageReadFailed", {
+              values: { name: file.name },
+            })
+          );
+        }
+        // 2. 上传拿 downloadUrl。
+        const dot = (file.name || "").lastIndexOf(".");
+        const ext = dot > 0 ? file.name.substring(dot + 1) : "";
+        let url: string;
+        try {
+          url = await uploadChatMedia(file, channel, ext);
+        } catch (err) {
+          const msg =
+            (err as { msg?: string })?.msg ||
+            t("base.conversation.upload.failed");
+          failImage(file, msg);
+        }
+        // 3. 安全：发送前图片 URL 走 isSafeUrl(http/https only)，与接收侧对称。
+        if (!isSafeUrl(url!)) {
+          failImage(file, t("base.conversation.upload.failed"));
+        }
+        contentBlocks.push(
+          makeImageBlock({
+            url: url!,
+            width,
+            height,
+            size: file.size,
+            name: file.name || undefined,
+          })
+        );
+        plainOffset += RichTextImagePlaceholder.length;
+      }
+      // file 块在 onSend 已被排除在图文混排路径之外
+    }
+
+    if (contentBlocks.length === 0) {
+      return false;
+    }
+
+    const content = createRichTextContent(contentBlocks);
+    if (reply) {
+      content.reply = reply;
+    }
+    if (
+      mentionAll ||
+      mentionUids.size > 0 ||
+      mentionHumans ||
+      mentionAis ||
+      mentionEntities.length > 0
+    ) {
+      const mn = new Mention();
+      mn.all = mentionAll;
+      if (mentionUids.size > 0) mn.uids = Array.from(mentionUids);
+      if (mentionHumans) (mn as any).humans = 1;
+      if (mentionAis) (mn as any).ais = 1;
+      if (mentionEntities.length > 0) (mn as any).entities = mentionEntities;
+      content.mention = mn;
+    }
+    return this.sendTextAndWaitAck(content, channel, onEnqueued, vm);
+  }
+
+  scrollToBottom(animate?: boolean): void {
+    this.vm.scrollToBottom(animate || false);
+  }
+  insertText(text: string): void {
+    const ctx = this.messageInputContext();
+    if (ctx) {
+      ctx.insertText(text);
+    } else {
+      // MessageInput 的 useEffect 尚未执行，延迟重试
+      this._pendingInsertText = text;
+    }
+  }
+  /** 恢复草稿内容（替换编辑器内容，解析 @[uid:label] 为 mention 节点） */
+  restoreDraft(text: string): void {
+    const ctx = this.messageInputContext();
+    if (ctx) {
+      ctx.restoreDraft(text);
+    } else {
+      // MessageInput 的 useEffect 尚未执行，延迟重试
+      this._pendingRestoreDraft = text;
+    }
+  }
+  editOn(): boolean {
+    return this.vm.editOn;
+  }
+  setEditOn(edit: boolean): void {
+    this.vm.editOn = edit;
+    if (
+      this.vm.selectMessage &&
+      edit &&
+      isMessageSelectable(this.vm.selectMessage)
+    ) {
+      this.vm.checkedMessage(this.vm.selectMessage, true);
+    }
+  }
+  getCheckedMessageCount(): number {
+    return this.vm.getCheckedMessages().length;
+  }
+  clearCheckedMessages(): void {
+    this.vm.unCheckAllMessages();
+  }
+  checkeMessage(message: Message, checked: boolean): void {
+    this.vm.checkedMessage(message, checked);
+  }
+  deleteMessages(messages: Message[]): void {
+    this.vm.deleteMessages(messages);
+  }
+  revokeMessage(message: Message): Promise<void> {
+    return this.vm.revokeMessage(message);
+  }
+  editMessage(
+    messageID: String,
+    messageSeq: number,
+    channelID: String,
+    channelType: number,
+    content: String
+  ): Promise<void> {
+    return this.vm.editMessage(
+      messageID,
+      messageSeq,
+      channelID,
+      channelType,
+      content
+    );
+  }
+  onTapAvatar(uid: string, event: React.MouseEvent<Element, MouseEvent>): void {
+    // webhook 发送者（iwh_*）不是群成员，没有个人资料 / 可执行动作。
+    // MessageRow 已在 isWebhook 时省略头像点击 handler，这里做 defense-in-depth：
+    // 即便其它调用方硬传了 onTapAvatar，也不为 iwh_* 弹出头像动作菜单。
+    if (isIncomingWebhookSender(uid)) {
+      return;
+    }
+    this.vm.selectUID = uid;
+    let trigger: ContextMenusTrigger = event;
+    // Enter / Space 触发的原生 button click 没有指针坐标，改用按钮右下角定位。
+    if (event.detail === 0) {
+      const rect = event.currentTarget.getBoundingClientRect();
+      trigger = {
+        clientX: rect.right,
+        clientY: rect.bottom,
+        preventDefault: () => undefined,
+      };
+    }
+    this.avatarMenusContext.show(trigger);
+  }
+
+  // 定位消息
+  locateMessage(messageSeq: number) {
+    const highlightAndScroll = (messageWrap: MessageWrap) => {
+      messageWrap.locateRemind = true;
+      this.vm.notifyListener(() => {
+        this.vm.scrollToMessage(messageWrap);
+      });
+    };
+    const messageWrap = this.vm.findMessageWithMessageSeq(messageSeq);
+    if (messageWrap) {
+      const foldSession = this.vm.findFoldSessionByMessageSeq(messageSeq);
+      if (foldSession) {
+        const isSummaryMessage = isFoldSessionSummaryMessage(
+          foldSession,
+          messageSeq
+        );
+        if (isSummaryMessage) {
+          this.vm.highlightFoldSessionSummary(foldSession.sessionId, () => {
+            this.vm.scrollToFoldSession(foldSession.sessionId);
+          });
+          return;
+        }
+        if (foldSession.isExpanded) {
+          highlightAndScroll(messageWrap);
+          return;
+        }
+        this.vm.setFoldSessionExpanded(
+          foldSession.sessionId,
+          true,
+          false,
+          () => {
+            highlightAndScroll(messageWrap);
+          },
+        );
+        return;
+      }
+      highlightAndScroll(messageWrap);
+      return;
+    }
+    this.vm.requestMessagesAroundMessageSeq(messageSeq, () => {
+      if (this.vm.findMessageWithMessageSeq(messageSeq)) {
+        this.locateMessage(messageSeq);
+      }
+    });
+  }
+
+  // 显示用户信息
+  showUser(uid: string) {
+    let fromChannel: Channel | undefined;
+    let vercode: string | undefined;
+    if (
+      this.vm.channel.channelType === ChannelTypeGroup ||
+      this.vm.channel.channelType === ChannelTypeCommunityTopic
+    ) {
+      fromChannel = this.vm.channel;
+      const subscriber = this.vm.subscriberWithUID(uid);
+      if (subscriber?.orgData?.vercode) {
+        vercode = subscriber?.orgData?.vercode;
+      }
+    }
+    WKApp.shared.baseContext.showUserInfo(uid, fromChannel, vercode);
+  }
+
+  // 回复消息
+  reply(message: Message, handlerType: number): void {
+    this.addReplyMention(message.fromUID);
+    if (handlerType === 2) {
+      let content = message.remoteExtra?.isEdit
+        ? message.remoteExtra?.contentEdit?.conversationDigest
+        : message.content.conversationDigest;
+      this.insertText(content);
+    }
+    this.vm.currentHandlerType = handlerType;
+    this.vm.currentReplyMessage = message;
+    // 自动聚焦输入框
+    this._messageInputContext?.focus();
+  }
+
+  setDragFileCallback(f: (file: File) => void): void {
+    this._dragFileCallback = f;
+  }
+
+  // ── Attachment Queue (#143 / #144) ──────────────────────────────────────
+
+  getPendingAttachments(): File[] {
+    // 从编辑器中获取附件文件
+    return this._messageInputContext?.getAttachmentFiles() || [];
+  }
+
+  async addPendingAttachments(
+    files: File[],
+    source: "paste" | "upload" = "upload"
+  ): Promise<string | null> {
+    const BLOCKED_EXTENSIONS = [
+      "exe",
+      "bat",
+      "sh",
+      "cmd",
+      "msi",
+      "dll",
+      "php",
+      "jsp",
+      "apk",
+      "com",
+      "scr",
+      "pif",
+      "vbs",
+      "js",
+      "wsf",
+      "ps1",
+    ];
+    const incoming = Array.from(files);
+
+    // 检查类型黑名单
+    for (const f of incoming) {
+      const ext = f.name.substring(f.name.lastIndexOf(".") + 1).toLowerCase();
+      if (BLOCKED_EXTENSIONS.includes(ext)) {
+        return t("base.conversation.upload.blockedExtension", {
+          values: { extension: ext },
+        });
+      }
+    }
+
+    // 大小校验（octo-web#3173）：单入口统一拦截，按钮/粘贴/拖拽三路共用。
+    // 阈值复用既有常量 ConversationVM.MAX_TOTAL_SIZE（100MB），不另立阈值。
+    // 单文件超限：任一文件本身就超过总上限时直接拒绝。
+    const maxTotal = ConversationVM.MAX_TOTAL_SIZE;
+    const maxSizeLabel = formatFileSize(maxTotal);
+    const oversized = incoming.find((f) => f.size > maxTotal);
+    if (oversized) {
+      return t("base.conversation.upload.fileTooLarge", {
+        values: { name: oversized.name, max: maxSizeLabel },
+      });
+    }
+    // 总大小超限：本次新增 + 已在待发送队列里的累加。
+    const existing = this.getPendingAttachments();
+    const existingSize = existing.reduce((sum, f) => sum + f.size, 0);
+    const incomingSize = incoming.reduce((sum, f) => sum + f.size, 0);
+    if (existingSize + incomingSize > maxTotal) {
+      return t("base.conversation.upload.totalTooLarge", {
+        values: { max: maxSizeLabel },
+      });
+    }
+
+    // 调用编辑器的 addAttachment 方法插入附件节点
+    if (this._addAttachmentFn) {
+      await this._addAttachmentFn(incoming, source);
+    }
+    return null;
+  }
+
+  removePendingAttachment(_index: number): void {
+    // 附件现在由编辑器管理，通过编辑器节点删除
+    // 此方法保留以兼容接口，但不再需要手动调用
+  }
+
+  clearPendingAttachments(): void {
+    // 附件现在由编辑器管理，清空编辑器内容时会自动清除
+    // 此方法保留以兼容接口
+  }
+
+  /**
+   * 尝试消费一次性 initialCompose（plan Task 4）。
+   *
+   * 在 MessageInput 就绪（onContext 设好 _messageInputContext / _addAttachmentFn）后、以及收到新
+   * requestId 的 componentDidUpdate 中调用。真正的原子装入 + 去重逻辑在 initialCompose.ts 里，
+   * 这里只把 Conversation 的 MessageInput/附件能力适配成 ComposeHost。绝不绕过 MessageInput 直接 sendMessage。
+   */
+  private tryConsumeInitialCompose(): void {
+    const compose = this.props.initialCompose;
+    if (!compose) return;
+    if (this._consumedComposeIds.has(compose.requestId)) return;
+    // 未就绪（onContext 尚未回调）时不消费，等待下一次 ready-retry。
+    const messageInputContext = this._messageInputContext;
+    if (!messageInputContext) return;
+
+    const generation = this._initialComposeGeneration;
+    const channelKey = `${this.props.channel.channelID}:${this.props.channel.channelType}`;
+    const isLive = () =>
+      this._initialComposeMounted &&
+      generation === this._initialComposeGeneration &&
+      this.props.initialCompose?.requestId === compose.requestId &&
+      `${this.props.channel.channelID}:${this.props.channel.channelType}` === channelKey;
+    const host: ComposeHost = {
+      isReady: () => true,
+      isLive,
+      currentDraftText: () => messageInputContext.text() ?? "",
+      pendingAttachmentCount: () => this.getPendingAttachments().length,
+      restoreDraft: (text: string) => messageInputContext.restoreDraft(text),
+      // 复用唯一附件权威校验（扩展名/100MB 总量），失败返回错误描述。
+      addPendingAttachments: (files: File[]) => this.addPendingAttachments(files),
+      // 经 MessageInput 发送（与回车发送同一路径），保留上传/ACK/失败保留语义。
+      send: () => messageInputContext.send(),
+    };
+
+    void tryConsumeInitialCompose(
+      compose,
+      host,
+      this._consumedComposeIds,
+      this.props.onInitialComposeStateChange
+    );
+  }
+
+  channel(): Channel {
+    return this.vm.channel;
+  }
+
+  // 显示消息上下文菜单
+  showContextMenus(message: Message, event: React.MouseEvent) {
+    this.vm.selectMessage = message;
+    this.setState({ contextMenuMessageID: message.messageID });
+
+    // 缓存当前选区文本（仅当选区完全落在本次右键的那条消息容器内时）。
+    // 用 event.currentTarget（收到 contextmenu 事件的那条消息容器）做归属判定，
+    // 而非枚举 CSS class 白名单——折叠摘要、折叠卡片内展开行、普通消息都把
+    // onContextMenu 绑在各自的消息容器上，因此同一套判定天然覆盖三者，且不会
+    // 因新增渲染容器漏补白名单而回归（#513）。
+    this._cachedSelectedText = captureSelectionWithinContainer(
+      window.getSelection(),
+      event.currentTarget as HTMLElement
+    );
+
+    this.contextMenusContext.show(event);
+    // 破例:右键 contextmenu 走原生事件而非委托蒙版,命令式补点。props 恒空。
+    Dap.shared.track("message_context_menu_opened", {});
+  }
+  hideContextMenus(): void {
+    this.contextMenusContext.hide();
+    this.setState({ contextMenuMessageID: null });
+  }
+
+  isContextMenuOpen(message: Message): boolean {
+    return this.state.contextMenuMessageID === message.messageID;
+  }
+
+  getCachedSelectedText(): string | null {
+    return this._cachedSelectedText;
+  }
+
+  messageInputContext(): MessageInputContext | undefined {
+    return this._messageInputContext;
+  }
+
+  forceStandaloneMessage(message: Message): boolean {
+    // 紧跟在折叠卡片后的消息，强制独立（避免 preMessage 仍指向卡片内消息导致头像丢失）
+    if (this.vm.afterFoldSessionClientMsgNos.has(message.clientMsgNo)) {
+      return true;
+    }
+
+    const foldSession =
+      message.messageSeq > 0
+        ? this.vm.findFoldSessionByMessageSeq(message.messageSeq)
+        : undefined;
+    if (foldSession?.isExpanded) {
+      return foldSession.expandedMessages.some(
+        (expandedMessage) => expandedMessage.clientMsgNo === message.clientMsgNo
+      );
+    }
+    for (const item of this.vm.renderItems) {
+      if (item.type !== "foldSession" || !item.session.isExpanded) {
+        continue;
+      }
+      if (
+        item.session.expandedMessages.some(
+          (expandedMessage) =>
+            expandedMessage.clientMsgNo === message.clientMsgNo
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  componentDidMount() {
+    this._initialComposeMounted = true;
+    this.subscribeComposeRecovery();
+    const { channel, onContext } = this.props;
+    if (onContext) {
+      onContext(this);
+    }
+    if (!this.props.isAuxiliary) {
+      WKApp.shared.openChannel = channel;
+      this._ownedOpenChannel = channel;
+      Conversation.openChannelOwner = this._openChannelOwner;
+    }
+
+    // 辅助 Thread 不覆盖主会话的全局附件守卫；否则开关侧栏会让主会话
+    // 的待发送附件失去离开确认，或被侧栏草稿反向阻塞。
+    if (!this.props.isAuxiliary) {
+      // 只保护「compose 已清空但本地气泡还没出现」的数据丢失窗口。消息一旦入队，
+      // 即使仍在等 upload/ack，也已有气泡承载失败与重试，不应再弹“未发送附件”确认。
+      WKApp.shared.pendingAttachmentGuard = () =>
+        this.getPendingAttachments().length === 0 &&
+        this.pendingPreEnqueueCount() === 0;
+      WKApp.shared.pendingAttachmentGuardId = this._guardId;
+    }
+
+    if (this.vm.hasDraft()) {
+      const draft = this.vm.draft();
+      const pendingOwners = composeRecoveryStore.matchPendingDraft(
+        this.composeRecoveryKey(),
+        draft,
+      );
+      // Attempt-owned recovery is the visible source while this provisional
+      // remote draft belongs to a consumed compose.
+      if (pendingOwners.length === 0) this.restoreDraft(draft);
+    }
+    // 恢复引用/回复状态
+    const channelKey = `${channel.channelID}-${channel.channelType}`;
+    const cachedReplyState = Conversation.replyStateCache.get(channelKey);
+    if (cachedReplyState) {
+      this.vm.currentReplyMessage = cachedReplyState.message;
+      this.vm.currentHandlerType = cachedReplyState.handlerType;
+      Conversation.replyStateCache.delete(channelKey);
+    }
+
+    this._exitMultipleModeHandler = () => {
+      this.vm.editOn = false;
+      this.vm.unCheckAllMessages();
+      this.forceUpdate();
+    };
+    WKApp.mittBus.on("wk:exit-multiple-mode", this._exitMultipleModeHandler);
+    WKApp.mittBus.on("wk:app-foreground", this._attentionRefreshHandler);
+    WKApp.mittBus.on("wk:active-menu-changed", this._attentionRefreshHandler);
+    this._unsubscribeVmAttentionListener = this.vm.addListener(
+      this._vmAttentionListener
+    );
+
+    window.addEventListener("beforeunload", this._beforeUnloadHandler);
+
+    // 群解散时 channelInfo.status 翻转为 Disband(2)，触发重渲染以收起成员栏/置灰发送框。
+    // 仅当变化的是当前会话的频道（或子区会话的父群）时才 forceUpdate，避免无关刷新。
+    this._channelInfoListener = (channelInfo: ChannelInfo) => {
+      const { channel } = this.props;
+      const changed = channelInfo.channel;
+      if (!changed) return;
+      const isSelf =
+        changed.channelID === channel.channelID &&
+        changed.channelType === channel.channelType;
+      let isParentGroup = false;
+      if (channel.channelType === ChannelTypeCommunityTopic) {
+        const parsed = parseThreadChannelId(channel.channelID);
+        isParentGroup =
+          !!parsed &&
+          changed.channelType === ChannelTypeGroup &&
+          changed.channelID === parsed.groupNo;
+      }
+      if (isSelf || isParentGroup) {
+        this.forceUpdate();
+      }
+    };
+    this._unsubscribeChannelInfoListener = addImChannelInfoListener(
+      WKSDK.shared(),
+      this._channelInfoListener
+    );
+    // 进入会话时主动拉取一次最新 channelInfo，确保解散状态(status)不依赖陈旧缓存。
+    // 群聊查自身；子区(CommunityTopic)解散状态在父群上，需拉父群。
+    if (channel.channelType === ChannelTypeGroup) {
+      fetchImChannelInfo(WKSDK.shared(), channel);
+    } else if (channel.channelType === ChannelTypeCommunityTopic) {
+      const parsed = parseThreadChannelId(channel.channelID);
+      if (parsed) {
+        fetchImChannelInfo(
+          WKSDK.shared(),
+          new Channel(parsed.groupNo, ChannelTypeGroup)
+        );
+      }
+    }
+
+    this.vm.onFirstMessagesLoaded = () => {
+      this.updateBrowseToMessageSeqAndReminderDoneIfNeed();
+
+      this.uploadReadedIfNeed();
+    };
+
+    this.vm.markUnread();
+  }
+
+  componentDidUpdate(prevProps: ConversationProps) {
+    // 收到新的 initialCompose.requestId 时再次尝试消费（plan Task 4）。ready 前只记录 pending：
+    // tryConsumeInitialCompose 内部已判断 _messageInputContext 是否 ready 与 requestId 是否已消费，
+    // 所以相同 requestId 的重渲染不会重发。
+    const prev = prevProps.initialCompose?.requestId;
+    const next = this.props.initialCompose?.requestId;
+    const channelChanged =
+      prevProps.channel.channelID !== this.props.channel.channelID ||
+      prevProps.channel.channelType !== this.props.channel.channelType;
+    if (channelChanged || prev !== next) {
+      this._initialComposeGeneration += 1;
+    }
+    if (channelChanged) {
+      composeRecoveryStore.release(
+        this.composeRecoveryKey(prevProps.channel),
+        this._composeRecoveryOwner,
+      );
+      this.subscribeComposeRecovery();
+    }
+    if (next && next !== prev) {
+      this.tryConsumeInitialCompose();
+    }
+    this._vmAttentionListener();
+  }
+
+  componentWillUnmount() {
+    this._initialComposeMounted = false;
+    this._initialComposeGeneration += 1;
+    if (this._exitMultipleModeHandler) {
+      WKApp.mittBus.off("wk:exit-multiple-mode", this._exitMultipleModeHandler);
+      this._exitMultipleModeHandler = undefined;
+    }
+    WKApp.mittBus.off("wk:app-foreground", this._attentionRefreshHandler);
+    WKApp.mittBus.off("wk:active-menu-changed", this._attentionRefreshHandler);
+    this._unsubscribeVmAttentionListener?.();
+    this._unsubscribeVmAttentionListener = undefined;
+    this._unsubscribeComposeRecovery?.();
+    this._unsubscribeComposeRecovery = undefined;
+    composeRecoveryStore.release(
+      this.composeRecoveryKey(),
+      this._composeRecoveryOwner,
+    );
+    window.removeEventListener("beforeunload", this._beforeUnloadHandler);
+    if (this._channelInfoListener) {
+      this._unsubscribeChannelInfoListener?.();
+      this._unsubscribeChannelInfoListener = undefined;
+      this._channelInfoListener = undefined;
+    }
+    // 注销附件守卫：只清除自己注册的，防止新实例 guard 被旧实例 unmount 覆盖
+    if (WKApp.shared.pendingAttachmentGuardId === this._guardId) {
+      WKApp.shared.pendingAttachmentGuard = undefined;
+      WKApp.shared.pendingAttachmentGuardId = undefined;
+    }
+    // 附件现在由编辑器管理，组件卸载时编辑器会自动清理
+    this.dealloc();
+  }
+  dealloc() {
+    if (this.scrollTimer) {
+      clearTimeout(this.scrollTimer);
+      this.scrollTimer = null;
+    }
+    // 保存引用/回复状态到缓存
+    const channelKey = `${this.props.channel.channelID}-${this.props.channel.channelType}`;
+    if (this.vm.currentReplyMessage) {
+      Conversation.replyStateCache.set(channelKey, {
+        message: this.vm.currentReplyMessage,
+        handlerType: this.vm.currentHandlerType,
+      });
+      // Evict oldest entries when cache exceeds max size
+      if (
+        Conversation.replyStateCache.size >
+        Conversation.REPLY_STATE_CACHE_MAX_SIZE
+      ) {
+        const firstKey = Conversation.replyStateCache.keys().next().value;
+        if (firstKey !== undefined) {
+          Conversation.replyStateCache.delete(firstKey);
+        }
+      }
+    } else {
+      Conversation.replyStateCache.delete(channelKey);
+    }
+    this.vm.markUnread();
+    this.markConversationExtra();
+    if (Conversation.openChannelOwner === this._openChannelOwner) {
+      if (
+        isOwnedConversationSingleton(
+          WKApp.shared.openChannel,
+          this._ownedOpenChannel
+        )
+      ) {
+        WKApp.shared.openChannel = undefined;
+      }
+      Conversation.openChannelOwner = undefined;
+    }
+    this._ownedOpenChannel = undefined;
+    this.vm.releaseOpenConversationOwnership();
+  }
+
+  private pendingPreEnqueueCount(): number {
+    return (
+      this.messageInputContext()?.pendingPreEnqueueCount?.(
+        this.composeRecoveryKey(),
+      ) ?? 0
+    );
+  }
+
+  private pendingSendDrafts(channelKey?: string): PendingSendDraft[] {
+    return this.messageInputContext()?.pendingSendDrafts?.(channelKey) ?? [];
+  }
+
+  private pendingPreEnqueueDrafts(channelKey?: string): PendingSendDraft[] {
+    return (
+      this.messageInputContext()?.pendingPreEnqueueDrafts?.(channelKey) ?? []
+    );
+  }
+
+  private composeRecoveryKey(channel = this.props.channel): string {
+    return `${channel.channelID}:${channel.channelType}`;
+  }
+
+  private refreshComposeRecoveries = (): void => {
+    if (!this._initialComposeMounted) return;
+    const recoveredComposes = composeRecoveryStore.claim(
+      this.composeRecoveryKey(),
+      this._composeRecoveryOwner,
+    );
+    this.setState({ recoveredComposes: [...recoveredComposes] });
+  }
+
+  private subscribeComposeRecovery(): void {
+    this._unsubscribeComposeRecovery?.();
+    this._unsubscribeComposeRecovery = composeRecoveryStore.subscribe(
+      this.composeRecoveryKey(),
+      this.refreshComposeRecoveries,
+    );
+    this.refreshComposeRecoveries();
+  }
+
+  private recordComposeRecovery = (recovery: ComposeRecoveryRecord): boolean => {
+    if (composeRecoveryStore.add(recovery)) return true;
+    const existing = composeRecoveryStore
+      .list(recovery.channelKey)
+      .find(({ attemptId }) => attemptId === recovery.attemptId);
+    return !!existing && hasSameComposeRecoveryResources(existing, recovery);
+  };
+
+  private consumeComposeRecoveries = ({
+    attemptIds,
+    draftText,
+  }: RecoveredComposeHydration): void => {
+    composeRecoveryStore.consume(
+      this.composeRecoveryKey(),
+      this._composeRecoveryOwner,
+      attemptIds,
+      draftText,
+    );
+    void this.updateConversationExtra(draftText).catch((err) =>
+      console.warn("[Conversation] persist recovered draft failed", err),
+    );
+  };
+
+  markConversationExtra() {
+    // 不要用空草稿覆盖「已消费但还没入队」的内容 (octo-web#1280 review)：
+    // 输入框在发送开始时就被清空，离开会话时这里读到的是空串。
+    const channelKey = this.composeRecoveryKey();
+    const pendingDrafts = this.pendingPreEnqueueDrafts(channelKey);
+    const { draft, source } = resolveDraftToPersist({
+      liveDraft: this.messageInputContext()?.text() || "",
+      pendingDrafts,
+    });
+    composeRecoveryStore.recordDraft(channelKey, {
+      draft,
+      source,
+      pendingDrafts,
+    });
+    void this.updateConversationExtra(draft).catch((err) =>
+      console.warn("[Conversation] persist draft failed", err),
+    );
+  }
+
+  updateConversationExtra(
+    draft: string,
+    context: ConversationSendTransactionContext = {
+      channel: this.props.channel,
+      channelKey: this.composeRecoveryKey(),
+      vm: this.vm,
+    },
+  ) {
+    const { channel, channelKey, vm } = context;
+    const viewport = document.getElementById(vm.messageContainerId);
+    const remoteExtra = vm.currentConversation?.remoteExtra;
+    const conversationLastMessageSeq = vm.conversationLastMessageSeq();
+    const lastVisiableMessage = this.visiblePersistentMessage(
+      viewport,
+      true,
+      vm
+    );
+    let keepMessageSeq = remoteExtra?.keepMessageSeq ?? 0;
+    let keepOffsetY = remoteExtra?.keepOffsetY ?? 0;
+    if (viewport) {
+      if (
+        conversationLastMessageSeq > 0 &&
+        lastVisiableMessage &&
+        lastVisiableMessage.messageSeq >= conversationLastMessageSeq
+      ) {
+        keepMessageSeq = 0;
+        keepOffsetY = 0;
+      } else {
+        const firstVisiableMessage = this.visiblePersistentMessage(
+          viewport,
+          false,
+          vm
+        );
+        const firstVisibleElement = firstVisiableMessage
+          ? this.getMessageElement(firstVisiableMessage, vm)
+          : null;
+        keepMessageSeq = firstVisiableMessage?.messageSeq || 0;
+        keepOffsetY = firstVisibleElement
+          ? getScrollAnchorOffsetY({
+              scrollTop: viewport.scrollTop,
+              anchorOffsetTop: firstVisibleElement.offsetTop,
+            })
+          : 0;
+      }
+    }
+
+    if (remoteExtra) {
+      remoteExtra.keepMessageSeq = keepMessageSeq;
+      remoteExtra.keepOffsetY = keepOffsetY;
+      remoteExtra.draft = draft || "";
+    }
+
+    const update = {
+      channel,
+      browseTo: 0,
+      keepMessageSeq: keepMessageSeq,
+      keepOffsetY,
+      draft,
+      version: 0,
+    };
+    return composeDraftWriteQueue.enqueue(channelKey, () =>
+      WKApp.dataSource.channelDataSource.conversationExtraUpdate(update),
+    );
+  }
+
+  async clearDraftAfterSend(
+    settlement: ChatSendSettlement,
+    context: ConversationSendTransactionContext = {
+      channel: this.props.channel,
+      channelKey: this.composeRecoveryKey(),
+      vm: this.vm,
+    },
+  ) {
+    const { attemptId, sendDraft } = settlement;
+    if (!sendDraft) return;
+    const { channelKey, vm } = context;
+    const remoteDraftAtSend = sendDraft.remoteDraft;
+    const remoteExtra = vm.currentConversation?.remoteExtra;
+    const remoteDraft = remoteExtra?.draft || "";
+    const persistedDraft = composeRecoveryStore.draftState(channelKey);
+    if (!persistedDraft || persistedDraft.draft !== remoteDraft) return;
+
+    const pendingDrafts = this.pendingSendDrafts(channelKey);
+    const channelActive = this.composeRecoveryKey() === channelKey;
+    const nextDraft = resolveDraftAfterSend({
+      attemptId,
+      protectedPendingAttemptIds:
+        sendDraft.protectedPendingAttemptIds.filter((protectedAttemptId) =>
+          persistedDraft.pendingAttemptIds.includes(protectedAttemptId),
+        ),
+      liveDraft: channelActive ? this.messageInputContext()?.text() || "" : "",
+      remoteDraft,
+      remoteDraftAtSend,
+      draftSavedAfterSend: persistedDraft.revision !== sendDraft.revision,
+      latestSavedDraft: persistedDraft.draft,
+      latestSavedDraftSource: persistedDraft.source,
+      latestSavedPendingAttemptIds: persistedDraft.pendingAttemptIds,
+      pendingDrafts,
+    });
+    if (nextDraft === undefined) {
+      return;
+    }
+
+    composeRecoveryStore.recordDraft(channelKey, {
+      draft: nextDraft,
+      source: nextDraft ? "pending" : "empty",
+      pendingDrafts: pendingDrafts.filter(
+        ({ attemptId: pendingAttemptId }) => pendingAttemptId !== attemptId,
+      ),
+    });
+    try {
+      await this.updateConversationExtra(nextDraft, context);
+    } catch (err) {
+      console.warn("[Conversation] clear draft after send failed", err);
+    }
+    if (vm.currentConversation) {
+      WKSDK.shared().conversationManager.notifyConversationListeners(
+        vm.currentConversation,
+        ConversationAction.update
+      );
+    }
+  }
+
+  _handleContextMenus(event: React.MouseEvent) {
+    this.contextMenusContext.show(event);
+  }
+
+  getMessageElement(
+    message: Message | MessageWrap,
+    vm: ConversationVM = this.vm
+  ) {
+    const foldSession =
+      message.messageSeq && message.messageSeq > 0
+        ? vm.findFoldSessionByMessageSeq(message.messageSeq)
+        : undefined;
+    if (foldSession?.isExpanded) {
+      const expandedElement = document.getElementById(
+        vm.foldSessionMessageElementId(message),
+      );
+      if (expandedElement) {
+        return expandedElement;
+      }
+    }
+    const element = document.getElementById(message.clientMsgNo);
+    if (element) {
+      return element;
+    }
+    if (!foldSession) {
+      return null;
+    }
+    return document.getElementById(foldSession.anchorId);
+  }
+
+  getMessageMentions(message: MessageWrap): MentionInfo[] {
+    // ── 三态 mention 高亮（render matrix） ───────────────────────────
+    // 在普通 @member 的 Parts 之外，额外注入以下三个虚拟 highlight token，
+    // 让 MarkdownContent 用现有 @member 胶囊样式标亮文本中的
+    // "@所有人" / "@所有AI"（uid='all' 仍表示不可点击）:
+    //   - mention.humans=1  → "@所有人"
+    //   - mention.ais=1     → "@所有AI"
+    //   - mention.humans=1 + mention.ais=1 → 两者都高亮
+    //   - mention.all=1 (legacy / server outbound 双写) → "@所有人"
+    // 不动 message.parts，避免影响 markdown 子节点分段；MarkdownContent
+    // 按 name 字符串匹配文本节点。复用同一份 highlight class 保持视觉一致。
+    //
+    // Edited messages render text from `message.remoteExtra.contentEdit`
+    // (see `getMessageTextContent` below). The mention flags must be read
+    // from the same content source — otherwise an edited message whose
+    // edit text now contains `@所有人` / `@所有AI` (or removes them) would
+    // disagree with the highlight overlay. Prefer the edited content's
+    // mention flags when present, falling back to the original message
+    // content for non-edited messages or edits that did not re-emit flags.
+    const editContent: any = message.remoteExtra?.isEdit
+      ? message.remoteExtra?.contentEdit
+      : undefined;
+    const flags =
+      readMentionFlags(editContent) ?? readMentionFlags(message.content);
+
+    return buildMentionRenderInfo(
+      message.parts as any,
+      flags,
+      PartType.mention as unknown as number
+    ) as MentionInfo[];
+  }
+
+  getMessageEmojis(message: MessageWrap): EmojiInfo[] {
+    return (
+      message.parts
+        ?.filter((part: Part) => part.type === PartType.emoji)
+        .reduce((acc: EmojiInfo[], part: Part) => {
+          const url = WKApp.emojiService.getImage(part.text);
+          if (url && !acc.find((emoji) => emoji.key === part.text)) {
+            acc.push({ key: part.text, url });
+          }
+          return acc;
+        }, []) ?? []
+    );
+  }
+
+  getMessageTextContent(message: MessageWrap) {
+    if (message.streamOn) {
+      return message.fullStreamContent;
+    }
+    const rawContent = message.remoteExtra?.isEdit
+      ? (message.remoteExtra?.contentEdit as any)
+      : (message.content as any);
+    return (
+      rawContent?.text ||
+      message.parts?.map((part: Part) => part.text).join("") ||
+      ""
+    );
+  }
+
+  renderFoldSessionSummary(message: MessageWrap) {
+    if (message.revoke) {
+      return <RevokeCell message={message} context={this} />;
+    }
+
+    if (message.contentType === MessageContentTypeConst.typing) {
+      return (
+        <span className="wk-fold-session-summary-loading">
+          <BeatLoader size={8} margin={4} color="var(--wk-color-theme)" />
+        </span>
+      );
+    }
+    if (message.contentType === MessageContentType.text || message.streamOn) {
+      return (
+        <div className="wk-msg-text-content">
+          <MarkdownContent
+            content={this.getMessageTextContent(message)}
+            isSend={message.send}
+            isStreaming={message.isStreaming}
+            mentions={this.getMessageMentions(message)}
+            onMentionClick={(uid) => this.showUser(uid)}
+            emojis={this.getMessageEmojis(message)}
+          />
+        </div>
+      );
+    }
+    const digest = message.remoteExtra?.isEdit
+      ? message.remoteExtra?.contentEdit?.conversationDigest
+      : message.content?.conversationDigest;
+    return digest || "";
+  }
+
+  renderFoldSessionExpandedList(messages: MessageWrap[]) {
+    const editMode = this.vm.editOn;
+    return (
+      <FoldSessionExpandedList
+        messages={messages}
+        editMode={editMode}
+        renderAvatar={(message) => (
+          <WKAvatar
+            channel={new Channel(message.fromUID, ChannelTypePerson)}
+            style={{ width: "100%", height: "100%" }}
+          />
+        )}
+        renderMessageContent={(message) =>
+          this.renderFoldMessageContent(message)
+        }
+        onToggleSelect={(message, checked) => {
+          this.vm.checkedMessage(message, checked);
+        }}
+        onMessageContextMenu={(message, event) => {
+          if (message.revoke) {
+            event.preventDefault();
+            return;
+          }
+          this.showContextMenus(message, event);
+        }}
+        getMessageElementId={(message) =>
+          this.vm.foldSessionMessageElementId(message)
+        }
+        onLocateAnimationEnd={(message) => {
+          message.locateRemind = false;
+          this.setState({});
+        }}
+      />
+    );
+  }
+
+  renderFoldMessageContent(message: MessageWrap) {
+    if (message.revoke) {
+      return <RevokeCell message={message} context={this} />;
+    }
+
+    // 文本消息（含 Markdown 表格、代码块、链接）
+    if (message.contentType === MessageContentType.text || message.streamOn) {
+      return (
+        <div className="wk-fold-msg-text wk-msg-text-content">
+          <MarkdownContent
+            content={this.getMessageTextContent(message)}
+            isSend={message.send}
+            isStreaming={message.isStreaming}
+            mentions={this.getMessageMentions(message)}
+            onMentionClick={(uid) => this.showUser(uid)}
+            emojis={this.getMessageEmojis(message)}
+          />
+        </div>
+      );
+    }
+
+    // 文件消息
+    if (message.contentType === MessageContentTypeConst.file) {
+      const content = message.content as FileContent;
+      const iconInfo = getFileIconInfo(content.extension, content.name);
+      return (
+        <div
+          className="wk-fold-file"
+          title={t("base.messageFile.preview")}
+          onClick={() => {
+            const fileUrl = resolveSafeFileUrl(content);
+            if (!fileUrl) return;
+            WKApp.mittBus.emit("wk:file-preview", {
+              url: fileUrl,
+              name: content.name || t("base.messageFile.unknownFile"),
+              extension: getExtension(content.extension, content.name),
+              size: content.size,
+              sourceChannelId: message.channel.channelID,
+              sourceChannelType: message.channel.channelType,
+              messageId: message.messageID,
+              messageSeq: message.messageSeq,
+              fromUID: message.fromUID,
+              conversationDigest: content.conversationDigest,
+            });
+          }}
+        >
+          <div
+            className="wk-fold-file-icon"
+            style={{ backgroundColor: iconInfo.color }}
+          >
+            <span>{iconInfo.label}</span>
+          </div>
+          <div className="wk-fold-file-info">
+            <div className="wk-fold-file-name" title={content.name}>
+              {content.name || t("base.conversation.file.unknown")}
+            </div>
+            <div className="wk-fold-file-size">
+              {formatFileSize(content.size)}
+            </div>
+          </div>
+          <div
+            className="wk-fold-file-dl"
+            title={t("base.conversation.file.download")}
+            onClick={async (e) => {
+              e.stopPropagation();
+              const fileUrl = resolveSafeFileUrl(content);
+              if (!fileUrl) return;
+              await downloadFile(fileUrl, content.name || "file");
+            }}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              width="14"
+              height="14"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+          </div>
+        </div>
+      );
+    }
+
+    // 图片消息
+    if (message.contentType === MessageContentType.image) {
+      const content = message.content as ImageContent;
+      const rawUrl = content.url || content.remoteUrl || "";
+      const imgUrl = rawUrl
+        ? WKApp.dataSource.commonDataSource.getImageURL(rawUrl)
+        : content.imgData || "";
+      return imgUrl ? <FoldImage src={imgUrl} /> : null;
+    }
+
+    // 其他类型：回退到文本摘要
+    const digest = this.getMessageDigestText(message);
+    return <div className="wk-fold-msg-text">{digest}</div>;
+  }
+
+  getMessageDigestText(message: MessageWrap): string {
+    if (message.streamOn) {
+      return message.fullStreamContent || "";
+    }
+    const rawContent = message.remoteExtra?.isEdit
+      ? (message.remoteExtra?.contentEdit as any)
+      : (message.content as any);
+    return (
+      rawContent?.text ||
+      rawContent?.conversationDigest ||
+      message.parts?.map((part: Part) => part.text).join("") ||
+      ""
+    );
+  }
+
+  foldSessionUI(session: FoldSessionViewModel, last: boolean) {
+    const participants: FoldSessionCardParticipant[] = session.participants.map(
+      (participant) => ({
+        id: participant.uid,
+        name: participant.name,
+        avatar: (
+          <WKAvatar
+            channel={participant.channel}
+            style={{ width: "100%", height: "100%" }}
+          />
+        ),
+      })
+    );
+    const { showSummary, summaryId, summaryMessage } =
+      getFoldSessionSummaryState(session);
+    const summarySelectable =
+      showSummary && isMessageSelectable(summaryMessage);
+    const typingSender =
+      summaryMessage.contentType === MessageContentTypeConst.typing
+        ? (summaryMessage.content as { fromName?: string })?.fromName
+        : undefined;
+    const summarySender =
+      summaryMessage.from?.title || typingSender || summaryMessage.fromUID;
+
+    // 判断是单个还是多个 AI
+    const isMultiAI = participants.length > 1;
+    const tagLabel = isMultiAI
+      ? t("base.conversation.foldSession.aiCollaboration")
+      : t("base.conversation.foldSession.aiAssistant");
+
+    // 折叠逻辑: 超过 5 个 AI 时折叠显示
+    const shouldCollapse = participants.length > 5;
+
+    // 参与者名字显示
+    let participantNameDisplay: React.ReactNode;
+    if (shouldCollapse) {
+      // 折叠模式: 显示第一个名字 + "等X人"
+      const collapsedText = t(
+        "base.conversation.foldSession.collapsedParticipants",
+        {
+          values: { name: participants[0].name, count: participants.length },
+        }
+      );
+      participantNameDisplay = (
+        <span className="wk-fold-session-participants-collapsed">
+          <span className="wk-fold-session-participant-name wk-fold-session-participant-name-ai">
+            {collapsedText}
+          </span>
+          <div className="wk-fold-session-tooltip">
+            {participants.map((participant) => (
+              <div
+                key={participant.id}
+                className="wk-fold-session-tooltip-item"
+              >
+                <div className="wk-fold-session-tooltip-avatar">
+                  {participant.avatar}
+                </div>
+                <span className="wk-fold-session-tooltip-name">
+                  {participant.name}
+                </span>
+              </div>
+            ))}
+          </div>
+        </span>
+      );
+    } else {
+      // 正常模式: 显示所有名字
+      const participantLabel = participants
+        .map((participant) => participant.name)
+        .join(" × ");
+      participantNameDisplay = (
+        <span className="wk-fold-session-participant-name wk-fold-session-participant-name-ai">
+          {participantLabel}
+        </span>
+      );
+    }
+
+    return (
+      <div
+        key={session.sessionId}
+        id={session.anchorId}
+        data-message-seq={
+          !session.isExpanded && session.lastMessage.messageSeq > 0
+            ? session.lastMessage.messageSeq
+            : undefined
+        }
+        className={classNames(
+          "wk-message-item",
+          "wk-message-item-fold-session",
+          last ? "wk-message-item-last" : undefined
+        )}
+      >
+        <div className="wk-message-item-fold-session-shell">
+          <div
+            className="wk-message-item-fold-session-avatar"
+            aria-hidden="true"
+          >
+            <img
+              className="wk-message-item-fold-session-avatar-icon"
+              src={foldSessionAvatarIcon}
+              alt=""
+            />
+          </div>
+          <div className="wk-message-item-fold-session-content">
+            {/* 标题行: 名字+Tag+时间 + 收起/展开 */}
+            <div className="wk-fold-session-title-row">
+              <div className="wk-fold-session-participants">
+                {participantNameDisplay}
+                <span className="wk-fold-session-tag">{tagLabel}</span>
+              </div>
+              <span className="wk-fold-session-time">
+                {formatMessageTimestamp(session.lastMessage.timestamp)}
+              </span>
+              <button
+                type="button"
+                className="wk-fold-session-toggle-btn"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  const wasExpanded = session.isExpanded;
+                  this.vm.toggleFoldSession(session.sessionId);
+                  // 兼收起:仅「展开」态命令式补点,避免收起误报。props 恒空。
+                  if (!wasExpanded) {
+                    Dap.shared.track("thread_expanded", {});
+                  }
+
+                  // 展开时,确保内容可见(无动画,下一帧立即滚动)
+                  if (!wasExpanded) {
+                    requestAnimationFrame(() => {
+                      const element = document.getElementById(session.anchorId);
+                      if (element) {
+                        const rect = element.getBoundingClientRect();
+                        const viewportHeight = window.innerHeight;
+                        // 如果元素下半部分不在视口内,滚动让它完整可见
+                        if (rect.bottom > viewportHeight) {
+                          element.scrollIntoView({
+                            behavior: "smooth",
+                            block: "nearest",
+                          });
+                        }
+                      }
+                    });
+                  }
+                }}
+                aria-label={
+                  session.isExpanded
+                    ? t("base.conversation.foldSession.collapseDiscussions", {
+                        values: { count: session.count },
+                      })
+                    : t("base.conversation.foldSession.expandDiscussions", {
+                        values: { count: session.count },
+                      })
+                }
+              >
+                {session.isExpanded
+                  ? t("base.conversation.foldSession.collapseDiscussions", {
+                      values: { count: session.count },
+                    })
+                  : t("base.conversation.foldSession.expandDiscussions", {
+                      values: { count: session.count },
+                    })}
+              </button>
+            </div>
+            <FoldSessionCard
+              className="wk-message-item-fold-session-card"
+              participants={participants}
+              count={session.count}
+              selectionMode={this.vm.editOn}
+              isActive={session.isActive}
+              isExpanded={session.isExpanded}
+              appearing={session.shouldAppear}
+              flash={session.shouldMergeFlash}
+              showSummary={showSummary}
+              highlightSummary={session.highlightSummary}
+              summaryId={summaryId}
+              summarySender={summarySender}
+              summaryTime={formatMessageTimestamp(summaryMessage.timestamp)}
+              summaryShowMeta={!summaryMessage.revoke}
+              summaryContent={this.renderFoldSessionSummary(summaryMessage)}
+              expandedContent={this.renderFoldSessionExpandedList(
+                session.expandedMessages
+              )}
+              onToggle={() => {
+                this.vm.toggleFoldSession(session.sessionId);
+              }}
+              summaryChecked={!!summaryMessage.checked}
+              summarySelectable={summarySelectable}
+              onSummaryToggleSelect={(checked) => {
+                if (!summarySelectable) {
+                  return;
+                }
+                this.vm.checkedMessage(summaryMessage.message, checked);
+              }}
+              onAnimationEnd={(event) => {
+                if (event.target === event.currentTarget) {
+                  if (
+                    event.animationName === "wk-fold-session-appear" &&
+                    session.shouldMergeFlash
+                  ) {
+                    return;
+                  }
+                  this.vm.clearFoldSessionAnimation(session.sessionId);
+                }
+              }}
+              onSummaryContextMenu={
+                !summaryMessage.revoke &&
+                summaryMessage.contentType !== MessageContentTypeConst.typing
+                  ? (event) => {
+                      this.showContextMenus(summaryMessage.message, event);
+                    }
+                  : undefined
+              }
+              onSummaryAnimationEnd={(event) => {
+                if (event.target === event.currentTarget) {
+                  this.vm.clearFoldSessionSummaryHighlight(session.sessionId);
+                }
+              }}
+            />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  renderConversationItem(item: ConversationRenderItem, last: boolean) {
+    if (item.type === "foldSession") {
+      return this.foldSessionUI(item.session, last);
+    }
+    return this.messageUI(item.message, last);
+  }
+
+  messageUI(message: MessageWrap, last: boolean, extraClassName?: string) {
+    let MessageCell: React.ElementType | undefined;
+    if (message.revoke) {
+      MessageCell = RevokeCell;
+    } else if (message.flame) {
+      MessageCell = FlameMessageCell;
+    } else {
+      MessageCell = WKApp.messageManager.getCell(message.contentType);
+    }
+    const isSystemMessage =
+      message.revoke ||
+      message.contentType === MessageContentTypeConst.screenshot ||
+      (message.contentType >= 1000 &&
+        message.contentType <= 2000 &&
+        message.contentType !== MessageContentTypeConst.threadCreated);
+    return (
+      <div
+        onAnimationEnd={() => {
+          message.locateRemind = false;
+          this.setState({});
+        }}
+        key={message.clientMsgNo}
+        id={`${
+          message.contentType === MessageContentTypeConst.time ? "time-" : ""
+        }${message.clientMsgNo}`}
+        data-locate-message-row="true"
+        data-message-seq={message.messageSeq > 0 ? message.messageSeq : undefined}
+        className={classNames(
+          "wk-message-item",
+          extraClassName,
+          last ? "wk-message-item-last" : undefined,
+          message.locateRemind ? "wk-message-item-reminder" : undefined,
+          isSystemMessage ? "wk-message-item-system" : undefined
+        )}
+      >
+        {MessageCell ? (
+          <MessageCell
+            key={message.clientMsgNo}
+            message={message}
+            context={this}
+          />
+        ) : null}
+      </div>
+    );
+  }
+
+  handleScroll(e: any) {
+    if (this.scrollTimer) {
+      clearTimeout(this.scrollTimer);
+      this.scrollTimer = null;
+    }
+    this.scrollTimer = window.setTimeout(() => {
+      this.handleScrollEnd();
+    }, 500);
+    this.contextMenusContext.hide();
+    const targetScrollTop = e.target.scrollTop;
+    const scrollOffsetTop =
+      e.target.scrollHeight - (targetScrollTop + e.target.clientHeight);
+    if (
+      targetScrollTop <= TOP_HISTORY_TRIGGER_OFFSET &&
+      !this.vm.loading &&
+      !this.vm.pulldownFinished
+    ) {
+      // 下拉
+      this.vm.pulldownMessages();
+    } else if (
+      scrollOffsetTop <= 500 &&
+      !this.vm.loading &&
+      this.vm.pullupHasMore
+    ) {
+      // 上拉
+      this.vm.pullupMessages();
+    }
+    if (this.vm.lastMessage) {
+      this.vm.lastLocalMessageElement = this.getMessageElement(
+        this.vm.lastMessage
+      ); // 最新消息
+      this.vm.showScrollToBottomBtn = shouldShowScrollToBottom(
+        scrollOffsetTop,
+        this.vm.lastLocalMessageElement?.clientHeight
+      );
+    }
+
+    this.updateBrowseToMessageSeqAndReminderDoneIfNeed();
+  }
+
+  // 内容不满屏时，wheel 向上滚动触发加载更多历史（折叠卡片压缩内容可能导致不满屏无法触发 onScroll）
+  handleWheel(e: React.WheelEvent) {
+    const viewport = e.currentTarget as HTMLElement;
+    if (
+      !this.vm.loading &&
+      !this.vm.pulldownFinished &&
+      shouldPulldownOnWheel(
+        e.deltaY,
+        viewport.scrollTop,
+        this.isFullScreen(viewport)
+      )
+    ) {
+      this.vm.pulldownMessages();
+    }
+  }
+
+  // 判断内容是否满一屏幕
+  isFullScreen(viewport: HTMLElement | null) {
+    if (!viewport) {
+      return false;
+    }
+    return viewport.scrollHeight > viewport.clientHeight;
+  }
+
+  handleScrollEnd() {
+    this.uploadReadedIfNeed();
+  }
+
+  // 上传已读数据
+  uploadReadedIfNeed() {
+    const viewport = document.getElementById(this.vm.messageContainerId);
+    if (!this.canRecordReadAttention(viewport)) return;
+    const visiableMessages = this.allVisiableMessages(viewport);
+    if (visiableMessages && visiableMessages.length > 0) {
+      const unreadMessages = new Array<Message>();
+      for (const visiableMessage of visiableMessages) {
+        if (
+          !visiableMessage.remoteExtra.readed &&
+          visiableMessage.fromUID !== WKApp.loginInfo.uid &&
+          visiableMessage.setting.receiptEnabled
+        ) {
+          unreadMessages.push(visiableMessage.message);
+        }
+      }
+      WKSDK.shared().receiptManager.addReceiptMessages(
+        this.channel(),
+        unreadMessages
+      );
+    }
+  }
+
+  // 更新已读位置和提醒项
+  updateBrowseToMessageSeqAndReminderDoneIfNeed() {
+    const viewport = document.getElementById(this.vm.messageContainerId);
+    if (!this.canRecordReadAttention(viewport)) return;
+
+    this.updateBrowseToMessageSeq(viewport); // 更新已读位置
+
+    this.updateReminderDoneIfNeed(viewport); // 更新提醒项
+    WKApp.mittBus.emit("wk:message-attention-state-changed");
+  }
+
+  // 更新已预览的位置
+  private canRecordReadAttention(viewport: HTMLElement | null): boolean {
+    const viewportVisible = isConversationViewportVisible(viewport, document);
+    return shouldMarkConversationRead({
+      chatModuleActive: WKApp.currentMenuId === "chat",
+      documentVisible: document.visibilityState === "visible",
+      windowFocused: document.hasFocus(),
+      currentConversation: viewport !== null,
+      // Callers below still select the actual visible messages within this viewport.
+      newMessageVisible: viewportVisible,
+    });
+  }
+
+  updateBrowseToMessageSeq(viewport: HTMLElement | null) {
+    const lastVisiableMessage = this.lastVisiableMessage(viewport); // 当前UI显示的最后一条可见的消息
+    if (
+      lastVisiableMessage &&
+      lastVisiableMessage.messageSeq > this.vm.browseToMessageSeq
+    ) {
+      // 如果当前UI显示的最后一条消息大于已预览到的最新消息，则更新未读数
+      this.vm.browseToMessageSeq = lastVisiableMessage.messageSeq;
+      this.vm.refreshNewMsgCount(); // 刷新最新消息数量
+    }
+  }
+
+  // 更新提醒项
+  updateReminderDoneIfNeed(viewport: HTMLElement | null) {
+    if (!this.vm.messages || this.vm.messages.length === 0) {
+      return;
+    }
+
+    const reminders = this.vm.currentConversation?.reminders;
+    if (!reminders || reminders.length === 0) {
+      return;
+    }
+    const doneReminderIDs: number[] = [];
+    for (const reminder of reminders) {
+      if (reminder.done) {
+        continue;
+      }
+      const message = this.vm.findMessageWithMessageSeq(reminder.messageSeq);
+      if (message && this.isVisiableMessage(message.message, viewport)) {
+        doneReminderIDs.push(reminder.reminderID);
+        continue;
+      }
+    }
+    if (doneReminderIDs.length > 0) {
+      // Persist reminder done status to server via SDK (fixes #169)
+      WKSDK.shared().reminderManager.done(doneReminderIDs);
+    }
+  }
+
+  // 消息是否可见
+  isVisiableMessage(message: Message, viewport: HTMLElement | null) {
+    if (!viewport) {
+      return;
+    }
+    const targetScrollTop = viewport.scrollTop;
+    const scrollOffsetTop =
+      viewport.scrollHeight - (targetScrollTop + viewport.clientHeight);
+
+    const element = this.getMessageElement(message);
+    if (element) {
+      if (
+        viewport.scrollHeight - element.offsetTop > scrollOffsetTop &&
+        element.offsetTop + element.clientHeight > targetScrollTop
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+  // 获取最后一个可见的消息
+  lastVisiableMessage(viewport: HTMLElement | null) {
+    if (!this.vm.messages || this.vm.messages.length === 0) {
+      return;
+    }
+    if (!viewport) {
+      viewport = document.getElementById(this.vm.messageContainerId);
+    }
+    if (!viewport) {
+      return;
+    }
+    const targetScrollTop = viewport.scrollTop;
+    const scrollOffsetTop =
+      viewport.scrollHeight - (targetScrollTop + viewport.clientHeight);
+
+    for (let index = this.vm.messages.length - 1; index >= 0; index--) {
+      const message = this.vm.messages[index];
+      const element = this.getMessageElement(message);
+      if (element) {
+        if (viewport.scrollHeight - element.offsetTop > scrollOffsetTop) {
+          return message;
+        }
+      }
+    }
+  }
+
+  // 获取第一个可见的消息
+  firstVisiableMessage(vp: HTMLElement | null) {
+    if (!this.vm.messages || this.vm.messages.length === 0) {
+      return;
+    }
+    let viewport = vp;
+    if (!viewport) {
+      viewport = document.getElementById(this.vm.messageContainerId);
+    }
+    if (!viewport) {
+      return;
+    }
+    const targetScrollTop = viewport.scrollTop;
+    // const scrollOffsetTop = viewport.scrollHeight - (targetScrollTop + viewport.clientHeight);
+    for (let index = 0; index < this.vm.messages.length; index++) {
+      const message = this.vm.messages[index];
+      const element = this.getMessageElement(message);
+      if (element) {
+        if (element.offsetTop + element.clientHeight > targetScrollTop) {
+          return message;
+        }
+      }
+    }
+  }
+
+  private visiblePersistentMessage(
+    vp: HTMLElement | null,
+    fromEnd: boolean,
+    vm: ConversationVM = this.vm
+  ) {
+    if (!vm.messages || vm.messages.length === 0) {
+      return;
+    }
+    let viewport = vp;
+    if (!viewport) {
+      viewport = document.getElementById(vm.messageContainerId);
+    }
+    if (!viewport) {
+      return;
+    }
+    const targetScrollTop = viewport.scrollTop;
+    const scrollOffsetTop =
+      viewport.scrollHeight - (targetScrollTop + viewport.clientHeight);
+    const start = fromEnd ? vm.messages.length - 1 : 0;
+    const end = fromEnd ? -1 : vm.messages.length;
+    const step = fromEnd ? -1 : 1;
+    for (let index = start; index !== end; index += step) {
+      const message = vm.messages[index];
+      if (!message.messageSeq || message.messageSeq <= 0) {
+        continue;
+      }
+      const element = this.getMessageElement(message, vm);
+      if (!element) {
+        continue;
+      }
+      if (fromEnd) {
+        if (viewport.scrollHeight - element.offsetTop > scrollOffsetTop) {
+          return message;
+        }
+      } else if (element.offsetTop + element.clientHeight > targetScrollTop) {
+        return message;
+      }
+    }
+  }
+
+  // 所有可见的消息
+  allVisiableMessages(vp: HTMLElement | null): Array<MessageWrap> {
+    const visiableMessages = new Array<MessageWrap>();
+    if (!this.vm.messages || this.vm.messages.length === 0) {
+      return visiableMessages;
+    }
+    let viewport = vp;
+    if (!viewport) {
+      viewport = document.getElementById(this.vm.messageContainerId);
+    }
+    if (!viewport) {
+      return visiableMessages;
+    }
+
+    const targetScrollTop = viewport.scrollTop;
+    const viewportBottom = targetScrollTop + viewport.clientHeight;
+    for (let index = 0; index < this.vm.messages.length; index++) {
+      const message = this.vm.messages[index];
+      const element = this.getMessageElement(message);
+      if (element) {
+        if (
+          element.offsetTop < viewportBottom &&
+          element.offsetTop + element.clientHeight / 2 > targetScrollTop
+        ) {
+          // message 要漏出来一半才算可见
+          visiableMessages.push(message);
+        }
+      }
+    }
+    return visiableMessages;
+  }
+
+  chatToolbarUI() {
+    const toolbars = WKApp.endpoints.chatToolbarsWithKey(this);
+    return (
+      <ul className="wk-conversation-chattoolbars">
+        {toolbars.map((t) => {
+          return (
+            <li key={t.sid} className="wk-conversation-chattoolbars-item">
+              {t.node}
+            </li>
+          );
+        })}
+      </ul>
+    );
+  }
+
+  dragEnd() {
+    this.vm.fileDragEnter = false;
+    this.vm.fileDragLeave = true;
+    this.vm.notifyListener();
+  }
+  dragStart() {
+    this.vm.fileDragEnter = true;
+    this.vm.fileDragLeave = false;
+    this.vm.notifyListener();
+  }
+
+  // 拖拽进入/离开计数：子元素之间移动会反复触发 dragenter/dragleave，
+  // 用深度计数代替布尔标记，避免遮罩闪烁/卡住（octo-web#3173）。
+  private _dragDepth = 0;
+
+  // 仅当拖拽内容里真的带文件时才响应。
+  // 拖网页里的图片(URL/HTML)、拖一段文字时 types 不含 "Files"，
+  // 直接忽略——遮罩不出现、不 preventDefault、不报错（octo-web#3173）。
+  private dragHasFiles(event: React.DragEvent): boolean {
+    const dt = event.dataTransfer;
+    if (!dt) return false;
+    return Array.from(dt.types || []).includes("Files");
+  }
+
+  private handleConversationDragEnter(event: React.DragEvent): void {
+    if (!this.dragHasFiles(event)) return;
+    event.preventDefault();
+    this._dragDepth += 1;
+    if (!this.vm.fileDragEnter) this.dragStart();
+  }
+
+  private handleConversationDragOver(event: React.DragEvent): void {
+    if (!this.dragHasFiles(event)) return;
+    // 必须 preventDefault 才能触发 drop。
+    event.preventDefault();
+  }
+
+  private handleConversationDragLeave(event: React.DragEvent): void {
+    if (!this.dragHasFiles(event)) return;
+    event.preventDefault();
+    this._dragDepth = Math.max(0, this._dragDepth - 1);
+    if (this._dragDepth === 0) this.dragEnd();
+  }
+
+  private async handleConversationDrop(event: React.DragEvent): Promise<void> {
+    // 无论拖入的是什么，drop 都强制复位计数与遮罩，杜绝遮罩残留。
+    this._dragDepth = 0;
+    this.dragEnd();
+    if (!this.dragHasFiles(event)) return; // 非文件(网页图/文字)：静默忽略
+    event.preventDefault();
+
+    const items = Array.from(event.dataTransfer.items);
+    const files: File[] = Array.from(event.dataTransfer.files);
+    if (files.length === 0) return; // types 声称有文件但实际取不到，安全兜底
+    const hasDirectory = items.length
+      ? items.some((it) => {
+          const entry = it.webkitGetAsEntry?.();
+          return entry ? entry.isDirectory : false;
+        })
+      : files.some((f) => f.type === "" && f.size === 0);
+    if (hasDirectory) {
+      Toast.error(t("base.conversation.upload.folderUnsupported"));
+      return;
+    }
+    const err = await this.addPendingAttachments(files);
+    if (err) Toast.error(err);
+  }
+
+  render() {
+    const { chatBg, channel, initLocateMessageSeq } = this.props;
+    const recoveryKey = `${channel.channelID}:${channel.channelType}`;
+    const recoveredComposes = this.state.recoveredComposes.filter(
+      ({ channelKey }) => channelKey === recoveryKey,
+    );
+
+    const channelInfo = getImChannelInfo(WKSDK.shared(), channel);
+
+    // 群已解散（企业微信式只读态）：保留历史，但禁发消息/建子区、收起成员栏。
+    // 覆盖群聊与子区（子区随父群解散一并只读）。
+    const disbanded = isConversationDisbanded(channel);
+
+    let botCommands: BotCommand[] | undefined;
+    if (
+      channel.channelType === ChannelTypePerson &&
+      channelInfo?.orgData?.robot === 1 &&
+      channelInfo.orgData.bot_commands
+    ) {
+      try {
+        const raw =
+          typeof channelInfo.orgData.bot_commands === "string"
+            ? JSON.parse(channelInfo.orgData.bot_commands)
+            : channelInfo.orgData.bot_commands;
+        if (Array.isArray(raw)) {
+          botCommands = raw as BotCommand[];
+        }
+      } catch (e) {
+        // ignore invalid bot_commands JSON
+      }
+    }
+
+    return (
+      <Provider
+        create={() => {
+          this.vm = new ConversationVM(channel, initLocateMessageSeq, {
+            registerAsOpenConversation: !this.props.isAuxiliary,
+          });
+          return this.vm;
+        }}
+        render={(vm: ConversationVM) => {
+          return (
+            <>
+              <ConversationSelectionStateBridge
+                editOn={vm.editOn}
+                onChange={this.props.onSelectionStateChange}
+              />
+              <div
+                className={classNames(
+                  "wk-conversation",
+                  vm.fileDragEnter ? "wk-conversation-dragover" : undefined,
+                  vm.currentReplyMessage
+                    ? "wk-conversation-hasreply"
+                    : undefined
+                )}
+                style={{
+                  background: chatBg
+                    ? `url(${chatBg}) rgb(245, 247, 249)`
+                    : undefined,
+                }}
+                // 拖拽命中区扩大到整个会话窗口（含输入框/输入框展开态）。
+                // 入口与遮罩都挂在这里，内部 content 在展开态被 inert/height:0
+                // 隐藏也不影响拖拽（octo-web#3173）。
+                onDragEnter={(event) => this.handleConversationDragEnter(event)}
+                onDragOver={(event) => this.handleConversationDragOver(event)}
+                onDragLeave={(event) => this.handleConversationDragLeave(event)}
+                onDrop={(event) => this.handleConversationDrop(event)}
+              >
+                <div
+                  className={classNames("wk-conversation-content")}
+                  style={
+                    this.state.inputExpanded
+                      ? { height: 0, overflow: "hidden", flex: "none" }
+                      : undefined
+                  }
+                  {...(this.state.inputExpanded ? { inert: "" } : {})}
+                >
+                  <div
+                    className="wk-conversation-messages"
+                    id={vm.messageContainerId}
+                    data-conversation-channel-id={channel.channelID}
+                    data-conversation-channel-type={channel.channelType}
+                    onScroll={this.handleScroll.bind(this)}
+                    onWheel={this.handleWheel.bind(this)}
+                  >
+                    {vm.renderItems.map((item, i) => {
+                      let last = false;
+                      if (i === vm.renderItems.length - 1) {
+                        last = true;
+                      }
+                      return this.renderConversationItem(item, last);
+                    })}
+
+                    {/* 位置view */}
+                    <ConversationPositionView
+                      onScrollToBottom={async () => {
+                        return this.vm.onDownArrow();
+                      }}
+                      onReminder={(reminder) => {
+                        return this.vm.syncMessages(reminder.messageSeq, () => {
+                          this.locateMessage(reminder.messageSeq);
+                        });
+                      }}
+                      showScrollToBottom={vm.showScrollToBottomBtn || false}
+                      unreadCount={vm.unreadCount}
+                      reminders={vm.currentConversation?.reminders?.filter(
+                        (r) => !r.done
+                      )}
+                    ></ConversationPositionView>
+                  </div>
+                </div>
+                {/* 拖拽上传遮罩：覆盖整个会话窗口，纯视觉层（pointer-events:none），
+                    drop/dragleave 由外层 .wk-conversation 统一处理，避免遮罩自身
+                    抢事件导致计数错乱（octo-web#3173）。 */}
+                {vm.fileDragEnter ? (
+                  <div className="wk-conversation-content-fileupload-mask">
+                    <div className="wk-conversation-content-fileupload-mask-content">
+                      {t("base.conversation.upload.sendTo", {
+                        values: { name: channelInfo?.title || "" },
+                      })}
+                    </div>
+                  </div>
+                ) : undefined}
+                {/* ReplyView 已移到 MessageInput 内部的 topView prop */}
+                <div className="wk-conversation-topview"></div>
+                <div
+                  className={classNames(
+                    "wk-conversation-multiplepanel",
+                    vm.editOn ? "wk-conversation-multiplepanel-show" : undefined
+                  )}
+                >
+                  <MultiplePanel
+                    onClose={() => {
+                      vm.editOn = false;
+                      vm.unCheckAllMessages();
+                    }}
+                    onForward={() => {
+                      const messages = vm.getCheckedMessages();
+                      if (!messages || messages.length === 0) {
+                        Toast.error(
+                          t("base.conversation.selection.selectMessageFirst")
+                        );
+                        return;
+                      }
+                      WKApp.shared.baseContext.showConversationSelect(
+                        async (channels: Channel[]) => {
+                          try {
+                            // 每 channel 一次 buildContent，返回 N 条 content（每条选中消息 1 条）。
+                            // messageMode='parallel' 保留 messages × channels 并发语义（对齐旧行为）。
+                            // getEffectiveContent 同步抛 InteractiveCardForwardBlockedError → Phase 1 abort。
+                            const result = await ForwardService.send(
+                              channels,
+                              () => messages.map((m) => getEffectiveContent(m.message)),
+                              this.buildForwardOptions({ messageMode: "parallel" }),
+                            );
+                            // 多选 Toast 分母保持 messages × channels 语义（scope='messages'）。
+                            const kind = this.showForwardResult(result, "messages");
+                            // 全部失败不计转发,与 smart_summary_forwarded 同口径(见二审 P2-2)。
+                            if (kind !== "all-failed") Dap.shared.track("message_multiselect_forwarded", {});
+                          } catch (e) {
+                            console.error("[forward] build content failed", e);
+                            const blockedMessageKey = forwardBlockedMessageKey(e);
+                            Toast.error(t(blockedMessageKey ?? "base.conversation.forward.allFailed"));
+                          }
+                          vm.editOn = false;
+                          vm.unCheckAllMessages();
+                        }
+                      );
+                    }}
+                    onMergeForward={() => {
+                      const checkedMsgs = vm.getCheckedMessages();
+                      if (!checkedMsgs || checkedMsgs.length === 0) {
+                        Toast.error(
+                          t("base.conversation.selection.selectMessageFirst")
+                        );
+                        return;
+                      }
+                      WKApp.shared.baseContext.showConversationSelect(
+                        async (channels: Channel[]) => {
+                          try {
+                            // buildMergeforwardContent 内部保留 InteractiveCard 校验 →
+                            // 抛 InteractiveCardForwardBlockedError；ForwardService Phase 1
+                            // abort 时向上冒到此处 catch。合并转发每 channel 只发 1 条
+                            // MergeforwardContent，Toast 分母 targets 与 messages 等价。
+                            const result = await ForwardService.send(
+                              channels,
+                              () => vm.buildMergeforwardContent(vm.getCheckedMessages()),
+                              this.buildForwardOptions(),
+                            );
+                            const kind = this.showForwardResult(result, "targets");
+                            // 全部失败不计转发,与 smart_summary_forwarded 同口径(见二审 P2-2)。
+                            if (kind !== "all-failed") Dap.shared.track("message_multiselect_forwarded", {});
+                          } catch (e) {
+                            console.error(
+                              "[merge-forward] build content failed",
+                              e,
+                            );
+                            const blockedMessageKey = forwardBlockedMessageKey(e);
+                            Toast.error(t(blockedMessageKey ?? "base.conversation.forward.allFailed"));
+                          }
+                          vm.editOn = false;
+                          vm.unCheckAllMessages();
+                        }
+                      );
+                    }}
+                    onDelete={() => {
+                      const checkedMsgs = vm.getCheckedMessages();
+                      if (!checkedMsgs || checkedMsgs.length === 0) {
+                        Toast.error(
+                          t("base.conversation.selection.selectMessageFirst")
+                        );
+                        return;
+                      }
+                      wkConfirm({
+                        title: t("base.conversation.deleteConfirm.title"),
+                        content: t("base.conversation.deleteConfirm.content"),
+                        okText: t("base.conversation.deleteConfirm.confirm"),
+                        cancelText: t("base.common.cancel"),
+                        okType: "danger",
+                        onOk: async () => {
+                          const checkedMessagewraps = vm.getCheckedMessages();
+                          const messages = checkedMessagewraps
+                            .map((m) => m.message)
+                            .filter(Boolean);
+                          await deleteSelectedConversationMessages(vm, messages);
+                        },
+                      });
+                    }}
+                  ></MultiplePanel>
+                </div>
+                <div
+                  className="wk-conversation-footer"
+                  style={
+                    vm.editOn
+                      ? { display: "none" }
+                      : this.state.inputExpanded
+                      ? {
+                          flex: 1,
+                          minHeight: 0,
+                          overflow: "hidden",
+                          paddingTop: "var(--wk-sp-2)",
+                        }
+                      : undefined
+                  }
+                >
+                  <div
+                    className="wk-conversation-footer-content"
+                    style={
+                      this.state.inputExpanded
+                        ? {
+                            height: "100%",
+                            overflow: "hidden",
+                            display: "flex",
+                            flexDirection: "column",
+                          }
+                        : undefined
+                    }
+                  >
+                    {disbanded ? (
+                      <div className="wk-conversation-disband-bar">
+                        {t("base.conversation.disband.inputNotice")}
+                      </div>
+                    ) : (
+                      <>
+                        {this.props.inputNotice && (
+                      <div className="wk-conversation-input-notice-wrap">
+                        <div className="wk-conversation-input-notice-bubble">
+                          {this.props.inputNotice}
+                        </div>
+                      </div>
+                    )}
+                    <ChatComposer
+                      extensions={this._chatComposerExtensions}
+                      recoveredComposes={recoveredComposes}
+                      onComposeRecovery={this.recordComposeRecovery}
+                      onRecoveredComposes={this.consumeComposeRecoveries}
+                      onRestoreRecoveredTarget={(target) =>
+                        reconcileRecoveredSendTarget<Message>(
+                          {
+                            getReplyMessage: () => vm.currentReplyMessage,
+                            setReplyMessage: (message) => {
+                              vm.currentReplyMessage = message;
+                            },
+                            getHandlerType: () => vm.currentHandlerType,
+                            setHandlerType: (handlerType) => {
+                              vm.currentHandlerType = handlerType;
+                            },
+                          },
+                          target
+                            ? {
+                                replyMessage: target.replyMessage as
+                                  | Message
+                                  | undefined,
+                                handlerType: target.handlerType,
+                              }
+                            : undefined,
+                        )
+                      }
+                      botCommands={botCommands}
+                      onAddAttachment={(
+                        addFn: (
+                          files: File[],
+                          source?: "paste" | "upload"
+                        ) => void | Promise<void>
+                      ) => {
+                        // 存储 addAttachment 方法，供外部调用
+                        this._addAttachmentFn = addFn;
+                      }}
+                      onAddPendingAttachments={async (files, source) => {
+                        const err = await this.addPendingAttachments(files, source);
+                        if (err) {
+                          Toast.error(err);
+                          return false;
+                        }
+                        return true;
+                      }}
+                      members={this.vm.subscribers.filter(
+                        (s) => s.uid !== WKApp.loginInfo.uid
+                      )}
+                      topView={
+                        vm.currentReplyMessage ? (
+                          <ReplyView
+                            message={vm.currentReplyMessage}
+                            vm={vm}
+                            onClose={() => {
+                              vm.currentReplyMessage = undefined;
+                            }}
+                          />
+                        ) : undefined
+                      }
+                      onExpandChange={(expanded) => {
+                        this.setState({ inputExpanded: expanded });
+                      }}
+                      onContext={(ctx) => {
+                        this._messageInputContext = ctx;
+                        // 先 flush 草稿恢复（setContent 替换整块），再 flush insertText（追加）
+                        // 顺序相反会导致 setContent 覆盖掉前面追加的内容
+                        if (this._pendingRestoreDraft) {
+                          ctx.restoreDraft(this._pendingRestoreDraft);
+                          this._pendingRestoreDraft = undefined;
+                        }
+                        if (this._pendingInsertText) {
+                          ctx.insertText(this._pendingInsertText);
+                          this._pendingInsertText = undefined;
+                        }
+                        // MessageInput 会在 onContext 返回后合并跨实例 recovery。
+                        // 延迟到当前调用栈结束，确保 initialCompose 的冲突检查看到
+                        // 完整的“远端草稿 + recovery”，不会覆盖待恢复内容。
+                        Promise.resolve().then(() =>
+                          this.tryConsumeInitialCompose(),
+                        );
+                      }}
+                      toolbar={this.chatToolbarUI()}
+                      host={this._chatComposerViewHost}
+                      getChatContext={async () => {
+                        const { channel } = this.props;
+                        await this.vm.ensureSubscribersLoaded();
+
+                        const channelInfo = getImChannelInfo(
+                          WKSDK.shared(),
+                          channel
+                        );
+                        let groupName: string | undefined;
+                        let threadName: string | undefined;
+
+                        if (channel.channelType === ChannelTypeCommunityTopic) {
+                          threadName = channelInfo?.title;
+                          const parsed = parseThreadChannelId(
+                            channel.channelID
+                          );
+                          if (parsed) {
+                            const parentInfo = getImChannelInfo(
+                              WKSDK.shared(),
+                              new Channel(parsed.groupNo, ChannelTypeGroup)
+                            );
+                            groupName = parentInfo?.title;
+                          }
+                        } else if (channel.channelType === ChannelTypeGroup) {
+                          groupName = channelInfo?.title;
+                        }
+
+                        const selfSub = this.vm.subscribers.find(
+                          (s) => s.uid === WKApp.loginInfo.uid
+                        );
+                        return buildChatContext({
+                          messages: this.vm.messagesOfOrigin || [],
+                          subscribers: this.vm.subscribers,
+                          channelType: channel.channelType,
+                          loginUID: WKApp.loginInfo.uid,
+                          channelInfo:
+                            channel.channelType === ChannelTypePerson
+                              ? (getImChannelInfo(
+                                  WKSDK.shared(),
+                                  channel
+                                ) as ChatContextChannelInfo | null)
+                              : undefined,
+                          groupName,
+                          threadName,
+                          self: {
+                            name: WKApp.loginInfo.name,
+                            remark: selfSub?.remark,
+                            realName: WKApp.loginInfo.realName,
+                            realnameVerified:
+                              WKApp.loginInfo.realnameVerified === true,
+                          },
+                        });
+                      }}
+                      onCaptureSendTransaction={
+                        this.captureChatComposerSendTransaction
+                      }
+                    ></ChatComposer>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+              <ContextMenus
+                onContext={(ctx) => {
+                  this.contextMenusContext = ctx;
+                }}
+                onHide={() => {
+                  this.setState({ contextMenuMessageID: null });
+                }}
+                menus={
+                  vm.selectMessage
+                    ? WKApp.endpoints
+                        .messageContextMenus(vm.selectMessage, this)
+                        .map((menus) => {
+                          return {
+                            title: menus.title,
+                            testid: menus.testid,
+                            onClick: () => {
+                              if (menus.onClick) {
+                                menus.onClick();
+                              }
+                            },
+                          };
+                        })
+                    : []
+                }
+              ></ContextMenus>
+              <ContextMenus
+                onContext={(ctx) => {
+                  this.avatarMenusContext = ctx;
+                }}
+                menus={[
+                  {
+                    title: t("base.conversation.avatarMenu.mention"),
+                    icon: AtSign,
+                    onClick: () => {
+                      if (!this.vm.selectUID) {
+                        return;
+                      }
+                      const channel = new Channel(
+                        this.vm.selectUID,
+                        ChannelTypePerson
+                      );
+                      const channelInfo = getImChannelInfo(
+                        WKSDK.shared(),
+                        channel
+                      );
+
+                      this.messageInputContext()?.addMention(
+                        this.vm.selectUID,
+                        channelInfo?.title || ""
+                      );
+                    },
+                  },
+                  {
+                    title: t("base.conversation.avatarMenu.viewUserInfo"),
+                    icon: UserRound,
+                    onClick: () => {
+                      if (!this.vm.selectUID) {
+                        return;
+                      }
+                      let fromChannel: Channel | undefined;
+                      let vercode: string | undefined;
+                      if (
+                        this.vm.channel.channelType === ChannelTypeGroup ||
+                        this.vm.channel.channelType === ChannelTypeCommunityTopic
+                      ) {
+                        fromChannel = this.vm.channel;
+                        const subscriber = this.vm.subscriberWithUID(
+                          this.vm.selectUID
+                        );
+                        if (subscriber?.orgData?.vercode) {
+                          vercode = subscriber?.orgData?.vercode;
+                        }
+                      }
+                      WKApp.shared.baseContext.showUserInfo(
+                        this.vm.selectUID,
+                        fromChannel,
+                        vercode
+                      );
+                    },
+                  },
+                ]}
+              />
+            </>
+          );
+        }}
+      ></Provider>
+    );
+  }
+}
+
+interface ConversationPositionViewProps extends HTMLProps<any> {
+  showScrollToBottom: boolean; // 是否显示滚动到底部
+  reminders: Reminder[] | undefined; //  提醒项
+  unreadCount: number; // 未读数量
+  onScrollToBottom: () => Promise<void>; // 滚动到底部
+  onReminder: (reminder: Reminder) => Promise<void>;
+}
+
+interface ConversationPositionViewState {
+  loading: Map<number, boolean>;
+}
+
+class ConversationPositionView extends Component<
+  ConversationPositionViewProps,
+  ConversationPositionViewState
+> {
+  constructor(props: ConversationPositionViewProps) {
+    super(props);
+    this.state = {
+      loading: new Map(),
+    };
+  }
+  getReminderIcon(reminderType: ReminderType) {
+    switch (reminderType) {
+      case ReminderType.ReminderTypeMentionMe:
+        return new URL("./assets/reminder_mention.png", import.meta.url).href;
+      case ReminderType.ReminderTypeApplyJoinGroup:
+        return new URL("./assets/reminder_member_invite.png", import.meta.url)
+          .href;
+    }
+  }
+
+  getReminderTypes(reminders: Reminder[] | undefined) {
+    if (!reminders || reminders.length === 0) {
+      return [];
+    }
+    const types = new Set<number>();
+    if (reminders && reminders.length > 0) {
+      for (const reminder of reminders) {
+        types.add(reminder.reminderType);
+      }
+    }
+    return Array.from(types);
+  }
+
+  getRemindersWithType(type: ReminderType) {
+    const { reminders } = this.props;
+    const newReminders = new Array<Reminder>();
+    if (reminders && reminders.length > 0) {
+      for (const reminder of reminders) {
+        if (reminder.reminderType === type) {
+          newReminders.push(reminder);
+        }
+      }
+    }
+    return newReminders;
+  }
+
+  render(): React.ReactNode {
+    const { loading } = this.state;
+    const {
+      showScrollToBottom,
+      unreadCount,
+      onScrollToBottom,
+      reminders,
+      onReminder,
+    } = this.props;
+    const types = this.getReminderTypes(reminders);
+    return (
+      <div className="wk-conversationpositionview">
+        <ul>
+          {types &&
+            types.map((type) => {
+              const typeReminders = this.getRemindersWithType(type);
+              return (
+                <li key={type}>
+                  <div
+                    className={classNames(
+                      "wk-conversationpositionview-item",
+                      "wk-reveale"
+                    )}
+                    onClick={async () => {
+                      if (onReminder) {
+                        if (typeReminders && typeReminders.length > 0) {
+                          loading.set(type, true);
+                          this.setState({
+                            loading: loading,
+                          });
+                          await onReminder(typeReminders[0]);
+                          loading.set(type, false);
+                          this.setState({
+                            loading: loading,
+                          });
+                        }
+                      }
+                    }}
+                  >
+                    {this.getReminderIcon(type) ? (
+                      loading.get(type) ? (
+                        <Spin spinning={true}></Spin>
+                      ) : (
+                        <img src={this.getReminderIcon(type)}></img>
+                      )
+                    ) : undefined}
+
+                    {typeReminders.length > 0 ? (
+                      <div className="wk-conversation-unread-count">
+                        {typeReminders.length}
+                      </div>
+                    ) : null}
+                  </div>
+                </li>
+              );
+            })}
+
+          <li>
+            <div
+              className={classNames(
+                "wk-conversationpositionview-item",
+                showScrollToBottom ? "wk-reveale" : undefined
+              )}
+              onClick={async () => {
+                if (onScrollToBottom) {
+                  loading.set(-1, true);
+                  this.setState({
+                    loading: loading,
+                  });
+                  await onScrollToBottom();
+                  loading.set(-1, false);
+                  this.setState({
+                    loading: loading,
+                  });
+                }
+              }}
+            >
+              {loading.get(-1) ? (
+                <Spin spinning={true}></Spin>
+              ) : (
+                <img src={require("./assets/message_down.png")}></img>
+              )}
+              {unreadCount > 0 ? (
+                <div className="wk-conversation-unread-count">
+                  {unreadCount}
+                </div>
+              ) : null}
+            </div>
+          </li>
+        </ul>
+      </div>
+    );
+  }
+}
+
+interface ReplyViewProps {
+  message: Message;
+  vm: ConversationVM;
+  onClose?: () => void;
+}
+class ReplyView extends Component<ReplyViewProps> {
+  render(): React.ReactNode {
+    const { message, onClose, vm } = this.props;
+    const fromChannelInfo = getImChannelInfo(
+      WKSDK.shared(),
+      new Channel(message.fromUID, ChannelTypePerson)
+    );
+    const isEdit = vm.currentHandlerType === 2;
+    const label = isEdit
+      ? t("base.conversation.replyView.edit")
+      : t("base.conversation.replyView.reply");
+    const userName = fromChannelInfo?.title || "";
+    const messageText = message.remoteExtra?.isEdit
+      ? message.remoteExtra?.contentEdit?.conversationDigest
+      : message.content.conversationDigest;
+
+    return (
+      <div className="wk-replyview-new">
+        <button
+          className="wk-replyview-new-close"
+          onClick={() => {
+            if (onClose) {
+              onClose();
+            }
+          }}
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="white"
+            strokeWidth="4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+        <div className="wk-replyview-new-divider"></div>
+        <div className="wk-replyview-new-content">
+          <span className="wk-replyview-new-label">{label}</span>
+          <span className="wk-replyview-new-name">{userName}：</span>
+          <span className="wk-replyview-new-text">{messageText}</span>
+        </div>
+      </div>
+    );
+  }
+}
+
+interface MultiplePanelProps {
+  onClose?: () => void;
+  onForward?: () => void; // 逐条转发
+  onMergeForward?: () => void; // 合并转发
+  onDelete?: () => void; // 删除
+}
+class MultiplePanel extends Component<MultiplePanelProps> {
+  render(): React.ReactNode {
+    const {
+      onClose,
+      onForward,
+      onMergeForward,
+      onDelete,
+    } = this.props;
+    return (
+      <div className="wk-multiplepanel">
+        <button className="wk-multiplepanel-btn" data-testid="multiselect-forward-btn" onClick={onForward}>
+          {t("base.conversation.multiplePanel.forwardOneByOne")}
+        </button>
+        <div className="wk-multiplepanel-sep" />
+        <button className="wk-multiplepanel-btn" data-testid="multiselect-mergeforward-btn" onClick={onMergeForward}>
+          {t("base.conversation.multiplePanel.mergeForward")}
+        </button>
+        <div className="wk-multiplepanel-sep" />
+        <button
+          className="wk-multiplepanel-btn wk-multiplepanel-btn--danger"
+          data-testid="multiselect-delete-btn"
+          onClick={onDelete}
+        >
+          {t("base.conversation.multiplePanel.delete")}
+        </button>
+        <div className="wk-multiplepanel-sep" />
+        <button
+          className="wk-multiplepanel-close"
+          onClick={onClose}
+          aria-label={t("base.conversation.multiplePanel.cancelSelection")}
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path
+              d="M1 1L13 13M13 1L1 13"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+            />
+          </svg>
+        </button>
+      </div>
+    );
+  }
+}

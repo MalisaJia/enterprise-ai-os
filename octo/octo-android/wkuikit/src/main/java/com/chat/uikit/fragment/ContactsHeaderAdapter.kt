@@ -1,0 +1,57 @@
+/*
+ * Copyright 2026-present OctoIM contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.chat.uikit.fragment
+
+import android.text.TextUtils
+import android.view.View
+import com.chad.library.adapter.base.BaseQuickAdapter
+import com.chad.library.adapter.base.viewholder.BaseViewHolder
+import com.chat.base.endpoint.entity.ContactsMenu
+import com.chat.base.ui.components.AvatarView
+import com.chat.base.ui.components.CounterView
+import com.chat.uikit.R
+import com.xinbida.wukongim.entity.WKChannelType
+
+class ContactsHeaderAdapter :
+    BaseQuickAdapter<ContactsMenu, BaseViewHolder>(R.layout.item_contacts_header_layout) {
+    override fun convert(holder: BaseViewHolder, item: ContactsMenu) {
+        holder.setImageResource(R.id.imageView, item.imgResourceID)
+        holder.setText(R.id.nameTv, item.text)
+        val countValueTv = holder.getView<android.widget.TextView>(R.id.countValueTv)
+        if (!item.countValue.isNullOrEmpty()) {
+            countValueTv.text = item.countValue
+            countValueTv.visibility = View.VISIBLE
+        } else {
+            countValueTv.visibility = View.GONE
+        }
+        val msgCountTv: CounterView = holder.getView(R.id.msgCountTv)
+        msgCountTv.setColors(R.color.white, R.color.reminderColor)
+        msgCountTv.setCount(item.badgeNum, true)
+        msgCountTv.visibility = if (item.badgeNum > 0) View.VISIBLE else View.GONE
+        val avatarView: AvatarView = holder.getView<AvatarView>(R.id.avatarView)
+        avatarView.setSize(40f)
+        if (!TextUtils.isEmpty(item.uid)) {
+            holder.setVisible(R.id.userLayout, true)
+            holder.setVisible(R.id.dotIv, true)
+            avatarView.showAvatar(item.uid, WKChannelType.PERSONAL)
+        } else {
+            holder.setVisible(R.id.userLayout, false)
+        }
+
+        holder.setGone(R.id.endView, holder.bindingAdapterPosition != data.size - 1)
+    }
+}

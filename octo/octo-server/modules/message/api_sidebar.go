@@ -1,0 +1,1556 @@
+// Package message — POST /v1/sidebar/sync
+//
+// # Data-flow overview
+//
+//  1. Validate request (tab ∈ {follow,recent}, device_uuid required).
+//  2. Call ctx.IMSyncUserConversation to get the raw conversation list from the
+//     IM core (timestamp, unread, last_msg_seq).
+//  3. Load ancillary data in parallel-ish batches:
+//     a. group_setting   → category_id, category_sort  (groupCategoryDB)
+//     b. user_conversation_ext → unfollowed groups, followed DMs, thread ext rows
+//     c. user_pinned_channel  → pinned set             (raw DB query via ctx.DB())
+//  4. Apply tab-specific filtering:
+//     follow  – groups with category + not unfollowed; followed DMs; threads
+//     with ext row whose parent group is in the follow set.
+//     recent  – per-channel-type activity window from system_settings
+//     (sidebar.recent_filter_{group,thread,person}_days); a window of 0
+//     disables filtering for that type. Defaults reproduce the historical
+//     behaviour for the types the recent tab carries (groups/threads = 3-day
+//     window, DMs unfiltered). See buildRecentItems / loadRecentCutoffs.
+//  5. Append standalone thread ext entries not already in the IM result.
+//  6. Sort:
+//     follow  – category_sort ASC → pinned DESC → follow_sort ASC →
+//     intra-category sort ASC → target_id ASC (Issue #41 — sidebar
+//     drag wins over category-management UI; pin overrides everything
+//     within a category; see sortFollowItems for the full rationale).
+//     recent  – pinned DESC, timestamp DESC.
+//  7. Return SidebarSyncResp{Items, Version}.
+//
+// Module dependencies: imports modules/conversation_ext (for ext rows) and
+// modules/thread (for QueryByShortIDs to enrich thread items with last_message_at).
+// Does NOT import modules/group or modules/user — group_setting / pinned data
+// are read via ctx.DB() raw queries to avoid pulling in those packages.
+//
+// Note: a follow-up review item (Important #4 — read pinned via a user-module
+// helper) may eventually replace the raw user_pinned_channel query.
+package message
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	commonapi "github.com/Mininglamp-OSS/octo-server/modules/common"
+	convext "github.com/Mininglamp-OSS/octo-server/modules/conversation_ext"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/space"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
+	"go.uber.org/zap"
+)
+
+// ---------------------------------------------------------------------------
+// Structs
+// ---------------------------------------------------------------------------
+
+// Sidebar handles POST /v1/sidebar/sync.
+type Sidebar struct {
+	ctx             *config.Context
+	groupCategoryDB *groupCategoryDB
+	convExtDB       *convext.DB
+	threadDB        *thread.DB
+	followVersionDB *convext.FollowVersionDB
+	// PR #21 review (Jerry-Xin Critical)：Space 过滤需要群表查询。
+	groupService group.IService
+	// groupDB 仅用于 thread ext 行的 Space 过滤（PR #21 Round-6 P0-2）查
+	// external-group mapping。
+	groupDB *group.DB
+	log.Log
+}
+
+// NewSidebar creates a Sidebar handler.
+func NewSidebar(ctx *config.Context) *Sidebar {
+	return &Sidebar{
+		ctx:             ctx,
+		groupCategoryDB: newGroupCategoryDB(ctx),
+		convExtDB:       convext.NewDB(ctx),
+		threadDB:        thread.NewDB(ctx),
+		followVersionDB: convext.NewFollowVersionDB(ctx),
+		groupService:    group.NewService(ctx),
+		groupDB:         group.NewDB(ctx),
+		Log:             log.NewTLog("Sidebar"),
+	}
+}
+
+// sidebarSyncReq is the JSON body for POST /v1/sidebar/sync.
+type sidebarSyncReq struct {
+	Tab         string `json:"tab"`     // "follow" | "recent"
+	Version     int64  `json:"version"` // IM core version cursor
+	LastMsgSeqs string `json:"last_msg_seqs"`
+	MsgCount    int64  `json:"msg_count"`
+	DeviceUUID  string `json:"device_uuid"`
+}
+
+// SidebarItem is one entry in the sidebar response.
+type SidebarItem struct {
+	TargetType  int    `json:"target_type"` // 1 DM / 2 group / 5 thread
+	TargetID    string `json:"target_id"`
+	ChannelType uint8  `json:"channel_type"`
+	ChannelID   string `json:"channel_id"`
+	// SpaceID 是该 sidebar 条目所属 Space 的 ID（GH octo-server#153）。
+	//   - GROUP: group 表的 space_id；
+	//   - COMMUNITY_TOPIC: 父群的 space_id；
+	//   - PERSON: 留空 —— DM 的 Space 归属在消息级 payload.space_id 上，
+	//     conversation 级别保持空避免误锁定。
+	// 客户端 WebSocket 收到群消息时拿这个字段决定渲染到哪个 Space tab，
+	// 与服务端 FilterRawConversationsBySpace 的可见性判定同口径。
+	SpaceID string `json:"space_id,omitempty"`
+	// MySourceSpaceID 是当前用户加入该群的"来源 Space"（外部成员场景）。
+	//   - GROUP: externalGroupMap[channelID]，即 group_external_member.source_space_id；
+	//   - COMMUNITY_TOPIC: externalGroupMap[parentGroupNo]（与父群保持同口径）；
+	//   - 其它（PERSON / 内部群成员）: 留空。
+	// 与 v1 SyncUserConversationResp.MySourceSpaceID 字段口径一致
+	// （GH octo-server#153 Round-2 P1）。客户端在 source Space 下用 sidebar 时
+	// 需要这个字段才能识别"我以哪个 Space 身份加入了这个外部群"。
+	MySourceSpaceID string  `json:"my_source_space_id,omitempty"`
+	Timestamp       int64   `json:"timestamp"`
+	Unread          int     `json:"unread"`
+	IsPinned        bool    `json:"is_pinned"`
+	IsFollowed      bool    `json:"is_followed"`
+	CategoryID      *string `json:"category_id,omitempty"`
+	// CategorySort 暴露给客户端的"类别之间排序权重"，来源是 group_category.sort
+	// （PR #21 review by lml2468 blocker #3）。改类别顺序会 bump follow_version
+	// 并改变这里返回的值，与 /category/sort 接口及 swagger 一致。
+	CategorySort int `json:"category_sort,omitempty"`
+	// intraCategorySort 是 group_setting.category_sort（类别内排序），仅在
+	// 服务端 sortFollowItems 作为二级 key 使用，不暴露给客户端 —— 客户端
+	// 拿到的 items 已经按服务端口径排序完毕。
+	intraCategorySort int
+	FollowSort        int    `json:"follow_sort,omitempty"`
+	ParentChannelID   string `json:"parent_channel_id,omitempty"` // thread only
+	// Status 仅对 thread 条目（target_type=5）有意义：1=active 2=archived
+	// 3=deleted，语义与 modules/thread/const.go 的 ThreadStatus* 枚举一致
+	// （GH octo-server#310）。客户端据此同步过滤已归档子区，无需等待 channelInfo。
+	// omitempty 让 DM / 群条目不带该字段，保持线上协议向后兼容。
+	Status int `json:"status,omitempty"`
+}
+
+// sidebarSyncResp is the JSON response for POST /v1/sidebar/sync.
+//
+// Version 是 IM 会话游标（recent tab 的 cursor）。
+// FollowVersion 是 user_follow_version 的当前值（follow tab 的 CAS / 增量检测）。
+// PR review (Round 3) Blocking #1/#2 — IM 游标无法感知 follow 状态变化，所以需要
+// 独立的 follow_version。客户端使用方式：
+//   - 拉取 follow tab 后保存 follow_version，下次比较是否需要全量重建。
+//   - 调 /v1/follow/sort 时把 follow_version 原样回传做 CAS。
+type sidebarSyncResp struct {
+	Items         []*SidebarItem `json:"items"`
+	Version       int64          `json:"version"`
+	FollowVersion int64          `json:"follow_version"`
+}
+
+// ---------------------------------------------------------------------------
+// Route registration helper (called from Conversation.Route or standalone)
+// ---------------------------------------------------------------------------
+
+// RegisterSidebarRoutes mounts /v1/sidebar/sync onto the router.
+func RegisterSidebarRoutes(r *wkhttp.WKHttp, ctx *config.Context) {
+	sb := NewSidebar(ctx)
+	uidLimit := appwkhttp.SharedUIDRateLimiter(r, ctx)
+	grp := r.Group("/v1/sidebar", ctx.AuthMiddleware(r), uidLimit, spacepkg.SpaceMiddleware(ctx))
+	{
+		grp.POST("/sync", sb.Sync)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Request validation
+// ---------------------------------------------------------------------------
+
+// 上限常量：IM 透传字段的边界。
+// 透传给下游服务前 fail-fast，避免恶意/异常输入放大到 IM 核心。
+const (
+	// maxMsgCount 是 IM_SyncUserConversation 的 msg_count 上限。
+	// 客户端通常 <= 100，这里设 1000 做上限。
+	maxMsgCount int64 = 1000
+	// maxLastMsgSeqsLen 是 last_msg_seqs 字符串长度上限（约 5000 个会话）。
+	maxLastMsgSeqsLen = 65536
+	// maxDeviceUUIDLen 是客户端生成的 UUID 长度上限。
+	maxDeviceUUIDLen = 128
+)
+
+// validateSidebarRequest validates the request fields.
+func validateSidebarRequest(req *sidebarSyncReq) error {
+	if req.Tab != "follow" && req.Tab != "recent" {
+		return errors.New("tab must be 'follow' or 'recent'")
+	}
+	deviceUUID := strings.TrimSpace(req.DeviceUUID)
+	if deviceUUID == "" {
+		return errors.New("device_uuid is required")
+	}
+	if len(deviceUUID) > maxDeviceUUIDLen {
+		return fmt.Errorf("device_uuid too long (max %d)", maxDeviceUUIDLen)
+	}
+	if req.Version < 0 {
+		return errors.New("version must be >= 0")
+	}
+	if req.MsgCount < 0 {
+		return errors.New("msg_count must be >= 0")
+	}
+	if req.MsgCount > maxMsgCount {
+		return fmt.Errorf("msg_count too large (max %d)", maxMsgCount)
+	}
+	if len(req.LastMsgSeqs) > maxLastMsgSeqsLen {
+		return fmt.Errorf("last_msg_seqs too long (max %d bytes)", maxLastMsgSeqsLen)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// HTTP handler
+// ---------------------------------------------------------------------------
+
+// Sync handles POST /v1/sidebar/sync.
+func (sb *Sidebar) Sync(c *wkhttp.Context) {
+	var req sidebarSyncReq
+	if err := c.BindJSON(&req); err != nil {
+		sb.Error("sidebar sync: bad JSON", zap.Error(err))
+		respondMessageRequestInvalid(c, "")
+		return
+	}
+	if err := validateSidebarRequest(&req); err != nil {
+		respondMessageRequestInvalid(c, "")
+		return
+	}
+
+	loginUID := c.GetLoginUID()
+	spaceID := spacepkg.GetSpaceID(c)
+
+	// 0. follow_version 必须先读再读数据（PR #21 review P1-1 by yujiawei）。
+	//    如果先读数据再读 version，并发的 Follow*/Unfollow*/UpdateSort 在两次
+	//    读取之间 bump 会让响应回 "V+1 + 数据V"——客户端缓存命中 V+1 不再触发
+	//    刷新，新关注的 item 被静默吞掉。
+	//    把读 version 放到第一步：任何并发 bump 都会让 follow_version < real_version，
+	//    下一次 sync 看到更大的 version，客户端自然刷新，错过可恢复。
+	//
+	//    返 0 时客户端只会理解为 "没有新状态"，对业务无害（仍是保守正确）。
+	var followVersion int64
+	if v, err := sb.followVersionDB.Get(loginUID, spaceID); err != nil {
+		sb.Warn("sidebar sync: follow_version query failed (non-fatal)", zap.Error(err))
+	} else {
+		followVersion = v
+	}
+
+	// 1. Fetch IM conversations (version=0, no device offset logic for v2).
+	//
+	//    rawConversations 必须独立保留 —— 它是 cursor 推进的唯一来源
+	//    （见 step 6 + maxConversationVersion 注释）。Space 过滤后的列表只用于
+	//    构建 items；如果用过滤后列表推 cursor，最高 version 的会话恰好属于另一个
+	//    Space 时会被剔除，respVersion 退回 req.Version，客户端反复拉同一批 raw
+	//    conversations 死循环（PR #21 Round-4 review B1 by Jerry-Xin / lml2468 / yujiawei）。
+	rawConversations, err := sb.ctx.IMSyncUserConversation(loginUID, req.Version, req.MsgCount, req.LastMsgSeqs, nil)
+	if err != nil {
+		sb.Error("sidebar sync: IM fetch failed", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+
+	// 1b. Space 过滤（PR #21 review by Jerry-Xin Critical）：
+	//     IM 核心返回的是用户在全局视野下的会话，必须用 X-Space-ID 收紧到
+	//     当前请求 Space，否则 sidebar 会把别的 Space 的活跃 DM/Group/Thread
+	//     暴露到当前 Space 的 follow/recent tab。规则与 v1 完全一致：
+	//     - 群：按 group 表的 space_id；
+	//     - 子区：跟父群的 space_id；
+	//     - DM：默认 Space 兜底 + Bot 成员关系 + payload.space_id 匹配；
+	//     - 系统 Bot：补齐占位，所有 Space 可见。
+	//
+	//    conversations 是过滤 + 系统 Bot 补齐后的"可见列表"，专门给后续 build/sort
+	//    使用；cursor 不取自这里（见 step 6）。
+	conversations := rawConversations
+	if spaceID != "" {
+		conversations = FilterRawConversationsBySpace(rawConversations, spaceID, loginUID, sb.ctx, sb.groupService)
+		conversations = EnsureSystemBotsPresentRaw(conversations)
+	}
+	// YUJ-4185 P1-4：子区(CommunityTopic)条目必须按父群成员身份过滤（fail-closed）。
+	// FilterRawConversationsBySpace 只在 spaceID != "" 时跑，且历史上它只比 space
+	// 不校验成员；这里对所有路径（含无 X-Space-ID 的请求）显式补父群 ExistMembersActive
+	// （排除黑名单），避免被移除/拉黑者在 sidebar 仍看到子区入口（越权读）。DB-only
+	// thread ext 行另在下方 2a.6 单独过滤。
+	conversations = filterThreadConvsByParentMembership(
+		conversations,
+		func(c *config.SyncUserConversationResp) string { return c.ChannelID },
+		func(c *config.SyncUserConversationResp) uint8 { return c.ChannelType },
+		loginUID, sb.groupService,
+	)
+
+	// 2. Load ancillary data
+	//
+	// PR #21 Round-4 review B2 (Jerry-Xin / yujiawei Important #1)：
+	// follow tab 的语义是 "服务器对客户端宣告完整 follow 列表"，伴随 follow_version
+	// 作为 fresh 标记。任何"影响 follow tab 内容"的查询失败如果被吞成 warn + 部分
+	// 列表，客户端会把 partial 当作 fresh 缓存进而长期看不到正确数据 —— 这是
+	// privacy/正确性回归。所以 follow tab 路径下，下列 4 个查询的失败一律 fail-closed
+	// 返回 500，让客户端短时退避后重试；recent tab 不依赖这些数据，仍 fail-open。
+	//
+	// 已 fail-closed 的列表：categorySetting / unfollowedGroups / followedDMs /
+	// threadExtRows / loadThreadLastMsgAt。
+	isFollowTab := req.Tab == "follow"
+	failClosedForFollow := func(stage string, err error) bool {
+		if err == nil {
+			return false
+		}
+		if isFollowTab {
+			sb.Error("sidebar sync: "+stage+" failed (follow tab fail-closed)", zap.Error(err))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return true
+		}
+		sb.Warn("sidebar sync: "+stage+" failed (recent tab non-fatal)", zap.Error(err))
+		return false
+	}
+
+	// 2a. Thread ext rows (for follow tab thread entries) —— 必须先于 2b（category
+	//     settings 查询），因为 DB-only thread 的父群可能没出现在 IM 返回里，需要把
+	//     父群 groupNo 合入 categorySetting 查询，否则 mergeThreadEntries 会因 parent
+	//     category 缺失而 skip 该 thread（PR #21 Round-4 review I6 / lml2468 #3）。
+	threadExtRows := []*convext.Model{}
+	if isFollowTab {
+		rows, err := sb.convExtDB.ListThreadExts(loginUID, spaceID)
+		if failClosedForFollow("thread ext query", err) {
+			return
+		}
+		threadExtRows = rows
+	}
+	// 2a.5. Space-filter thread ext rows by parent group's space_id
+	//       (PR #21 Round-6 P0-2 by Jerry-Xin / yujiawei).
+	//       FollowThread 的旧版鉴权可能让 ext 行的 (uid, space_id) 与父群真实 space
+	//       不一致；categorySetting 是按 (uid, group_no) 查的、不带 space 谓词，
+	//       所以仅靠 categorySetting 不能挡住跨 Space thread。这一步显式按父群
+	//       space_id 过滤，与 v2 sidebar group 过滤保持同口径。
+	//       fail-closed：群表查询失败 → follow tab 整体退避。
+	if isFollowTab && spaceID != "" && len(threadExtRows) > 0 {
+		var err error
+		threadExtRows, err = sb.filterThreadExtsBySpace(threadExtRows, spaceID, loginUID)
+		if failClosedForFollow("thread ext space filter", err) {
+			return
+		}
+	}
+	// 2a.6. YUJ-4185 P1-4：DB-only thread ext 行也必须按父群成员身份过滤（fail-closed）。
+	//       这些行不经 conversations 路径，mergeThreadEntries 只校验父群 category/follow，
+	//       不校验成员 → 被移除者的子区仍可能从 ext 表透出到 follow tab（越权读）。
+	if isFollowTab && len(threadExtRows) > 0 {
+		var err error
+		threadExtRows, err = sb.filterThreadExtsByParentMembership(threadExtRows, loginUID)
+		if failClosedForFollow("thread ext parent membership filter", err) {
+			return
+		}
+	}
+	threadExtMap := make(map[string]*convext.Model, len(threadExtRows))
+	for _, m := range threadExtRows {
+		threadExtMap[m.TargetID] = m
+	}
+
+	// 2b. Group category settings
+	//     groupNos = IM 返回的 group 频道 ∪ thread ext 行的父群（去重）。
+	groupNos := extractGroupNos(conversations)
+	if isFollowTab && len(threadExtRows) > 0 {
+		groupNos = appendThreadParentGroupNos(groupNos, threadExtRows)
+	}
+	categorySetting := map[string]*GroupCategorySetting{}
+	if len(groupNos) > 0 {
+		settings, err := sb.groupCategoryDB.QueryCategorySettingsByGroupNos(groupNos, loginUID)
+		if failClosedForFollow("category query", err) {
+			return
+		}
+		for _, s := range settings {
+			categorySetting[s.GroupNo] = s
+		}
+	}
+
+	// 2c. Unfollowed groups
+	unfollowedGroups := map[string]struct{}{}
+	unfollowed, err := sb.convExtDB.ListUnfollowedGroups(loginUID, spaceID)
+	if failClosedForFollow("unfollowed groups query", err) {
+		return
+	}
+	for _, m := range unfollowed {
+		unfollowedGroups[m.TargetID] = struct{}{}
+	}
+
+	// 2d. Followed DMs
+	followedDMs := map[string]*convext.Model{}
+	dms, err := sb.convExtDB.ListFollowedDM(loginUID, spaceID)
+	if failClosedForFollow("followed DM query", err) {
+		return
+	}
+	for _, m := range dms {
+		followedDMs[m.TargetID] = m
+	}
+
+	// 2d2. Group ext rows (Issue #41 fix #1)：读取群的 user_conversation_ext，
+	//      把 follow_sort 喂给 buildFollowItems 群分支。recent tab 不依赖 follow_sort，
+	//      仍走 fail-open。
+	groupExts := map[string]*convext.Model{}
+	if isFollowTab {
+		rows, err := sb.convExtDB.ListGroupExts(loginUID, spaceID)
+		if failClosedForFollow("group ext query", err) {
+			return
+		}
+		for _, m := range rows {
+			groupExts[m.TargetID] = m
+		}
+	}
+
+	// 2d3. DM category sorts (Issue #41 fix #2)：DM 引用的 dm_category_id 对应
+	//      group_category.sort 必须显式 JOIN 出来，才能让带 category 的 DM 与同
+	//      category 的群进入同一排序桶。
+	dmCategorySorts := map[string]int{}
+	if isFollowTab && len(followedDMs) > 0 {
+		ids := make([]string, 0, len(followedDMs))
+		seen := make(map[string]struct{}, len(followedDMs))
+		for _, m := range followedDMs {
+			if m.DMCategoryID == nil {
+				continue
+			}
+			if _, dup := seen[*m.DMCategoryID]; dup {
+				continue
+			}
+			seen[*m.DMCategoryID] = struct{}{}
+			ids = append(ids, *m.DMCategoryID)
+		}
+		if len(ids) > 0 {
+			sorts, err := sb.groupCategoryDB.QueryCategorySortsByIDs(ids, loginUID)
+			if failClosedForFollow("dm category sort query", err) {
+				return
+			}
+			dmCategorySorts = sorts
+		}
+	}
+
+	// 2e. Pinned channels
+	//
+	// 查询失败的降级方向按 tab 不同，这是有意区分、不是遗漏：
+	//   - recent tab 会因此整体跳过时间窗口（见下方 case "recent"）—— 空置顶集合
+	//     会让「置顶永不被窗口隐藏」失效，宁可这一批不过滤；
+	//   - follow tab 只丢 `is_pinned` 与置顶排序档位，条目本身照常返回。置顶是
+	//     **呈现**，不是关注**成员关系**；fail-closed 只留给 failClosedForFollow
+	//     列举的那五个查询，它们失败会让关注列表本身失真（PR #679 review,
+	//     yujiawei）。该行为与本 PR 之前完全一致。
+	pinnedSet, err := sb.loadPinnedSet(loginUID, spaceID)
+	pinnedLoadFailed := err != nil
+	if err != nil {
+		sb.Warn("sidebar sync: pinned query failed (non-fatal)", zap.Error(err))
+		pinnedSet = map[string]struct{}{}
+	}
+
+	// 2f. groupNo -> space_id 映射，用于把 group / thread 父群的 SpaceID 回填到
+	//     SidebarItem.SpaceID（GH octo-server#153）。
+	//     使用 conversations（已 Space 过滤）作为输入：当前 Space tab 不会出现
+	//     其他 Space 的群，因此即便 group service 调用失败也只是少填一些字段，
+	//     不会泄露跨 Space 元数据。失败时退化为空 map，fail-open 把 SpaceID
+	//     置空，客户端走"未知 Space"分支（与历史行为一致）。
+	//
+	//     额外把 threadExtRows 的父群 groupNo 合入查询集合（GH octo-server#153
+	//     Round-2 Critical 2）：DB-only thread 的父群可能不在 IM 返回里，
+	//     如果不显式带上，mergeThreadEntries 写 SidebarItem.SpaceID 时
+	//     groupSpaceMap[parentGroupNo] 会 miss，space_id 被回填为空。
+	var extraParentGroupNos []string
+	if len(threadExtRows) > 0 {
+		extraParentGroupNos = uniqueThreadParentGroupNos(threadExtRows)
+	}
+	groupSpaceMap, ok := CollectGroupSpaceMap(conversations, extraParentGroupNos, sb.groupService)
+	if !ok {
+		sb.Warn("sidebar sync: group space map query failed (non-fatal, SidebarItem.SpaceID will be empty)")
+		groupSpaceMap = map[string]string{}
+	}
+
+	// 2g. externalGroupMap：当前 user 作为外部成员加入的 (groupNo -> source_space_id)
+	//     映射，用来回填 SidebarItem.MySourceSpaceID（GH octo-server#153 Round-2 P1）。
+	//     与 api_conversation.go syncUserConversation 同口径：非致命错误时降级为
+	//     空 map，仅缺失 my_source_space_id 字段，不影响 SpaceID 回填。
+	externalGroupMap, externalErr := sb.groupDB.QueryExternalGroupNosForUser(loginUID)
+	if externalErr != nil {
+		sb.Warn("sidebar sync: external group map query failed (non-fatal, my_source_space_id will be empty)", zap.Error(externalErr))
+		externalGroupMap = map[string]string{}
+	}
+
+	// 2h. defaultSpaceID：用户最早加入的 Space，用于外部群 source_space_id="" 的
+	//     空值兜底（GH octo-server#154 Round-2 Finding 2，与 decideConvKeepInSpace
+	//     同口径）。查询失败回空串，sidebarMySourceSpaceID 退化为不写
+	//     my_source_space_id —— omitempty 保持向后兼容。
+	defaultSpaceID := space.GetUserDefaultSpaceID(sb.ctx, loginUID)
+
+	// 3. Build tab-specific items
+	var items []*SidebarItem
+	switch req.Tab {
+	case "follow":
+		items = buildFollowItems(conversations, categorySetting, unfollowedGroups, followedDMs, threadExtMap, groupExts, dmCategorySorts, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		// Append standalone thread ext entries not present in IM result.
+		// Pass categorySetting + unfollowedGroups so parent-follow filter applies
+		// to DB-only thread entries as well (PR review Round-3 Blocking #4).
+		lastMsgAtMap, threadStatusMap, threadCreatorMap, err := sb.loadThreadLastMsgAt(threadExtRows)
+		if failClosedForFollow("thread last_message_at query", err) {
+			return
+		}
+		// issue #557：创建者自建子区必须能出现在自己的关注 Tab，即使父群从未关注/
+		// 未分类/被显式取关。用 thread.creator_uid==loginUID 精确识别「本人自建」，据此
+		// 对这些子区放宽 mergeThreadEntries 的父群前置丢弃。键为 "{groupNo}____{shortID}"，
+		// 与 thread 条目 TargetID 同口径。
+		// 注意：豁免只跳过「分类/取关」前置，绝不跳过 space 过滤（2a.5）与父群成员过滤
+		// （2a.6）——这两个安全过滤在此之前已对 threadExtRows 生效，被移出父群/跨 Space
+		// 的创建者子区行早已被剔除，不会走到这里。
+		selfCreatedThreads := make(map[string]struct{}, len(threadCreatorMap))
+		for key, creatorUID := range threadCreatorMap {
+			if creatorUID == loginUID {
+				selfCreatedThreads[key] = struct{}{}
+			}
+		}
+		items = mergeThreadEntries(items, threadExtRows, lastMsgAtMap, categorySetting, unfollowedGroups, groupSpaceMap, externalGroupMap, defaultSpaceID, selfCreatedThreads, threadStatusMap)
+
+		// GH octo-server#310：把 thread 生命周期状态回填到 thread 条目。statusMap
+		// 来自 loadThreadLastMsgAt（复用 QueryActiveByGroupShortIDs 已 SELECT 的
+		// status，零额外查询），键为 "{groupNo}____{shortID}"，与 thread 条目的
+		// TargetID 同口径。同时覆盖 buildFollowItems（IM-present）与 mergeThreadEntries
+		// （DB-only）两条路径；mergeThreadEntries 已把不在 statusMap 中的 thread
+		// （deleted/missing）skip，所以幸存的 thread 条目必有 status。
+		backfillThreadStatus(items, threadStatusMap)
+
+		// Issue #151 symptom #2 — materialize ext rows for default-followed
+		// groups (categorized but never touched).  Without this, OnThreadCreated
+		// silently skips this user for those groups and new threads never reach
+		// the follow tab.  Fail-open: a failure here must not block the sidebar
+		// response.  Subsequent sidebar/sync calls will retry the same
+		// materialization until it lands.
+		//
+		// Latency budget: the loop is O(N) over the follow-tab items but only
+		// emits a DB write when defaultFollowedGroups is non-empty.  First-load
+		// for a user with many categorized groups pays one batched INSERT IGNORE
+		// (a single tx); every subsequent sidebar/sync from the same user hits
+		// the (groupExts has-key) branch and exits without a write.  Cost
+		// amortizes to one DB write per never-touched group across the user's
+		// lifetime.
+		var defaultFollowedGroups []string
+		for _, it := range items {
+			if it.TargetType != int(common.ChannelTypeGroup) {
+				continue
+			}
+			if _, hasExt := groupExts[it.TargetID]; hasExt {
+				continue
+			}
+			defaultFollowedGroups = append(defaultFollowedGroups, it.TargetID)
+		}
+		if len(defaultFollowedGroups) > 0 {
+			// Why no DefaultFollowedGroupGuard here (vs the /v1/follow/sort path):
+			// the candidates are not client-supplied.  They come from
+			// buildFollowItems above, which only emits a group SidebarItem when
+			// the group is in `categorySetting` with a non-nil CategoryID, and
+			// that CategoryID carries "live" semantics — see
+			// db_group_category.go GroupCategorySetting.CategoryID for the full
+			// contract.  Two stacked filters guarantee Stage-1-equivalent
+			// authorization without a separate round-trip:
+			//   1. Membership / Space visibility: candidate group_no's came
+			//      from the IM-returned conversation list (FilterRawConversations-
+			//      BySpace), which only includes channels the user is a member
+			//      of in the current Space.  Same authority the rest of the
+			//      sidebar relies on.
+			//   2. Live-category: QueryCategorySettingsByGroupNos SELECTs
+			//      gc.category_id (not gs.category_id), so a group_setting
+			//      pointing at a soft-deleted category (gc.status=2) or a
+			//      missing category row yields CategoryID=nil; buildFollowItems
+			//      then drops it before this loop runs.  Issue #151 review fix:
+			//      the previous code selected gs.category_id, letting dangling
+			//      refs through; that bypass is closed at the query layer.
+			// Together these are at least as strong as the UpdateSort guard's
+			// Stage 1 INNER JOIN.  Stage 2 (membership / Disband) is also
+			// covered by point 1 above — IMSyncUserConversation does not
+			// return rows for users who aren't current members, and Disband
+			// groups are filtered out of the IM result by the IM core.
+			// Adding a guard call here would be redundant and would cost a
+			// per-group channel-access round-trip on the hot read path.
+			if mErr := sb.convExtDB.MaterializeDefaultFollowedGroups(loginUID, spaceID, defaultFollowedGroups); mErr != nil {
+				sb.Warn("sidebar sync: default-followed group materialization failed (non-fatal)",
+					zap.Error(mErr), zap.Int("count", len(defaultFollowedGroups)))
+			}
+		}
+	case "recent":
+		cutoffs := loadRecentCutoffs(sb.ctx, time.Now())
+		if pinnedLoadFailed {
+			// FAIL-OPEN：置顶集合不可信时整体不套用活跃窗口，而不是拿空豁免集合
+			// 继续过滤（否则一次 DB 抖动就会抹掉用户置顶的安静会话）。与
+			// /v1/conversation/sync 的同款降级保持一致（PR #679 review, yujiawei）。
+			cutoffs = recentCutoffs{}
+			sb.Warn("sidebar sync: skipping recent window this response (pinned set unavailable)")
+		}
+		items = buildRecentItems(conversations, cutoffs, pinnedSet, groupSpaceMap, externalGroupMap, defaultSpaceID)
+		// GH octo-server#310：recent tab 也要带 thread 生命周期状态。一次性批量
+		// 查询所有 thread 条目的 status（无 N+1），再 backfill。
+		// FAIL-OPEN：查询失败只记 warn 并把 Status 留空（omitempty -> 字段缺省），
+		// 与 recent tab 既有的降级行为一致，绝不 fail-closed。
+		if statusMap, qerr := sb.loadThreadStatuses(items); qerr != nil {
+			sb.Warn("sidebar sync: thread status query failed (recent tab non-fatal, status omitted)", zap.Error(qerr))
+		} else {
+			backfillThreadStatus(items, statusMap)
+		}
+
+		// 归档子区收口 —— **仅 recent tab**（task inactive-hiding-user-control / P0）。
+		//
+		// 收敛到 /v1/conversation/sync 早已在跑的 status=active 语义：安静到被归档的
+		// 子区不再占据「最近」列表。
+		//
+		// **为什么不对 follow tab 做同样的过滤**（PR #679 review, yujiawei）：
+		// follow tab 的响应不只是「要显示什么」，它是客户端唯一的**关注状态真源** ——
+		// 每个条目带 is_followed=true，三端都只从这里构建 followedKeys：
+		//   - Web  ThreadPanel 用 threadList(status:"all") 列出含归档的子区，再从
+		//          tab=follow 推导 is_followed，handleFollow 据此在 follow/unfollow
+		//          之间分支；
+		//   - iOS  WKFollowedKeysStore / Android FollowedKeysStore 同理。
+		// 一旦把 archived 从 follow tab 拿掉，已关注的归档子区 is_followed 变 false，
+		// 「取消关注」按钮反转成「关注」—— 取消关注变得不可能。而这恰好发生在
+		// 「已归档」浏览界面上，也就是本任务指认为 P0 安全垫的那个入口。
+		//
+		// 产品目标（归档子区不出现在会话列表）在 follow tab 上**已由三端自行满足**：
+		// Web 与 IM 缓存取交集且 channelInfo 优先做归档过滤，iOS 按 thread REST
+		// status 排除非 active，Android 构建关注列表时直接跳过 thread 条目。服务端
+		// 再过滤一遍不增加收益，只会摧毁关注状态。
+		//
+		// FAIL-OPEN：只丢 Status 明确等于 archived 的条目。status 查询失败时上面把
+		// Status 留空（0），这里据此保留 —— 与 /v1/conversation/sync 查询失败即跳过
+		// 过滤的方向一致。宁可短暂多显示，绝不因为一次查询抖动把子区藏起来。
+		//
+		// 归档非终态：任何人发消息经 RecordMessageAndReactivate 抬回 active，下一次
+		// sync 即重新出现；手动取消归档同理。
+		items = dropArchivedThreadItems(items)
+	}
+
+	// 4. Enrich pinned flag (follow tab items also need it)
+	for _, item := range items {
+		k := channelKey(item.TargetID, uint8(item.TargetType))
+		if _, ok := pinnedSet[k]; ok {
+			item.IsPinned = true
+		}
+	}
+
+	// 5. Sort
+	switch req.Tab {
+	case "follow":
+		sortFollowItems(items)
+	case "recent":
+		sortRecentItems(items)
+	}
+
+	// 6. Compute response version from raw conversations.
+	//    必须用 rawConversations（过滤前）—— Space filter 把 max-version 会话
+	//    剔除时 respVersion 仍要前进，否则客户端死循环（PR #21 Round-4 review B1）。
+	//    follow_version 已在 step 0 读取（PR #21 review P1-1）。
+	respVersion := maxConversationVersion(rawConversations, req.Version)
+
+	c.JSON(http.StatusOK, &sidebarSyncResp{
+		Items:         items,
+		Version:       respVersion,
+		FollowVersion: followVersion,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// loadPinnedSet loads the user's pinned channels as a set keyed by channelKey.
+// ---------------------------------------------------------------------------
+
+func (sb *Sidebar) loadPinnedSet(uid, spaceID string) (map[string]struct{}, error) {
+	return loadPinnedChannelSet(sb.ctx, uid, spaceID)
+}
+
+// loadPinnedChannelSet is the package-level form, shared with
+// /v1/conversation/sync so the pinned exemption (P2) is resolved identically on
+// both endpoints — divergent pinned lookups would reintroduce exactly the kind
+// of per-endpoint drift this task exists to remove.
+func loadPinnedChannelSet(ctx *config.Context, uid, spaceID string) (map[string]struct{}, error) {
+	type row struct {
+		ChannelID   string `db:"channel_id"`
+		ChannelType uint8  `db:"channel_type"`
+	}
+	var rows []row
+	var err error
+	if spaceID == "" {
+		// 无 Space key 的请求：响应本就跨 Space，置顶集合也取该 uid 的全部。
+		//
+		// 按 space_id='' 查会恒空 —— 写入侧（modules/user/api_pinned.go）拒绝空
+		// Space，表里不存在这样的行，于是置顶豁免在这条路径上是死代码，而
+		// keepDespiteRecentWindow 的文档把置顶描述为绝对豁免（PR #679 review,
+		// yujiawei）。取全部是与该文档一致的 fail-open 读法。
+		//
+		// 影响面（有意为之，已写进 swagger/sidebar.yaml）：本函数的结果在
+		// /v1/sidebar/sync 上有三个消费者 —— 窗口豁免、`is_pinned` 线上字段、
+		// 以及两个 tab 排序的置顶档位。此前这条路径恒返回空集，`is_pinned` 因此
+		// 恒为 false；现在会为真，置顶条目也会浮到顶部。跨 Space 的列表配跨 Space
+		// 的置顶是自洽读法，且 SQL 仍限 `uid=?`、集合只给已在响应里的频道打标，
+		// 不存在越权面（PR #679 review, yujiawei）。
+		_, err = ctx.DB().SelectBySql(
+			"SELECT channel_id, channel_type FROM user_pinned_channel WHERE uid=?",
+			uid,
+		).Load(&rows)
+	} else {
+		_, err = ctx.DB().SelectBySql(
+			"SELECT channel_id, channel_type FROM user_pinned_channel WHERE uid=? AND space_id=?",
+			uid, spaceID,
+		).Load(&rows)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loadPinnedSet: %w", err)
+	}
+	set := make(map[string]struct{}, len(rows))
+	for _, r := range rows {
+		set[channelKey(r.ChannelID, r.ChannelType)] = struct{}{}
+	}
+	return set, nil
+}
+
+// loadThreadLastMsgAt queries the thread table for last_message_at of the
+// given thread ext rows.
+//
+// PR review (Round 3) Blocking #3 / Important #4：用 (group_no, short_id) 复合键
+// 匹配，只取 status != deleted 的行。SELECT 也收窄到最小列，不必要地读 thread
+// 其他列（thread_md 等大文本）。
+//
+// 返回 map 的键就是 ext.TargetID（"{groupNo}____{shortID}" 格式）。
+// map 中不存在的键意味着"该 thread 已删除或不存在或跨群错配"，
+// 调用方据此 skip 该 ext 行，避免把幽灵 thread emit 给客户端。
+//
+// PR review follow-up：之前的实现以 shortID 单键作 map，跨群同名 shortID 会
+// 互相覆盖，且 mergeThreadEntries 无法区分"thread 不存在"与"last_message_at NULL"。
+// 改为复合键后两种语义都清楚：键存在 = thread 活跃；值为 nil = last_message_at NULL。
+//
+// PR #21 Round-4 review B2：返回 error 让调用方决定 fail-closed 还是 fail-open。
+// 在 follow tab 路径下吞掉错误并返回空 map 会让 mergeThreadEntries 把所有 DB-only
+// thread 当 "不活跃" skip，客户端 follow tab 残缺但仍带 follow_version，看上去 fresh —
+// 客户端长期缓存错误结果。所以接口契约改为：错误必须显式上报。
+//
+// GH octo-server#310：QueryActiveByGroupShortIDs 同时 SELECT 了 status，这里把它
+// 一并 surface 出来（statusMap，键同为 "{groupNo}____{shortID}"），让 follow tab
+// 在 backfill 阶段把 thread 生命周期状态回填到 SidebarItem.Status，零额外查询。
+//
+// issue #557：同理把 creator_uid 一并带回（creatorMap，键同为 "{groupNo}____{shortID}"）。
+// 调用方据此判定「这是 loginUID 自建的子区」，从而对创建者自建子区放宽父群未关注/
+// 未分类的前置丢弃（见 mergeThreadEntries selfCreatedThreads）。同样零额外查询。
+func (sb *Sidebar) loadThreadLastMsgAt(extRows []*convext.Model) (lastMsgAt map[string]*time.Time, statusMap map[string]int, creatorMap map[string]string, err error) {
+	result := make(map[string]*time.Time, len(extRows))
+	statuses := make(map[string]int, len(extRows))
+	creators := make(map[string]string, len(extRows))
+	if len(extRows) == 0 {
+		return result, statuses, creators, nil
+	}
+	refs := make([]thread.ShortRef, 0, len(extRows))
+	for _, m := range extRows {
+		gno, sid, perr := parseThreadChannelIDSidebar(m.TargetID)
+		if perr != nil {
+			continue
+		}
+		refs = append(refs, thread.ShortRef{GroupNo: gno, ShortID: sid})
+	}
+	if len(refs) == 0 {
+		return result, statuses, creators, nil
+	}
+	threadMap, qerr := sb.threadDB.QueryActiveByGroupShortIDs(refs)
+	if qerr != nil {
+		return nil, nil, nil, fmt.Errorf("sidebar load thread last_message_at: %w", qerr)
+	}
+	// QueryActiveByGroupShortIDs 已经按 "{groupNo}____{shortID}" 做键，直接转写。
+	for key, lite := range threadMap {
+		result[key] = lite.LastMessageAt
+		statuses[key] = lite.Status
+		creators[key] = lite.CreatorUID
+	}
+	return result, statuses, creators, nil
+}
+
+// loadThreadStatuses 批量查询给定 sidebar items 里 thread 条目（target_type=5）
+// 的生命周期 status，返回 map["{groupNo}____{shortID}"]status。供 recent tab 使用：
+// 那里没有现成的 thread DB 结果可复用，必须单独发一次 batched 查询（无 N+1）。
+//
+// 复用 thread.QueryActiveByGroupShortIDs：它已按 (group_no, short_id) 过滤、只返回
+// status != deleted 的行，且只 SELECT 最小列集。不修改它的过滤语义（鉴权路径依赖
+// 它过滤掉 deleted），仅消费它本就返回的 status。
+//
+// 无 thread 条目时返回空 map、不发查询。
+func (sb *Sidebar) loadThreadStatuses(items []*SidebarItem) (map[string]int, error) {
+	refs := make([]thread.ShortRef, 0)
+	for _, it := range items {
+		if it.TargetType != int(common.ChannelTypeCommunityTopic) {
+			continue
+		}
+		gno, sid, err := parseThreadChannelIDSidebar(it.TargetID)
+		if err != nil {
+			continue
+		}
+		refs = append(refs, thread.ShortRef{GroupNo: gno, ShortID: sid})
+	}
+	if len(refs) == 0 {
+		return map[string]int{}, nil
+	}
+	threadMap, err := sb.threadDB.QueryActiveByGroupShortIDs(refs)
+	if err != nil {
+		return nil, fmt.Errorf("sidebar load thread statuses: %w", err)
+	}
+	statuses := make(map[string]int, len(threadMap))
+	for key, lite := range threadMap {
+		statuses[key] = lite.Status
+	}
+	return statuses, nil
+}
+
+// backfillThreadStatus 把 statusMap 里的 thread 生命周期 status 回填到 thread 条目
+// （target_type=5）的 SidebarItem.Status 上（GH octo-server#310）。statusMap 的键是
+// "{groupNo}____{shortID}"，与 thread 条目的 TargetID 一致。非 thread 条目跳过；
+// statusMap 中没有的 thread 条目保持 Status=0（omitempty -> 字段缺省），由调用方
+// 的 fail-open / fail-closed 语义决定这种情况是否会出现。
+func backfillThreadStatus(items []*SidebarItem, statusMap map[string]int) {
+	if len(statusMap) == 0 {
+		return
+	}
+	for _, it := range items {
+		if it.TargetType != int(common.ChannelTypeCommunityTopic) {
+			continue
+		}
+		if st, ok := statusMap[it.TargetID]; ok {
+			it.Status = st
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Filter helpers
+// ---------------------------------------------------------------------------
+
+// recentCutoffs holds the per-channel-type activity cutoffs (unix seconds) for
+// the recent tab. A conversation is hidden when its timestamp <= the cutoff for
+// its channel type. A cutoff of 0 means "no time filter" — that type is
+// returned in full regardless of age (issue #289).
+type recentCutoffs struct {
+	group  int64
+	thread int64
+	person int64
+}
+
+// daysCutoff converts a day-count window to a unix-second cutoff relative to
+// now. A window of 0 (or negative, defensively) yields 0 = "no filter"; the
+// caller's `cutoff == 0` check then skips filtering entirely. Unifying the
+// "disabled" case as cutoff 0 lets buildRecentItems treat every channel type
+// the same way, including the DM exemption (person window default 0).
+func daysCutoff(now time.Time, days int) int64 {
+	if days <= 0 {
+		return 0
+	}
+	return now.Add(-time.Duration(days) * 24 * time.Hour).Unix()
+}
+
+// loadRecentCutoffs resolves the per-channel-type recent-tab windows from the
+// shared system_settings snapshot (admin-tunable, ~60s reload). For the channel
+// types the recent tab carries, the defaults reproduce the historical
+// hard-coded behaviour: groups/threads use a 3-day window, DMs are unfiltered.
+// (Unknown types are kept unconditionally — see cutoffFor.)
+//
+// Package-level (not a *Sidebar method) so /v1/conversation/sync can reuse the
+// exact same window resolution when a client opts in to recent filtering
+// (issue #294) — both handlers live in package message.
+//
+// NOTE: EnsureSystemSettings returns a process-wide singleton, so this reads a
+// snapshot shared across the process. Tests that mutate sidebar.* settings must
+// Reload() after wiping the table (see the recent-filter e2e setup), else a
+// stale snapshot from a prior test (within the ~60s auto-reload TTL) can leak
+// in.
+func loadRecentCutoffs(ctx *config.Context, now time.Time) recentCutoffs {
+	ss := commonapi.EnsureSystemSettings(ctx)
+	return recentCutoffs{
+		group:  daysCutoff(now, ss.SidebarRecentFilterGroupDays()),
+		thread: daysCutoff(now, ss.SidebarRecentFilterThreadDays()),
+		person: daysCutoff(now, ss.SidebarRecentFilterPersonDays()),
+	}
+}
+
+// keepDespiteRecentWindow reports whether a conversation must survive the
+// inactivity window regardless of how stale it is (task
+// inactive-hiding-user-control / P2).
+//
+// The window is a per-viewer "this went quiet, fade it out" projection. Three
+// things must never be faded out by it:
+//
+//   - **Unread.** Hiding a conversation that still holds unread messages hides
+//     the messages with it, and the user has no way to know. Discord's
+//     equivalent per-user layer (collapsed categories) always lets unread
+//     through for exactly this reason; ours did not, which is the behaviour
+//     this closes. This is also the precondition for ever letting users pick
+//     their own window (Batch 2) — a window that can swallow unread is not
+//     safe to hand out.
+//   - **Pinned.** Pinning is an explicit statement about position ("keep this
+//     in front of me"). A time window silently overriding it inverts the user's
+//     instruction. Note this is why `pinned` is resolved BEFORE the cutoff
+//     check — the previous order filtered first and only tagged IsPinned
+//     afterwards, so a pinned-but-quiet channel was dropped before anything
+//     knew it was pinned.
+//   - **System bots.** They must stay reachable in every Space. The placeholder
+//     entries EnsureSystemBotsPresentRaw appends carry Timestamp 0 and Unread 0,
+//     so any non-zero person window would drop them on the spot. Exempting them
+//     here keeps that guarantee without reordering the placeholder injection,
+//     and closes the same gap /v1/conversation/sync documented but only covered
+//     when a space_id was supplied.
+func keepDespiteRecentWindow(channelID string, channelType uint8, unread int, pinned bool) bool {
+	if pinned || unread > 0 {
+		return true
+	}
+	return channelType == common.ChannelTypePerson.Uint8() && spacepkg.IsSystemBot(channelID)
+}
+
+// cutoffFor returns the activity cutoff for a given channel type. Unknown
+// channel types (anything that is not group / thread / DM) return 0 = no
+// filter; the recent tab only ever carries those three types, but defaulting
+// unknown types to "kept" avoids silently dropping a future channel type on an
+// unrelated code path.
+func (c recentCutoffs) cutoffFor(channelType uint8) int64 {
+	switch channelType {
+	case common.ChannelTypeGroup.Uint8():
+		return c.group
+	case common.ChannelTypeCommunityTopic.Uint8():
+		return c.thread
+	case common.ChannelTypePerson.Uint8():
+		return c.person
+	default:
+		return 0
+	}
+}
+
+// dropArchivedThreadItems removes thread entries whose lifecycle status is
+// explicitly archived, mirroring /v1/conversation/sync's status=active
+// whitelist (task inactive-hiding-user-control / P0).
+//
+// Only `Status == ThreadStatusArchived` is dropped. Status 0 means "unknown"
+// (the field is omitempty and stays zero when the status query failed or the
+// row was missing) and is KEPT — the fail-open direction every thread read path
+// in this package already takes. Non-thread items are untouched.
+//
+// Returns a new slice; the input is not mutated, so any caller-side view built
+// from the pre-filter list stays intact.
+func dropArchivedThreadItems(items []*SidebarItem) []*SidebarItem {
+	out := make([]*SidebarItem, 0, len(items))
+	for _, it := range items {
+		if it.TargetType == int(common.ChannelTypeCommunityTopic) &&
+			it.Status == thread.ThreadStatusArchived {
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// channelKey returns a string key for (channelID, channelType).
+func channelKey(channelID string, channelType uint8) string {
+	return fmt.Sprintf("%s-%d", channelID, channelType)
+}
+
+// extractGroupNos collects group channel IDs from IM conversations.
+func extractGroupNos(convs []*config.SyncUserConversationResp) []string {
+	groupNos := make([]string, 0, len(convs))
+	for _, c := range convs {
+		if c.ChannelType == common.ChannelTypeGroup.Uint8() {
+			groupNos = append(groupNos, c.ChannelID)
+		}
+	}
+	return groupNos
+}
+
+// filterThreadExtsBySpace 按父群的 space_id 过滤 thread ext 行（v2 sidebar 专用）。
+//
+// PR #21 Round-6 P0-2：FollowThread 的旧鉴权允许在 X-Space-ID=B 下写 Space A 的群
+// 对应的 thread ext 行；categorySetting 又是按 (uid, group_no) 取的，不带 space 谓词，
+// 单靠 categorySetting + unfollowedGroups 挡不住跨 Space thread。这里在 sidebar 渲染
+// 前显式按父群 space_id 过滤，规则与 FilterRawConversationsBySpace 的 group 分支一致：
+//   - 内部群：parent.space_id == spaceID 才保留
+//   - 外部群：当前 user 作为外部成员加入该群且 sourceSpaceID == spaceID 才保留
+//   - 旧群 (parent.space_id == "")：只在用户默认 Space 保留（issue #484 follow-up，
+//     与 filterThreadConvCore 同口径；此前"所有 Space 可见"是串空间路径）
+//
+// fail-closed：群表 / 外部群查询失败时返回 error，调用方 follow tab 整体退避，避免
+// 半结果泄露——这两个查询划定真正的跨 Space 鉴权边界（内部群 parent.space_id==spaceID、
+// 外部群 sourceSpaceID==spaceID）。
+//
+// 例外——默认 Space 查询（GetUserDefaultSpaceIDE）只用于「空 space_id 父群露在哪个
+// Space」这个软启发式，不是鉴权边界，故单独 fail-open（视 filterSpaceID 为默认，与
+// FilterConversationsBySpace 同口径）：空 space_id 群此时归到当前 Space，是 legacy
+// 「全 Space 可见」的子集、不构成跨 Space 泄露；一次 space_member 抖动不再把整个
+// follow tab 打黑（#519 reviewer 反馈：默认 Space 查询失败拖垮 follow tab）。
+func (sb *Sidebar) filterThreadExtsBySpace(rows []*convext.Model, spaceID, loginUID string) ([]*convext.Model, error) {
+	parentNos := uniqueThreadParentGroupNos(rows)
+	if len(parentNos) == 0 {
+		return rows, nil
+	}
+	defaultSpaceID, err := space.GetUserDefaultSpaceIDE(sb.ctx, loginUID)
+	if err != nil {
+		// 软启发式查询失败 → fail-open（不牵连整个 follow tab），空 space_id 父群按
+		// 当前 Space 归属；真正的边界（群表/外部群查询）仍在下方 fail-closed。
+		sb.Warn("sidebar sync: thread ext default-space lookup failed, fail-open to current space",
+			zap.Error(err), zap.String("loginUID", loginUID))
+		defaultSpaceID = spaceID
+	}
+	groupInfos, err := sb.groupService.GetGroups(parentNos)
+	if err != nil {
+		return nil, fmt.Errorf("filter thread ext by space: get groups: %w", err)
+	}
+	parentSpaceMap := make(map[string]string, len(groupInfos))
+	for _, g := range groupInfos {
+		parentSpaceMap[g.GroupNo] = g.SpaceID
+	}
+	externalMap, err := sb.groupDB.QueryExternalGroupNosForUser(loginUID)
+	if err != nil {
+		return nil, fmt.Errorf("filter thread ext by space: external group map: %w", err)
+	}
+
+	kept := make([]*convext.Model, 0, len(rows))
+	for _, ext := range rows {
+		parentNo, _, perr := parseThreadChannelIDSidebar(ext.TargetID)
+		if perr != nil {
+			continue // malformed; drop silently
+		}
+		parentSpaceID, known := parentSpaceMap[parentNo]
+		if !known {
+			// Parent group disappeared from group table (disbanded mid-flight).
+			// Drop fail-closed; cleanup hooks will eventually remove the ext row.
+			continue
+		}
+		if parentSpaceID == "" {
+			// issue #484 follow-up：空 space_id 父群只在默认 Space 露出（与
+			// filterThreadConvCore 同口径），不再全 Space 可见。
+			if spaceID == defaultSpaceID {
+				kept = append(kept, ext)
+			}
+			continue
+		}
+		if parentSpaceID == spaceID {
+			kept = append(kept, ext)
+			continue
+		}
+		if sourceSpace, ok := externalMap[parentNo]; ok && sourceSpace == spaceID {
+			kept = append(kept, ext)
+		}
+	}
+	return kept, nil
+}
+
+// filterThreadExtsByParentMembership 剔除“调用者已不是父群成员”的 DB-only thread ext 行。
+// YUJ-4185 P1-4：子区无独立成员表，权威成员身份在父群；被踢/退群/拉黑后 thread ext 行
+// 仍可能残留，必须按父群 ExistMembersActive 校验，避免子区从 follow tab 越权透出。
+// CR 整改：用 ExistMembersActive（status=Normal 白名单）而非 ExistMembers，否则被拉黑
+// (status=Blacklist、is_deleted=0) 用户仍能从 follow tab 看到子区。
+// fail-closed：父群成员查询失败时返回 error，调用方 follow tab 整体退避。
+func (sb *Sidebar) filterThreadExtsByParentMembership(rows []*convext.Model, loginUID string) ([]*convext.Model, error) {
+	parentNos := uniqueThreadParentGroupNos(rows)
+	if len(parentNos) == 0 {
+		return rows, nil
+	}
+	memberNos, err := sb.groupService.ExistMembersActive(parentNos, loginUID)
+	if err != nil {
+		return nil, fmt.Errorf("filter thread ext by parent membership: %w", err)
+	}
+	memberSet := make(map[string]struct{}, len(memberNos))
+	for _, no := range memberNos {
+		memberSet[no] = struct{}{}
+	}
+	kept := make([]*convext.Model, 0, len(rows))
+	for _, ext := range rows {
+		parentNo, _, perr := parseThreadChannelIDSidebar(ext.TargetID)
+		if perr != nil {
+			continue // malformed; drop silently
+		}
+		if _, member := memberSet[parentNo]; !member {
+			continue // not a parent-group member → drop (fail-closed)
+		}
+		kept = append(kept, ext)
+	}
+	return kept, nil
+}
+
+// uniqueThreadParentGroupNos collects distinct parent groupNos from a slice of
+// thread ext rows. Malformed thread target IDs are skipped.
+func uniqueThreadParentGroupNos(rows []*convext.Model) []string {
+	seen := make(map[string]struct{}, len(rows))
+	parents := make([]string, 0, len(rows))
+	for _, m := range rows {
+		parent, _, err := parseThreadChannelIDSidebar(m.TargetID)
+		if err != nil {
+			continue
+		}
+		if _, dup := seen[parent]; dup {
+			continue
+		}
+		seen[parent] = struct{}{}
+		parents = append(parents, parent)
+	}
+	return parents
+}
+
+// appendThreadParentGroupNos 把 thread ext 行的父群 groupNo 去重后追加到
+// groupNos 切片中。
+//
+// PR #21 Round-4 review I6 (lml2468 #3)：DB-only thread（父群最近没新消息、
+// 没出现在 IM 返回里）的父群 category 必须一起加载，否则 mergeThreadEntries 在
+// parent-follow predicate 处把它 skip，用户 follow 的子区会从 follow tab 消失。
+// 这里只追加 groupNo，调用方负责走 QueryCategorySettingsByGroupNos 拉真实数据。
+func appendThreadParentGroupNos(groupNos []string, threadExtRows []*convext.Model) []string {
+	seen := make(map[string]struct{}, len(groupNos)+len(threadExtRows))
+	for _, g := range groupNos {
+		seen[g] = struct{}{}
+	}
+	for _, m := range threadExtRows {
+		parentNo, _, err := parseThreadChannelIDSidebar(m.TargetID)
+		if err != nil {
+			continue
+		}
+		if _, ok := seen[parentNo]; ok {
+			continue
+		}
+		seen[parentNo] = struct{}{}
+		groupNos = append(groupNos, parentNo)
+	}
+	return groupNos
+}
+
+// parseThreadChannelIDSidebar splits "{groupNo}____{shortID}" → (groupNo, shortID).
+// Uses the 4-underscore separator convention matching the thread package.
+const threadSeparator = "____"
+
+func parseThreadChannelIDSidebar(channelID string) (groupNo, shortID string, err error) {
+	idx := strings.Index(channelID, threadSeparator)
+	if idx <= 0 || idx+len(threadSeparator) >= len(channelID) {
+		return "", "", fmt.Errorf("invalid thread channel id: %q", channelID)
+	}
+	return channelID[:idx], channelID[idx+len(threadSeparator):], nil
+}
+
+// buildFollowItems constructs the SidebarItem list for the follow tab from
+// the IM conversation list.
+// Rules:
+//   - Group: must have a category_id entry AND not be in unfollowedGroups.
+//   - DM:    must have a followedDMs entry with followed_dm=1.
+//   - Thread: parent group must be in the follow set AND the thread must have
+//     an ext row in threadExtMap.
+//
+// Issue #41：
+//   - groupExts 提供群的 user_conversation_ext 行（key = TargetID = groupNo），
+//     用于把 follow_sort 写到群 SidebarItem 上。旧实现完全忽略该字段，导致 sidebar
+//     拖拽群条目后下次 sync 返回顺序不变。无 ext 行的群按 0 处理。
+//   - dmCategorySorts 把 DM 关联的 group_category.sort 提供给 DM 排序键，让带
+//     category 的 DM 与同 category 群落到同一桶。
+func buildFollowItems(
+	convs []*config.SyncUserConversationResp,
+	categorySetting map[string]*GroupCategorySetting,
+	unfollowedGroups map[string]struct{},
+	followedDMs map[string]*convext.Model,
+	threadExtMap map[string]*convext.Model,
+	groupExts map[string]*convext.Model,
+	dmCategorySorts map[string]int,
+	groupSpaceMap map[string]string,
+	externalGroupMap map[string]string,
+	defaultSpaceID string,
+) []*SidebarItem {
+	items := make([]*SidebarItem, 0, len(convs))
+	for _, conv := range convs {
+		switch conv.ChannelType {
+		case common.ChannelTypeGroup.Uint8():
+			cs, ok := categorySetting[conv.ChannelID]
+			if !ok || cs.CategoryID == nil {
+				continue // no category → not in follow set
+			}
+			if _, unfollowed := unfollowedGroups[conv.ChannelID]; unfollowed {
+				continue
+			}
+			// Issue #41 fix #1：读取群的 follow_sort；ext 行可能不存在（用户从未拖拽），
+			// map 缺失视为 0。
+			var groupFollowSort int
+			if ext, has := groupExts[conv.ChannelID]; has && ext != nil {
+				groupFollowSort = ext.FollowSort
+			}
+			items = append(items, &SidebarItem{
+				TargetType:        int(common.ChannelTypeGroup),
+				TargetID:          conv.ChannelID,
+				ChannelType:       conv.ChannelType,
+				ChannelID:         conv.ChannelID,
+				SpaceID:           groupSpaceMap[conv.ChannelID],
+				MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, conv.ChannelID, defaultSpaceID),
+				Timestamp:         conv.Timestamp,
+				Unread:            conv.Unread,
+				IsFollowed:        true,
+				CategoryID:        cs.CategoryID,
+				CategorySort:      cs.CategoryGroupSort,
+				intraCategorySort: cs.CategorySort,
+				FollowSort:        groupFollowSort,
+			})
+
+		case common.ChannelTypePerson.Uint8():
+			ext, ok := followedDMs[conv.ChannelID]
+			if !ok {
+				continue
+			}
+			item := &SidebarItem{
+				TargetType:  int(common.ChannelTypePerson),
+				TargetID:    conv.ChannelID,
+				ChannelType: conv.ChannelType,
+				ChannelID:   conv.ChannelID,
+				// PERSON 频道 SpaceID 留空：DM 的 Space 归属在消息级 payload.space_id 上
+				// （GH octo-server#153）。
+				Timestamp:  conv.Timestamp,
+				Unread:     conv.Unread,
+				IsFollowed: true,
+				FollowSort: ext.FollowSort,
+			}
+			// PR #21 Round-6：DMCategoryID 现在已经是 VARCHAR(32) UUID（与 group_category
+			// 共用 namespace），直接透传给客户端即可。
+			// Issue #41 fix #2：DM 关联了 category 时必须从 group_category.sort 读取
+			// CategorySort，旧实现仅 copy CategoryID 而 CategorySort=0，导致带 category
+			// 的 DM 永远排在"无 category"桶里。
+			if ext.DMCategoryID != nil {
+				item.CategoryID = ext.DMCategoryID
+				if cs, has := dmCategorySorts[*ext.DMCategoryID]; has {
+					item.CategorySort = cs
+				}
+			}
+			items = append(items, item)
+
+		case common.ChannelTypeCommunityTopic.Uint8():
+			// Thread must have an ext row
+			extRow, hasExt := threadExtMap[conv.ChannelID]
+			if !hasExt {
+				continue
+			}
+			// Parent group must be in follow set
+			groupNo, _, err := parseThreadChannelIDSidebar(conv.ChannelID)
+			if err != nil {
+				continue
+			}
+			cs, ok := categorySetting[groupNo]
+			if !ok || cs.CategoryID == nil {
+				continue
+			}
+			if _, unfollowed := unfollowedGroups[groupNo]; unfollowed {
+				continue
+			}
+			// PR #21 Round-6 P1-2 (yujiawei) + 原型确认：thread 必须继承父群的
+			// CategorySort + intraCategorySort，让 thread 和父群在同一分类块内排序，
+			// 而不是默认全部落到 CategorySort=0 桶（与 DM 混在 follow tab 顶部）。
+			items = append(items, &SidebarItem{
+				TargetType:  int(common.ChannelTypeCommunityTopic),
+				TargetID:    conv.ChannelID,
+				ChannelType: conv.ChannelType,
+				ChannelID:   conv.ChannelID,
+				// thread 继承父群 SpaceID（GH octo-server#153）。
+				SpaceID: groupSpaceMap[groupNo],
+				// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
+				// Round-3 (GH#154 Round-2 Finding 2)：父群 source_space_id="" 兜底到 defaultSpaceID。
+				MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID),
+				Timestamp:         conv.Timestamp,
+				Unread:            conv.Unread,
+				IsFollowed:        true,
+				FollowSort:        extRow.FollowSort,
+				ParentChannelID:   groupNo,
+				CategoryID:        cs.CategoryID,
+				CategorySort:      cs.CategoryGroupSort,
+				intraCategorySort: cs.CategorySort,
+			})
+		}
+	}
+	return items
+}
+
+// buildRecentItems constructs the SidebarItem list for the recent tab.
+// Rules:
+//   - Each conversation is filtered against the cutoff for its channel type
+//     (cutoffs.cutoffFor): kept iff cutoff == 0 (window disabled) OR
+//     timestamp > cutoff. With the default cutoffs (groups/threads = 3-day
+//     window, DMs = 0) this reproduces the historical behaviour where DMs are
+//     always shown and groups/threads obey a 72h window — but every type is
+//     now operator-tunable via system_settings (issue #289).
+//   - The returned slice is not yet sorted.
+//
+// Intentional non-rule (PR review Important #6): unfollowed groups
+// (group_unfollowed=1 in user_conversation_ext) are NOT filtered out here.
+// Per PM decision on issue #337 — "取消关注就是移除关注列表，放到最近 tab" —
+// an unfollowed group still belongs in the recent tab as long as it has
+// activity within the configured window.  The unfollow blacklist only affects
+// the follow tab.
+func buildRecentItems(
+	convs []*config.SyncUserConversationResp,
+	cutoffs recentCutoffs,
+	pinnedSet map[string]struct{},
+	groupSpaceMap map[string]string,
+	externalGroupMap map[string]string,
+	defaultSpaceID string,
+) []*SidebarItem {
+	items := make([]*SidebarItem, 0, len(convs))
+	for _, conv := range convs {
+		pinned := false
+		if pinnedSet != nil {
+			_, pinned = pinnedSet[channelKey(conv.ChannelID, conv.ChannelType)]
+		}
+		// 窗口判定必须在算完 pinned 之后 —— 见 keepDespiteRecentWindow。
+		if !keepDespiteRecentWindow(conv.ChannelID, conv.ChannelType, conv.Unread, pinned) {
+			if cutoff := cutoffs.cutoffFor(conv.ChannelType); cutoff != 0 && conv.Timestamp <= cutoff {
+				continue
+			}
+		}
+		parentID := ""
+		// spaceID 取自 groupSpaceMap：GROUP 直接查 channelID；COMMUNITY_TOPIC 取
+		// 父群；PERSON 留空（GH octo-server#153，规则与 buildFollowItems 一致）。
+		// mySourceSpaceID 同口径：从 externalGroupMap 查 channelID / parentGroupNo
+		// （GH octo-server#153 Round-2 P1）。
+		// Round-3 (GH#154 Round-2 Finding 2)：externalGroupMap[k]="" 时兜底到
+		// defaultSpaceID，与 decideConvKeepInSpace 同口径。
+		spaceID := ""
+		mySourceSpaceID := ""
+		switch conv.ChannelType {
+		case common.ChannelTypeGroup.Uint8():
+			spaceID = groupSpaceMap[conv.ChannelID]
+			mySourceSpaceID = sidebarMySourceSpaceID(externalGroupMap, conv.ChannelID, defaultSpaceID)
+		case common.ChannelTypeCommunityTopic.Uint8():
+			groupNo, _, err := parseThreadChannelIDSidebar(conv.ChannelID)
+			if err == nil {
+				parentID = groupNo
+				spaceID = groupSpaceMap[groupNo]
+				mySourceSpaceID = sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID)
+			}
+		}
+		items = append(items, &SidebarItem{
+			TargetType:      int(conv.ChannelType),
+			TargetID:        conv.ChannelID,
+			ChannelType:     conv.ChannelType,
+			ChannelID:       conv.ChannelID,
+			SpaceID:         spaceID,
+			MySourceSpaceID: mySourceSpaceID,
+			Timestamp:       conv.Timestamp,
+			Unread:          conv.Unread,
+			IsPinned:        pinned,
+			ParentChannelID: parentID,
+		})
+	}
+	return items
+}
+
+// mergeThreadEntries appends thread ext entries (from user_conversation_ext)
+// that are NOT already present in the existing items slice.
+// This covers threads that have an ext row but the IM core didn't return them
+// as independent conversation entries.
+//
+// PR review (Round 3) Blocking #4 — DB-only thread entries must apply the same
+// parent-follow predicate as IM-returned threads (see buildFollowItems thread
+// branch): the parent group must have a non-nil category AND must not be in
+// the unfollowed set. Without this filter, threads whose parent group was
+// unfollowed (or whose category was removed) would still surface in the follow
+// tab, exposing stale state.
+//
+// issue #557 — 例外：创建者自建的**active**子区（selfCreatedThreads 命中且
+// status==ThreadStatusActive）必须始终渲染，即使父群从未关注/未分类/被显式取关。
+// 识别口径是 thread.creator_uid==loginUID（硬事实，来自 thread 表，不可能命中别人
+// 的子区），因此只对创建者本人放宽，对 fanout / 关注者行零影响，Blocking #4 的保护
+// 原样保留。为何安全：
+//  1. 豁免键严格等于 creator_uid==loginUID，别人的子区永不匹配；
+//  2. 豁免只跳过「分类/取关」前置，space 过滤（2a.5）与父群成员过滤（2a.6）
+//     在本函数之前执行且不受影响——被移出父群/跨 Space 的创建者行早已被剔除；
+//  3. UnfollowChannel 取关父群即删该群所有 thread ext 行，fanout 又只补
+//     auto_follow=1 AND group_unfollowed=0 的成员——「thread 行存在但父群未关注/
+//     未分类」几乎只能是创建者补行，豁免不会复活任何本应被删的 fanout 行；
+//  4. alive（lastMsgAtMap）检查不变，已删除子区仍被丢弃。
+//
+// XIN-1135（块B）— 豁免加 active 守卫：已归档(status=2)的自建子区不再享受 #557 豁免，
+// 回落到常规 parent-follow 谓词，避免归档子区在每次 /sidebar/sync 被无条件重新 emit
+// 进关注 Tab。对齐 /conversation/sync 的 server 端 active 语义。status 复用
+// threadStatusMap，零额外查询。见 selfCreated 分支内注释。
+//
+// PR review follow-up：ext 行存在但目标 thread 已被删除（cleanup 延迟 / 失败）的
+// 情况，loadThreadLastMsgAt 不会把它放进 lastMsgAtMap。本函数据此 skip，
+// 避免把 timestamp=0 的"幽灵 thread"emit 给客户端。
+//
+// Malformed thread channel IDs (no separator, empty parts) are skipped silently;
+// they should never be persisted in the first place but defensive handling
+// avoids appending entries with an empty ParentChannelID.
+func mergeThreadEntries(
+	existing []*SidebarItem,
+	threadExtRows []*convext.Model,
+	// lastMsgAtMap 的键是 ext.TargetID（"{groupNo}____{shortID}" 格式）。
+	// 键存在表示 thread 仍活跃（status != deleted 且 group_no 匹配）。
+	// 值为 nil 表示 thread 活跃但 last_message_at 还是 NULL（新建后未发消息）。
+	lastMsgAtMap map[string]*time.Time,
+	categorySetting map[string]*GroupCategorySetting,
+	unfollowedGroups map[string]struct{},
+	groupSpaceMap map[string]string,
+	externalGroupMap map[string]string,
+	defaultSpaceID string,
+	// selfCreatedThreads 的键是 ext.TargetID，命中表示该子区由 loginUID 本人创建
+	// （issue #557）。命中时跳过父群未关注/未分类前置丢弃，但分类字段仍安全取值
+	// （父群无分类时 catID=nil，落"未分类"桶）。
+	selfCreatedThreads map[string]struct{},
+	// threadStatusMap 的键同为 ext.TargetID（"{groupNo}____{shortID}"），值为 thread
+	// 生命周期 status（来自 loadThreadLastMsgAt 复用的 QueryActiveByGroupShortIDs，
+	// 零额外查询）。用于给 #557 自建豁免加 active 守卫：仅 active 自建子区放宽 emit。
+	threadStatusMap map[string]int,
+) []*SidebarItem {
+	if len(threadExtRows) == 0 {
+		return existing
+	}
+	// Build a set of already-present thread target IDs.
+	presentIDs := make(map[string]struct{}, len(existing))
+	for _, it := range existing {
+		if it.TargetType == int(common.ChannelTypeCommunityTopic) {
+			presentIDs[it.TargetID] = struct{}{}
+		}
+	}
+
+	result := existing
+	for _, ext := range threadExtRows {
+		if _, present := presentIDs[ext.TargetID]; present {
+			continue
+		}
+		groupNo, _, err := parseThreadChannelIDSidebar(ext.TargetID)
+		if err != nil {
+			// Malformed ID — never expose to client.
+			continue
+		}
+		// PR review follow-up：thread 必须仍活跃（在 lastMsgAtMap 中）。
+		// 不存在意味着 thread 已删除 / 不存在 / 跨群错配。
+		lastMsgAt, alive := lastMsgAtMap[ext.TargetID]
+		if !alive {
+			continue
+		}
+		_, selfCreated := selfCreatedThreads[ext.TargetID]
+		// XIN-1135 (块B) — 自建豁免加 server 端 active 守卫：只有 active 的自建子区
+		// 才放宽父群前置丢弃。已归档(status=2)的自建子区必须回落到常规 parent-follow
+		// 谓词，否则它会在每次 /sidebar/sync 被无条件重新 emit 进关注 Tab（线上「归档
+		// 子区刷新后重现」的直接成因，根因 #565 selfCreated 豁免缺 status 守卫）。对齐
+		// /conversation/sync 的 QueryActiveShortIDs status=active 语义。status 复用
+		// threadStatusMap（loadThreadLastMsgAt 已带回），零额外查询；alive 检查已保证
+		// 存活行必在 statusMap 中，故 != ThreadStatusActive 精确命中 archived。
+		if selfCreated && threadStatusMap[ext.TargetID] != thread.ThreadStatusActive {
+			selfCreated = false
+		}
+		// Apply parent-follow predicate (mirrors buildFollowItems thread branch),
+		// except for the creator's own ACTIVE thread (issue #557 + XIN-1135 guard).
+		cs, hasCategory := categorySetting[groupNo]
+		if !selfCreated {
+			if !hasCategory || cs.CategoryID == nil {
+				continue // parent group not in follow set
+			}
+			if _, unfollowed := unfollowedGroups[groupNo]; unfollowed {
+				continue // parent group explicitly unfollowed
+			}
+		}
+		// 分类字段安全取值：父群未分类（!hasCategory 或 CategoryID==nil）时 catID=nil，
+		// 该子区落"未分类"桶（CategorySort=0）。仅创建者自建子区会走到这个 nil 分支——
+		// 非创建者子区在上面已被 continue 丢弃。
+		var catID *string
+		var catGroupSort, catSort int
+		if hasCategory && cs != nil {
+			catID = cs.CategoryID
+			catGroupSort = cs.CategoryGroupSort
+			catSort = cs.CategorySort
+		}
+		var ts int64
+		if lastMsgAt != nil {
+			ts = lastMsgAt.Unix()
+		}
+		// 与 buildFollowItems thread 分支一致：继承父群 CategorySort + intraCategorySort。
+		result = append(result, &SidebarItem{
+			TargetType:  int(common.ChannelTypeCommunityTopic),
+			TargetID:    ext.TargetID,
+			ChannelType: common.ChannelTypeCommunityTopic.Uint8(),
+			ChannelID:   ext.TargetID,
+			// thread 继承父群 SpaceID（GH octo-server#153）。
+			SpaceID: groupSpaceMap[groupNo],
+			// thread 同样继承父群的 MySourceSpaceID（GH octo-server#153 Round-2 P1）。
+			// Round-3 (GH#154 Round-2 Finding 2)：父群 source_space_id="" 兜底到 defaultSpaceID。
+			MySourceSpaceID:   sidebarMySourceSpaceID(externalGroupMap, groupNo, defaultSpaceID),
+			Timestamp:         ts,
+			IsFollowed:        true,
+			FollowSort:        ext.FollowSort,
+			ParentChannelID:   groupNo,
+			CategoryID:        catID,
+			CategorySort:      catGroupSort,
+			intraCategorySort: catSort,
+		})
+	}
+	return result
+}
+
+// sidebarMySourceSpaceID 解析 sidebar item 的 my_source_space_id：
+//   - externalGroupMap 没记录该 groupNo（用户不是外部成员）：返回空串，omitempty
+//     让客户端拿不到字段，与历史一致。
+//   - 记录了非空 source_space_id：直接返回。
+//   - 记录了 source_space_id=""（旧外部成员行）：兜底到 defaultSpaceID
+//     （GH octo-server#154 Round-2 Finding 2，与 decideConvKeepInSpace 同口径）。
+//     defaultSpaceID 也空时退化为空串——保持向后兼容。
+func sidebarMySourceSpaceID(externalGroupMap map[string]string, groupNo, defaultSpaceID string) string {
+	if externalGroupMap == nil {
+		return ""
+	}
+	src, ok := externalGroupMap[groupNo]
+	if !ok {
+		return ""
+	}
+	if src != "" {
+		return src
+	}
+	return defaultSpaceID
+}
+
+// ---------------------------------------------------------------------------
+// Sorting
+// ---------------------------------------------------------------------------
+
+// sortFollowItems sorts items for the follow tab:
+//
+//	T1: CategorySort       ASC  (group_category.sort —— 类别之间的顺序)
+//	T2: IsPinned           DESC (pin overrides everything within a category)
+//	T3: FollowSort         ASC  (user_conversation_ext.follow_sort, sidebar drag wins)
+//	T4: intraCategorySort  ASC  (group_setting.category_sort —— category-mgmt UI 回退)
+//	T5: TargetID           ASC  (deterministic tiebreaker)
+//
+// Issue #41：旧实现把 intraCategorySort 排在 FollowSort 之前，导致 sidebar 拖拽
+// 排序被 category-management UI 设置过的同类内顺序覆盖；并且群分支根本没读
+// follow_sort，使群恒以 0 排在 DM 前。
+//
+// 新顺序的语义：用户在 sidebar 没拖过任何条目时 FollowSort=0，所有条目按
+// intraCategorySort（即 category-management UI 的顺序）展示；一旦拖动 sidebar，
+// 被拖条目的 FollowSort 非 0 即胜过 intraCategorySort。两套 UI 都仍然生效，
+// 且 sidebar 作为更直接的 UI 作为最终来源。
+func sortFollowItems(items []*SidebarItem) {
+	sort.SliceStable(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.CategorySort != b.CategorySort {
+			return a.CategorySort < b.CategorySort
+		}
+		if a.IsPinned != b.IsPinned {
+			return a.IsPinned // pinned first
+		}
+		if a.FollowSort != b.FollowSort {
+			return a.FollowSort < b.FollowSort
+		}
+		if a.intraCategorySort != b.intraCategorySort {
+			return a.intraCategorySort < b.intraCategorySort
+		}
+		return a.TargetID < b.TargetID
+	})
+}
+
+// sortRecentItems sorts items for the recent tab:
+// primary: pinned DESC; secondary: timestamp DESC.
+func sortRecentItems(items []*SidebarItem) {
+	sort.SliceStable(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.IsPinned != b.IsPinned {
+			return a.IsPinned
+		}
+		return a.Timestamp > b.Timestamp
+	})
+}

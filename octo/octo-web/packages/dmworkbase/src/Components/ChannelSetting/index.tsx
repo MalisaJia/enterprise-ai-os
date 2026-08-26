@@ -1,0 +1,82 @@
+import { Button, Spin } from "@douyinfe/semi-ui";
+import classNames from "classnames";
+import { Channel, ChannelInfo, Subscriber } from "wukongimjssdk";
+import React from "react";
+import { Component } from "react";
+import WKApp from "../../App";
+import Provider from "../../Service/Provider";
+import Sections from "../Sections";
+import "./index.css"
+import { ChannelSettingVM } from "./vm";
+import RoutePage from "../RoutePage";
+import ConversationContext from "../Conversation/context";
+import { ChannelTypeCommunityTopic, ChannelTypeCustomerService } from "../../Service/Const";
+import { I18nContext } from "../../i18n";
+import { getCurrentImChannelInfo } from "../../im-runtime/currentChannelRuntime";
+
+export interface ChannelSettingProps {
+    onClose?: () => void
+    channel: Channel
+    conversationContext:ConversationContext
+}
+
+export default class ChannelSetting extends Component<ChannelSettingProps> {
+    static contextType = I18nContext
+    declare context: React.ContextType<typeof I18nContext>
+
+    subscribers(): Subscriber[] {
+        return this.vm.subscribers;
+    }
+    subscriberOfMe(): Subscriber | undefined {
+        return this.vm.subscriberOfMe
+    }
+    channel(): Channel {
+        const { channel } = this.props
+        return channel
+    }
+    vm!: ChannelSettingVM
+
+    componentDidMount() {
+    }
+    render() {
+        const { onClose, channel,conversationContext } = this.props
+        return <Provider create={() => {
+            this.vm = new ChannelSettingVM(channel)
+            return this.vm
+        }} render={(vm: ChannelSettingVM) => {
+            vm.routeData.refresh = ()=>{
+                vm.notifyListener()
+            }
+
+           let  memberCount = vm.subscribers.length
+
+            const channelInfo = getCurrentImChannelInfo(channel)
+            if(channelInfo?.orgData?.member_count) {
+                memberCount = channelInfo.orgData.member_count
+            }
+
+            const title = vm.channel.channelType === ChannelTypeCommunityTopic
+                ? this.context.t("base.channelSetting.threadTitle")
+                : vm.channel.channelType === ChannelTypeCustomerService
+                    ? this.context.t("base.channelSetting.title")
+                    : this.context.t("base.channelSetting.titleWithCount", { values: { count: memberCount } })
+           
+            return <RoutePage className="wk-channelsetting" title={title} onClose={() => {
+                if (onClose) {
+                    onClose()
+                }
+            }} render={(context) => {
+                vm.routeData.conversationContext = conversationContext
+                context.setRouteData(vm.routeData)
+                return <div className="wk-channelsetting-content">
+                    {
+                        vm.channelInfo ? <Sections sections={vm.sections(context)}></Sections> : <div className="wk-channelsetting-content-loading"><Spin ></Spin></div>
+                    }
+                </div>
+            }} />
+        }}>
+        </Provider>
+
+
+    }
+}

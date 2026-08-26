@@ -1,0 +1,5186 @@
+package user
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"math/rand"
+	"net/http"
+	"os"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/model"
+	chservice "github.com/Mininglamp-OSS/octo-server/modules/channel/service"
+	"github.com/Mininglamp-OSS/octo-server/modules/file"
+	"github.com/Mininglamp-OSS/octo-server/modules/source"
+	"github.com/Mininglamp-OSS/octo-server/pkg/authtree"
+	"github.com/Mininglamp-OSS/octo-server/pkg/avatarrender"
+	"github.com/Mininglamp-OSS/octo-server/pkg/avatarversion"
+	"github.com/Mininglamp-OSS/octo-server/pkg/metrics"
+	"github.com/Mininglamp-OSS/octo-server/pkg/ratelimit"
+	octoredis "github.com/Mininglamp-OSS/octo-server/pkg/redis"
+	spacepkg "github.com/Mininglamp-OSS/octo-server/pkg/space"
+	appwkhttp "github.com/Mininglamp-OSS/octo-server/pkg/wkhttp"
+	rd "github.com/go-redis/redis"
+	"github.com/gocraft/dbr/v2"
+	"github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/ext"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/log"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/network"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/register"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkevent"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/app"
+	commonapi "github.com/Mininglamp-OSS/octo-server/modules/base/common"
+	"github.com/Mininglamp-OSS/octo-server/modules/base/event"
+	"github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
+	common2 "github.com/Mininglamp-OSS/octo-server/modules/common"
+	"github.com/Mininglamp-OSS/octo-server/pkg/auth"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	octoi18n "github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
+)
+
+var (
+	ErrUserNeedVerification = errors.New("user need verification") // 用户需要验证
+	// ErrUserDisabled / ErrUserDeviceInfoRequired are execLogin's client-facing
+	// sentinels so every login entry point (main / OAuth / email / username) can
+	// classify them uniformly: a disabled account is 403, a missing device info
+	// is 400 — not a generic 500. errors.Is on these at the call site (see
+	// respondExecLoginError) keeps the classification in one place.
+	ErrUserDisabled           = errors.New("该用户已被禁用")
+	ErrUserDeviceInfoRequired = errors.New("登录设备信息不能为空！")
+)
+
+// qrcodeChanMap stores channels for QR code login long-polling.
+// Concurrency safety is ensured by qrcodeChanLock:
+//   - SendQRCodeInfo: holds lock during both map read AND channel send (no TOCTOU)
+//   - removeQRCodeChanOwned: holds lock during map delete AND channel close, and
+//     only acts when the registered channel is still the caller's own — that
+//     ownership check is what makes a cross-request close impossible
+//   - getQRCodeModelChan: holds lock during map write
+//
+// The channel is buffered (size 1) to prevent message loss between
+// getQRCodeModelChan return and the caller's select/receive.
+// See: #294, #345 for race condition fixes.
+var qrcodeChanMap = map[string]chan *common.QRCodeModel{}
+var qrcodeChanLock sync.RWMutex
+
+// User 用户相关API
+type User struct {
+	db             *DB
+	friendDB       *friendDB
+	deviceDB       *deviceDB
+	smsServie      commonapi.ISMSService
+	fileService    file.IService
+	settingDB      *SettingDB
+	onlineDB       *onlineDB
+	userService    IService
+	onlineService  *OnlineService
+	giteeDB        *giteeDB
+	githubDB       *githubDB
+	pinnedDB       *PinnedDB
+	pinned         *Pinned
+	spaceSettingDB *SpaceSettingDB
+
+	setting *Setting
+	log.Log
+	ctx                      *config.Context
+	userDeviceTokenPrefix    string
+	loginUUIDPrefix          string
+	openapiAuthcodePrefix    string
+	openapiAccessTokenPrefix string
+	loginLog                 *LoginLog
+	identitieDB              *identitieDB
+	onetimePrekeysDB         *onetimePrekeysDB
+	maillistDB               *maillistDB
+	commonService            common2.IService
+	deviceFlagDB             *deviceFlagDB
+	deviceFlagsCache         []*deviceFlagModel
+	deviceFlagsOnce          sync.Once
+	deviceFlagsErr           error
+	appService               app.IService
+	loginGuard               *LoginGuard
+	verificationDB           *verificationDB
+	languageService          *LanguageService
+	sessionStore             userSessionStore
+	tokenValidator           *auth.TokenValidator
+	scanLoginAuthorizations  *scanLoginAuthorizationStore
+	revocationWorkerOwner    string
+}
+
+type userSessionStore interface {
+	IssueNew(ctx context.Context, token, payload, uid string, deviceFlag int) error
+	ReuseExisting(ctx context.Context, token, payload, uid string, deviceFlag int) (bool, error)
+	UpdatePayloadKeepDeadline(ctx context.Context, token, payload string) (bool, error)
+	DeviceToken(ctx context.Context, uid string, deviceFlag int) (string, error)
+	DeleteToken(ctx context.Context, token string) error
+	RevokeIssued(ctx context.Context, token, uid string, deviceFlag int) error
+}
+
+type v3UserSessionStore interface {
+	Mode() auth.SessionMode
+	BeginIssue(ctx context.Context, uid string) (auth.IssueFence, error)
+	IssueNewSession(ctx context.Context, token string, info auth.TokenInfo, fence auth.IssueFence) error
+	ReuseSession(ctx context.Context, token string, info auth.TokenInfo, fence auth.IssueFence) (bool, error)
+	UpdateSessionSnapshot(ctx context.Context, token string, info auth.TokenInfo) (bool, error)
+	RevokeCurrent(ctx context.Context, token, uid string, deviceFlag int) error
+	RevokeAll(ctx context.Context, uid string, event auth.RevocationEvent) error
+}
+
+type userSessionIssueContextKey struct{}
+
+type userSessionIssueContext struct {
+	uid   string
+	fence auth.IssueFence
+}
+
+type currentUserTokenInvalidator interface {
+	InvalidateCurrentToken(ctx context.Context, uid, token string) error
+}
+
+// New New
+func New(ctx *config.Context) *User {
+	sessionStore, loginRedisClient := auth.SessionStoreAndClientForContext(ctx)
+	u := &User{
+		ctx:                      ctx,
+		db:                       NewDB(ctx),
+		deviceDB:                 newDeviceDB(ctx),
+		friendDB:                 newFriendDB(ctx),
+		smsServie:                commonapi.NewSMSService(ctx),
+		settingDB:                NewSettingDB(ctx.DB()),
+		setting:                  NewSetting(ctx),
+		userDeviceTokenPrefix:    common.UserDeviceTokenPrefix,
+		loginUUIDPrefix:          "loginUUID:",
+		openapiAuthcodePrefix:    "openapi:authcodePrefix:",
+		openapiAccessTokenPrefix: "openapi:accessTokenPrefix:",
+		onlineDB:                 newOnlineDB(ctx),
+		onlineService:            NewOnlineService(ctx),
+		Log:                      log.NewTLog("User"),
+		fileService:              file.NewService(ctx),
+		userService:              NewService(ctx),
+		loginLog:                 NewLoginLog(ctx),
+		identitieDB:              newIdentitieDB(ctx),
+		onetimePrekeysDB:         newOnetimePrekeysDB(ctx),
+		maillistDB:               newMaillistDB(ctx),
+		deviceFlagDB:             newDeviceFlagDB(ctx),
+		giteeDB:                  newGiteeDB(ctx),
+		githubDB:                 newGithubDB(ctx),
+		commonService:            common2.NewService(ctx),
+		appService:               app.NewService(ctx),
+		loginGuard:               NewLoginGuard(ctx.GetRedisConn(), loginGuardThresholdFromEnv(), loginGuardWindowFromEnv()),
+		pinnedDB:                 NewPinnedDB(ctx),
+		spaceSettingDB:           NewSpaceSettingDB(ctx.DB()),
+		verificationDB:           newVerificationDB(ctx),
+		sessionStore:             sessionStore,
+		tokenValidator:           auth.NewTokenValidator(sessionStore, ctx.GetConfig().Cache.TokenCachePrefix),
+		scanLoginAuthorizations:  newScanLoginAuthorizationStore(loginRedisClient),
+		revocationWorkerOwner:    util.GenerUUID(),
+	}
+	// LanguageService 与 main.go 注入到 CacheTokenParser 的实例独立构造，但共享
+	// 底层 *DB session / Redis 连接，因此读写同一份 user.language 列与
+	// user_language:{uid} 热缓存，行为等价。这样 handler 不需要 main.go 反向注入。
+	u.languageService = NewLanguageService(u.db, ctx.Cache())
+	u.pinned = NewPinned(u.pinnedDB, u.friendDB)
+	InitGlobalPinnedDB(ctx) // 初始化全局 PinnedDB 供其他模块调用
+	u.updateSystemUserToken()
+	// 手机号加密器由 NewDB 持有并在 Insert/insertTx 里统一同步影子列；这里只做一次
+	// 运维可见性提示，避免每个 NewDB 都刷同一条 warn。
+	//
+	// 用 Error 而不是 Warn：建号不会失败，但**手机号会以明文入库**，而"手机号已加密
+	// 存储"是对外声明过的结论 —— 这条日志是漏配的唯一告警面，降级本身在请求路径上
+	// 完全静默（见 DB.syncPhoneShadow）。日志必须如实描述降级范围，说错会把生产
+	// 排障带到完全错误的方向。
+	if u.db.phoneEnc == nil {
+		u.Error("手机号加密主密钥未配置：新建账号的手机号将以明文入库、加密列与盲索引留空"+
+			"（等同于未回填的存量行）。建号与检索均不受影响。请配置该环境变量（32 字节）"+
+			"后重启，并运行手机号影子列回填把这批明文补齐。",
+			zap.String("env", phoneEncryptionSecretEnv))
+	}
+	source.SetUserProvider(u)
+	// 注入外部 IdP 登录 handler:Service 通过 IService 暴露 LoginByExternalIdentity,
+	// 但实际逻辑落在 *User 上（依赖 execLogin / createUserWithRespAndTx 等私有方法）。
+	if svc, ok := u.userService.(*Service); ok {
+		svc.SetExternalLoginHandler(u)
+		// 同款反向注入:VerifyPasswordByUID / Send|VerifyOIDCBindSMS 都依赖
+		// *User 私有的 loginGuard / smsServie / db.QueryByUID,Service 持不到。
+		svc.SetOIDCBindHandler(u)
+	}
+
+	return u
+}
+
+// Route 路由配置
+func (u *User) Route(r *wkhttp.WKHttp) {
+	// 端点级严格 per-IP 限流：防暴力破解 / 撞库 / 手机号枚举 / SMS 费用 DoS
+	// 同类端点共享一个限流器实例，使同一 IP 的总配额受控，避免攻击者跨端点分散
+	rlCtx := context.Background()
+	// 限流状态存 Redis，多副本共享配额；生命周期跟随进程，与 main.go 的做法一致
+	// PoolSize 显式设 10：理由同 main.go——限流 Lua 脚本短事务，不需要大池。
+	rlRedis := octoredis.NewInstrumentedClient(u.ctx.GetConfig(), func(o *rd.Options) {
+		o.MaxRetries = 1
+		o.PoolSize = 10
+	})
+	// burst 取小值：人类正常重试容忍 + 不给攻击者初始白嫖窗口
+	// tag 用稳定字符串分离 keyspace；注意 register 和 sms 参数相同但语义不同，必须分开
+	loginLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "login", 10.0/60, 5)       // 10 req/min, burst 5
+	verifyLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "verify", 1000.0/60, 100) // 1000 req/min, burst 100 (Gateway traffic)
+	registerLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "register", 5.0/60, 3)  // 5 req/min, burst 3
+	smsLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "sms", 5.0/60, 3)            // 5 req/min, burst 3
+	searchLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "search", 30.0/60, 15)    // 30 req/min, burst 15
+	// 扫码登录的两个端点此前既未认证也未限流：loginuuid 可被用来批量铸造钓鱼二维码，
+	// loginstatus 每次请求挂起 10 秒、可用来占满连接与 goroutine。
+	//
+	// 阈值刻意比 login 松，且做成 env 可调：loginstatus 是长轮询（单浏览器约 6 次/分，
+	// 多开标签页会翻倍），而企业 NAT 下整层楼共用一个出口 IP —— 卡太死的后果是一片人
+	// 登不上，比放过一点扫描流量严重得多。运维撞到 NAT 墙时可不重新发版直接上调。
+	scanLoginUUIDLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "scanlogin_uuid",
+		ratelimit.SanitizeRPS(
+			wkhttp.ParseRPSFromEnv("DM_API_SCANLOGIN_UUID_RATELIMIT_RPS", defaultScanLoginUUIDRateLimitRPS),
+			defaultScanLoginUUIDRateLimitRPS,
+		),
+		wkhttp.ParseBurstFromEnv("DM_API_SCANLOGIN_UUID_RATELIMIT_BURST", defaultScanLoginUUIDRateLimitBurst))
+	scanLoginStatusLimit := r.StrictIPRateLimitMiddleware(rlCtx, rlRedis, "scanlogin_status",
+		ratelimit.SanitizeRPS(
+			wkhttp.ParseRPSFromEnv("DM_API_SCANLOGIN_STATUS_RATELIMIT_RPS", defaultScanLoginStatusRateLimitRPS),
+			defaultScanLoginStatusRateLimitRPS,
+		),
+		wkhttp.ParseBurstFromEnv("DM_API_SCANLOGIN_STATUS_RATELIMIT_BURST", defaultScanLoginStatusRateLimitBurst))
+
+	auth := r.Group("/v1", u.ctx.AuthMiddleware(r))
+	{
+
+		// 挂 SharedUIDRateLimiter（须在 AuthMiddleware 之后才能读到 uid）：该端点是
+		// 对象级资料读取面，UID 虽是 32 位 hex 高熵，但认证用户批量探测不应只受全局
+		// per-IP 桶约束。与 channelGet 对齐（modules/channel/api.go）。
+		auth.GET("/users/:uid", appwkhttp.SharedUIDRateLimiter(r, u.ctx), u.get) // 根据uid查询用户信息
+		// 批量解析用户最小身份信息（无 PII），供大群转发授权等场景一次拉取，替代
+		// 逐个 GET /v1/users/:uid 打满端点限流。静态 /users/batch 与上面的
+		// /users/:uid 同层共存（gin 1.9 支持 static+param）。
+		//
+		// 与 /users/:uid 复用**同一个**进程级 SharedUIDRateLimiter 实例，即两条路由
+		// 共享同一把 per-uid 令牌桶（ratelimit:uid:{uid}）——认证用户的批量身份探测面
+		// 必须受 per-uid 桶约束而非只靠全局 per-IP 桶（.octospec/rules/rate-limit.md，
+		// load_bearing）。桶按请求计 1 token，批量放大由 MaxBatchUserUIDs 上限兜住
+		// （见 batch.go：规则禁止手搓 Redis 计数器做加权扣费，故用收紧上限这条合规杠杆）。
+		auth.POST("/users/batch", appwkhttp.SharedUIDRateLimiter(r, u.ctx), u.batchGet)
+		// 获取用户的会话信息
+		// auth.GET("/users/:uid/conversation", u.userConversationInfoGet)
+
+		auth.GET("/user/search", searchLimit, u.search)
+		auth.POST("/users/:uid/avatar", u.uploadAvatar)              //上传用户头像
+		auth.PUT("/users/:uid/setting", u.setting.userSettingUpdate) // 更新用户设置
+	}
+
+	// 用户详情与用户搜索开放给 User API Key（`uk_*`）树。两个 handler 的 actor 都取自
+	// MustGet("uid") / GetLoginUID()，uk 中间件把真人 UID 落在同一个 context key，因此
+	// 复用后 actor 仍是真人而非 bot。search 复用 human 侧那**同一个** searchLimit 实例，
+	// 于是两棵树共享 per-IP 的 `strict:search` 桶——这是刻意的取舍：搜索是用户存在性探测
+	// 面，共享桶意味着攻击者无法通过换 surface 把配额翻倍；代价是同一出口 IP 下的自动化
+	// 客户端会吃掉真人的额度。反枚举优先于额度隔离，故选共享。（uk 树自己的 per-uid 桶是
+	// 120 req/min，比 human 的 30 req/min 宽，缺这一层会让自动化路径成为更省力的入口。）
+	//
+	// 两条路由的租户锚点不同，故 Tenant 声明不同：
+	//   /users/:uid  → handler 不读请求 Space，注入对它是 no-op，必须靠路由自己的
+	//                  requireBoundSpaceMember 把目标 UID 限制在绑定 Space 内。
+	//   /user/search → handler 直接读 query 的 space_id，enforceKeySpace 已把它钉成
+	//                  绑定值，注入即约束（"按该 Space 过滤"分支只返回该 Space 成员）。
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:      http.MethodGet,
+		Path:        "/users/:uid",
+		Tenant:      authtree.ScopeRouteGuard,
+		Middlewares: []wkhttp.HandlerFunc{u.requireBoundSpaceMember()},
+		Handler:     u.get,
+	})
+	authtree.Add(authtree.TreeUserKey, r, authtree.Route{
+		Method:      http.MethodGet,
+		Path:        "/user/search",
+		Tenant:      authtree.ScopeRouteGuard,
+		Middlewares: []wkhttp.HandlerFunc{searchLimit},
+		Handler:     u.search,
+	})
+
+	user := r.Group("/v1/user", u.ctx.AuthMiddleware(r))
+	{
+		user.POST("/device_token", u.registerUserDeviceToken)      // 注册用户设备
+		user.DELETE("/device_token", u.unregisterUserDeviceToken)  // 卸载用户设备
+		user.POST("/device_badge", u.registerUserDeviceBadge)      // 上传设备红点数量
+		user.GET("/grant_login", u.grantLogin)                     // 授权登录
+		user.GET("/current", u.currentUser)                        // 获取当前登录用户信息（含 self 实名字段）
+		user.PUT("/current", u.userUpdateWithField)                //修改用户信息
+		user.PUT("/language", u.setLanguage)                       // 设置当前用户语言偏好（i18n）；依赖 group 上的 AuthMiddleware 注入 uid，handler 内仍保留 belt-and-braces 检查
+		user.GET("/qrcode", u.qrcodeMy)                            // 我的二维码
+		user.PUT("/my/setting", u.userUpdateSetting)               // 更新我的设置
+		user.POST("/blacklist/:uid", u.addBlacklist)               //添加黑名单
+		user.DELETE("/blacklist/:uid", u.removeBlacklist)          //移除黑名单
+		user.GET("/blacklists", u.blacklists)                      //黑名单列表
+		user.POST("/chatpwd", u.setChatPwd)                        //设置聊天密码
+		user.POST("/lockscreenpwd", u.setLockScreenPwd)            //设置锁屏密码
+		user.PUT("/lock_after_minute", u.lockScreenAfterMinuteSet) // 设置多久后锁屏
+		user.DELETE("/lockscreenpwd", u.closeLockScreenPwd)        //关闭锁屏密码
+		user.GET("/customerservices", u.customerservices)          //客服列表
+		user.DELETE("/destroy/:code", u.destroyAccount)            // 注销用户（即时，已废弃但保留兼容）
+		user.POST("/sms/destroy", u.sendDestroyCode)               //获取注销账号短信验证码
+		user.POST("/destroy/apply", u.destroyApply)                // 申请注销（进入冷静期）
+		user.POST("/destroy/cancel", u.destroyCancel)              // 撤销注销申请
+		user.GET("/destroy/status", u.destroyStatus)               // 查询注销状态
+		user.PUT("/updatepassword", u.updatePwd)                   // 修改登录密码
+		user.POST("/web3publickey", u.uploadWeb3PublicKey)         // 上传web3公钥
+		user.POST("/quit", u.quit)                                 // 退出登录
+		// #################### 登录设备管理 ####################
+		user.GET("/devices", u.deviceList)                 // 用户登录设备
+		user.DELETE("/devices/:device_id", u.deviceDelete) // 删除登录设备
+		user.GET("/devices/:device_id", u.getDevice)       // 查询某个登录设备
+		user.GET("/online", u.onlineList)                  // 用户在线列表（我的设备和我的好友）
+		user.POST("/online", u.onlinelistWithUIDs)         // 获取指定的uid在线状态
+		user.POST("/pc/quit", u.pcQuit)                    // 退出pc登录
+
+		// #################### 用户通讯录 ####################
+		user.POST("/maillist", u.addMaillist)
+		user.GET("/maillist", u.getMailList)
+
+		// #################### 用户红点 ####################
+		user.GET("/reddot/:category", u.getRedDot)      // 获取用户红点
+		user.DELETE("/reddot/:category", u.clearRedDot) // 清除红点
+	}
+
+	// #################### 用户置顶频道（需要 Space 隔离）####################
+	pinned := r.Group("/v1/user/pinned", u.ctx.AuthMiddleware(r), spacepkg.SpaceMiddleware(u.ctx))
+	{
+		pinned.POST("", u.pinned.Add)            // 添加置顶
+		pinned.DELETE("", u.pinned.Remove)       // 移除置顶
+		pinned.GET("", u.pinned.List)            // 获取置顶列表
+		pinned.PUT("/sort", u.pinned.UpdateSort) // 更新排序
+	}
+
+	// #################### Space 级用户设置 ####################
+	spaceSetting := r.Group("/v1/user/space", u.ctx.AuthMiddleware(r), spacepkg.SpaceMiddleware(u.ctx))
+	{
+		spaceSetting.GET("/setting", u.getSpaceSetting)
+		spaceSetting.PUT("/setting", u.updateSpaceSetting)
+	}
+	v := r.Group("/v1")
+	{
+
+		v.POST("/user/register", registerLimit, u.register)                 //用户注册
+		v.POST("/user/login", loginLimit, u.login)                          // 用户登录
+		v.POST("/user/usernamelogin", loginLimit, u.usernameLogin)          // 用户名登录
+		v.POST("/user/usernameregister", registerLimit, u.usernameRegister) // 用户名注册
+		v.POST("/user/emaillogin", loginLimit, u.emailLogin)                // 邮箱登录
+		v.POST("/user/emailregister", registerLimit, u.emailRegister)       // 邮箱注册
+		v.POST("/user/email/sendcode", smsLimit, u.emailSendCode)           // 发送邮箱验证码
+		v.POST("/user/email/forgetpwd", loginLimit, u.emailForgetPwd)       // 邮箱忘记密码
+
+		v.POST("/user/pwdforget_web3", u.resetPwdWithWeb3PublicKey) // 通过web3公钥重置密码
+		v.GET("/user/web3verifytext", u.getVerifyText)              // 获取验证字符串
+		v.POST("/user/web3verifysign", u.web3verifySignature)       // 验证签名
+		//v.POST("user/wxlogin", u.wxLogin)
+		v.POST("/user/sms/forgetpwd", smsLimit, u.getForgetPwdSMS)   //获取忘记密码验证码
+		v.POST("/user/pwdforget", loginLimit, u.pwdforget)           //重置登录密码
+		v.GET("/users/:uid/avatar", u.UserAvatar)                    // 用户头像
+		v.GET("/users/:uid/im", u.userIM)                            // 获取用户所在IM节点信息
+		v.GET("/user/loginuuid", scanLoginUUIDLimit, u.getLoginUUID) // 获取扫描用的登录uuid
+		v.GET("/user/loginstatus", scanLoginStatusLimit, u.getloginStatus)
+		v.POST("/user/sms/registercode", smsLimit, u.sendRegisterCode)             //获取注册短信验证码
+		v.POST("/user/login_authcode/:auth_code", loginLimit, u.loginWithAuthCode) // 通过认证码登录
+		v.POST("/user/sms/login_check_phone", smsLimit, u.sendLoginCheckPhoneCode) //发送登录设备验证验证码
+		v.POST("/user/login/check_phone", loginLimit, u.loginCheckPhone)           //登录验证设备手机号
+
+		// #################### Token / Bot 认证验证（供 Gateway 调用） ####################
+		v.POST("/auth/verify", verifyLimit, u.authVerifyToken)          // 验证用户 token
+		v.POST("/auth/verify-bot", verifyLimit, u.authVerifyBot)        // 验证 Bot API Key
+		v.POST("/auth/verify-api-key", verifyLimit, u.authVerifyAPIKey) // 验证 daemon API Key (uk_)
+		// ↑ Verify endpoints are rate-limited (1000 req/min/IP). For production,
+		// restrict access at network level (nginx allow internal IPs only) or
+		// add X-Internal-Key header validation.
+
+		// #################### 第三方授权 ####################
+		v.GET("/user/thirdlogin/authcode", u.thirdAuthcode)     // 第三方授权码获取
+		v.GET("/user/thirdlogin/authstatus", u.thirdAuthStatus) // github认证页面
+		// github
+		v.GET("/user/github", u.github)            // github认证页面
+		v.GET("/user/oauth/github", u.githubOAuth) // github登录
+		// gitee
+		v.GET("/user/gitee", u.gitee)            // gitee认证页面
+		v.GET("/user/oauth/gitee", u.giteeOAuth) // gitee登录
+
+	}
+
+	// /v1/internal/verify-token —— Aegis OIDC Phase 2d 翻译层 (YUJ-394)
+	//
+	// 老的 verify-service HMAC 回调 /v1/internal/verification/complete 与 5 分钟 JWT
+	// 签发 /v1/internal/verify-token 已随 Aegis OIDC 直切(YUJ-382 / Aegis OIDC Phase 1)
+	// 全部废弃,新链路走 oidc callback 直接写 user_verification。
+	// /verification/complete 彻底删除:合法客户端只有 verify-service 自己,该服务已下线。
+	//
+	// 但已发布的老 App 仍会调用 /v1/internal/verify-token 来获取一个"跳转 URL"去做实名。
+	// Phase 1 临时改成 410 Gone,会让老 App 点去认证就报错 —— 用户体验不可接受。
+	// Phase 2d 恢复该接口为"翻译层":认证后直接返回 Aegis 账户页 URL,不再签任何
+	// HMAC/JWT,只是代理返回一个稳定 URL。
+	// 保留 AuthMiddleware —— 不能让未登录用户拿到携带 return_to 的认证跳转。
+	internal := r.Group("/v1/internal", u.ctx.AuthMiddleware(r))
+	{
+		internal.GET("/verify-token", u.verifyTokenAegisRedirect)
+		internal.POST("/verify-token", u.verifyTokenAegisRedirect)
+	}
+
+	u.ctx.AddOnlineStatusListener(u.onlineService.listenOnlineStatus)  // 监听在线状态
+	u.ctx.AddOnlineStatusListener(u.handleOnlineStatus)                // 需要放在listenOnlineStatus之后
+	u.ctx.Schedule(time.Minute*5, u.onlineStatusCheck)                 // 在线状态定时检查
+	u.ctx.Schedule(time.Minute*5, u.checkDestroyExpired)               // 注销冷静期到期扫描
+	u.ctx.Schedule(10*time.Second, u.processPendingSessionRevocations) // durable HTTP session revocation
+
+}
+
+// app退出登录
+func (u *User) quit(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	failed := false
+	if err := invalidateCurrentUserToken(c.Request.Context(), u.sessionStore, loginUID, c.GetHeader("token")); err != nil {
+		u.Error("撤销当前 HTTP token 失败", zap.Error(err))
+		failed = true
+	}
+	err := u.ctx.QuitUserDevice(loginUID, int(config.Web)) // 退出web
+	if err != nil {
+		u.Error("退出web设备失败", zap.Error(err))
+		failed = true
+	}
+
+	err = u.ctx.QuitUserDevice(loginUID, int(config.PC))
+	if err != nil {
+		u.Error("退出PC设备失败", zap.Error(err))
+		failed = true
+	}
+
+	err = u.ctx.GetRedisConn().Del(fmt.Sprintf("%s%s", u.userDeviceTokenPrefix, loginUID))
+	if err != nil {
+		u.Error("删除设备token失败！", zap.Error(err))
+		failed = true
+	}
+	if failed {
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// 清除红点
+func (u *User) clearRedDot(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	category := c.Param("category")
+	if category == "" {
+		respondUserRequestInvalid(c, "category")
+		return
+	}
+	userRedDot, err := u.db.queryUserRedDot(loginUID, category)
+	if err != nil {
+		u.Error("查询用户红点错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userRedDot != nil {
+		userRedDot.Count = 0
+		err = u.db.updateUserRedDot(userRedDot)
+		if err != nil {
+			u.Error("修改用户红点错误", zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
+	}
+	c.ResponseOK()
+}
+
+// 获取用户红点
+func (u *User) getRedDot(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	category := c.Param("category")
+	if category == "" {
+		respondUserRequestInvalid(c, "category")
+		return
+	}
+	userRedDot, err := u.db.queryUserRedDot(loginUID, UserRedDotCategoryFriendApply)
+	if err != nil {
+		u.Error("查询用户红点错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	count := 0
+	isDot := 0
+	if userRedDot != nil {
+		count = userRedDot.Count
+		isDot = userRedDot.IsDot
+	}
+	c.Response(map[string]interface{}{
+		"count":  count,
+		"is_dot": isDot,
+	})
+}
+
+// updateSystemUserToken 更新系统账号token
+func (u *User) updateSystemUserToken() {
+	_, err := u.ctx.UpdateIMToken(config.UpdateIMTokenReq{
+		UID:         u.ctx.GetConfig().Account.SystemUID,
+		DeviceFlag:  config.APP,
+		DeviceLevel: config.DeviceLevelMaster,
+		Token:       util.GenerUUID(),
+	})
+	if err != nil {
+		u.Error("更新IM的token失败！", zap.Error(err))
+	}
+
+	_, err = u.ctx.UpdateIMToken(config.UpdateIMTokenReq{
+		UID:         u.ctx.GetConfig().Account.FileHelperUID,
+		DeviceFlag:  config.APP,
+		DeviceLevel: config.DeviceLevelMaster,
+		Token:       util.GenerUUID(),
+	})
+	if err != nil {
+		u.Error("更新IM的token失败！", zap.Error(err))
+	}
+
+	// 系统管理员
+	_, err = u.ctx.UpdateIMToken(config.UpdateIMTokenReq{
+		UID:         u.ctx.GetConfig().Account.AdminUID,
+		DeviceFlag:  config.APP,
+		DeviceLevel: config.DeviceLevelMaster,
+		Token:       util.GenerUUID(),
+	})
+	if err != nil {
+		u.Error("更新IM的token失败！", zap.Error(err))
+	}
+
+}
+
+// UserAvatar 用户头像
+func (u *User) UserAvatar(c *wkhttp.Context) {
+	uid := c.Param("uid")
+	v := c.Query("v")
+	if u.ctx.GetConfig().IsVisitor(uid) {
+		c.Header("Content-Type", "image/jpeg")
+		avatarBytes, err := os.ReadFile("assets/assets/visitor.png")
+		if err != nil {
+			u.Error("头像读取失败！", zap.Error(err))
+			c.Writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		c.Writer.Write(avatarBytes)
+		return
+	}
+	if uid == u.ctx.GetConfig().Account.SystemUID {
+		c.Header("Content-Type", "image/jpeg")
+		avatarBytes, err := os.ReadFile("assets/assets/u_10000.png")
+		if err != nil {
+			u.Error("系统用户头像读取失败！", zap.Error(err))
+			c.Writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		c.Writer.Write(avatarBytes)
+		return
+	}
+	if uid == u.ctx.GetConfig().Account.FileHelperUID {
+		c.Header("Content-Type", "image/jpeg")
+		avatarBytes, err := os.ReadFile("assets/assets/fileHelper.jpeg")
+		if err != nil {
+			u.Error("文件传输助手头像读取失败！", zap.Error(err))
+			c.Writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		c.Writer.Write(avatarBytes)
+		return
+	}
+
+	// 系统 Bot 品牌化专属头像（botfather 等）：固定静态图，优先级与
+	// u_10000/fileHelper 同级——查库前返回，不依赖 DB 记录，也不走 13 色随机
+	// 头像或昵称首字母渲染。未配专属图的系统 Bot 返回 ok=false，继续走下面的
+	// 默认逻辑。
+	if imageData, ok := systemBotAvatar(uid); ok {
+		c.Header("Content-Type", "image/png")
+		c.Header("Content-Disposition", "inline; filename=avatar.png")
+		c.Header("Cache-Control", "public, max-age=86400")
+		c.Data(http.StatusOK, "image/png", imageData)
+		return
+	}
+
+	// incoming webhook 合成发送者（iwh_ 前缀）不在 user 表，单独处理头像：有自定义
+	// URL 则重定向，否则回退默认头像，避免裂图（含 webhook 已删除的情况）。
+	if strings.HasPrefix(uid, webhookUIDPrefix) {
+		u.writeWebhookAvatar(c, uid)
+		return
+	}
+
+	userInfo, err := u.db.QueryByUID(uid)
+	if err != nil {
+		u.Error("查询用户信息错误", zap.Error(err))
+		c.Writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if userInfo == nil {
+		u.Error("用户不存在", zap.Error(err))
+		c.Writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	ph := ""
+	downloadUrl := ""
+	if userInfo.IsUploadAvatar == 1 {
+		ph = userAvatarFilePath(uid, u.ctx.GetConfig().Avatar.Partition, userInfo.AvatarVersion)
+	} else {
+		if shouldUseBotDefaultAvatar(uid, userInfo) {
+			imageData, avatarErr := readBotDefaultAvatar(uid)
+			if avatarErr != nil {
+				u.Error("读取 Bot 默认头像失败", zap.Error(avatarErr), zap.String("uid", uid))
+			} else {
+				c.Header("Content-Type", "image/png")
+				c.Header("Content-Disposition", "inline; filename=avatar.png")
+				c.Header("Cache-Control", "public, max-age=86400")
+				c.Data(http.StatusOK, "image/png", imageData)
+				return
+			}
+		}
+
+		// 配置使用本地默认头像
+		if u.ctx.GetConfig().Avatar.Default != "" && strings.TrimSpace(u.ctx.GetConfig().Avatar.DefaultBaseURL) == "" {
+			// 读取配置的头像文件
+			avatarPath := u.ctx.GetConfig().Avatar.Default
+			imageData, err := os.ReadFile(avatarPath)
+			if err != nil {
+				u.Error("打开本地头像文件失败", zap.Error(err))
+			} else {
+				c.Header("Content-Type", "image/png")
+				c.Header("Content-Disposition", "inline; filename=avatar.png")
+				c.Header("Cache-Control", "public, max-age=86400")
+				c.Data(http.StatusOK, "image/png", imageData)
+				return
+			}
+		}
+
+		if strings.TrimSpace(u.ctx.GetConfig().Avatar.DefaultBaseURL) != "" {
+			avatarID := crc32.ChecksumIEEE([]byte(uid)) % uint32(u.ctx.GetConfig().Avatar.DefaultCount)
+			ph = fmt.Sprintf("/avatar/default/test (%d).jpg", avatarID)
+			downloadUrl = strings.ReplaceAll(u.ctx.GetConfig().Avatar.DefaultBaseURL, "{avatar}", fmt.Sprintf("%d", avatarID))
+		} else {
+			// 本地生成默认头像：固定色板按 uid 取色（改名不变色）+ 昵称取字（script 感知后 2）白字。
+			// 昵称为空、或截出的文字含本字体无字形的字符（典型是纯 emoji）时，回退到
+			// 基于 uid 的 ASCII 兜底图，保证不裂图、不出豆腐块。
+			//
+			// 默认头像内容随昵称变化，但 URL 是稳定的 users/{uid}/avatar。因此用
+			// 短缓存 + must-revalidate + 内容相关 ETag：改名后端换 ?v 立即生效，
+			// 不换 URL 的访问（共享缓存/直接访问/非好友）也最多 5 分钟内 revalidate
+			// 到新头像，避免按 max-age 长达一天继续展示旧昵称头像。
+			//
+			// ETag 只依赖 uid+昵称（无需渲染），因此先算 ETag 并在命中 If-None-Match
+			// 时直接 304，避免对每次缓存 revalidation 重复执行昂贵的渲染/PNG 编码。
+			// ETag/Cache-Control 在 304 与 200 都要带；Content-Type 由下面返回图像的
+			// c.Data 统一设置（304 无 body 不需要），避免重复设置。
+			setAvatarHeaders := func(etag string) {
+				c.Header("Content-Disposition", "inline; filename=avatar.png")
+				c.Header("ETag", etag)
+				c.Header("Cache-Control", "public, max-age=300, must-revalidate")
+			}
+
+			text := avatarrender.IndividualText(userInfo.Name)
+			nameMode := avatarrender.Renderable(text)
+			// ETag 覆盖决定内容的因子：渲染模式版本 + uid(决定颜色) + 展示文字。
+			// 渲染**视觉/取字规则**改动(像素变但因子不变，如 #486 透明四角、本次取字改版)必须
+			// bump 版本段；ascii-v1 走 generateDefaultAvatar，本次未改其像素，故不 bump。
+			// name-v5: 昵称取字改为 script 感知(混排只取中文、纯英文首字母缩写)，原 v4 取后 2。
+			etag := avatarETag("ascii-v1", uid)
+			if nameMode {
+				etag = avatarETag("name-v5", uid, text)
+			}
+			setAvatarHeaders(etag)
+			if ifNoneMatchSatisfied(c.GetHeader("If-None-Match"), etag) {
+				metrics.ObserveAvatarNotModified()
+				c.Status(http.StatusNotModified)
+				return
+			}
+
+			// 非条件 GET（disable-cache / 首屏 / 共享缓存 miss）会绕过上面的 304 快路径，
+			// 落到这里真渲染。成员列表扇出下大量并发非条件 GET 会把 CPU 打满、饿死同机
+			// 其它请求（issue#480）。渲染统一走共享缓存：相同内容 key 命中复用字节、
+			// singleflight 合并并发冷渲染、渲染信号量限并发，确保一次扇出最多渲一张。
+			//
+			// 缓存 key 用 avatarCacheKey（完整原始因子），**不是**上面的 CRC32 ETag：
+			// ETag 是 32 位弱指纹，作共享缓存身份会碰撞→跨用户串图（PR#481 评审）。
+			// 两者覆盖同一组因子（渲染版本/uid→色/文字），仅 ETag 头继续用 CRC32。
+			if nameMode {
+				nameKey := avatarCacheKey("name-v5", uid, text)
+				imageData, genErr := avatarrender.GetOrRender(nameKey, func() ([]byte, error) {
+					return avatarrender.Render(avatarrender.Options{
+						Text: text,
+						Bg:   avatarrender.ColorForSeed(uid),
+					})
+				})
+				if genErr == nil {
+					c.Data(http.StatusOK, "image/png", imageData)
+					return
+				}
+				// 渲染失败不直接 500，记录后回退 ASCII 兜底；ETag 改回 ASCII 模式与内容一致。
+				u.Error("生成昵称默认头像失败，回退兜底", zap.Error(genErr), zap.String("uid", uid))
+				c.Header("ETag", avatarETag("ascii-v1", uid))
+			}
+			asciiKey := avatarCacheKey("ascii-v1", uid)
+			imageData, genErr := avatarrender.GetOrRender(asciiKey, func() ([]byte, error) {
+				return generateDefaultAvatar(uid)
+			})
+			if genErr != nil {
+				u.Error("生成默认头像失败", zap.Error(genErr))
+				c.Writer.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			c.Data(http.StatusOK, "image/png", imageData)
+			return
+		}
+	}
+	if downloadUrl == "" {
+		downloadUrl, err = u.fileService.DownloadURL(ph, "")
+		if err != nil {
+			u.Error("获取文件下载地址失败", zap.Error(err))
+			c.Writer.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if strings.Contains(downloadUrl, "?") {
+		c.Redirect(http.StatusFound, fmt.Sprintf("%s&v=%s", downloadUrl, v))
+	} else {
+		c.Redirect(http.StatusFound, fmt.Sprintf("%s?v=%s", downloadUrl, v))
+	}
+}
+
+// uploadAvatar 上传用户头像
+func (u *User) uploadAvatar(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	targetUID := c.Param("uid")
+	if targetUID == "" {
+		targetUID = loginUID
+	}
+
+	// 若 targetUID 与 loginUID 不同，需确认 loginUID 有权限修改该头像
+	if targetUID != loginUID {
+		var creatorUID string
+		err := u.ctx.DB().Select("IFNULL(creator_uid,'')").From("robot").Where("robot_id=? and status=1", targetUID).LoadOne(&creatorUID)
+		if err != nil || creatorUID != loginUID {
+			// User Bot 校验失败，尝试 App Bot 权限校验
+			var appBot struct {
+				Scope   string `db:"scope"`
+				SpaceID string `db:"space_id"`
+			}
+			cnt, appErr := u.ctx.DB().SelectBySql(
+				"SELECT scope, IFNULL(space_id,'') as space_id FROM app_bot WHERE uid=? LIMIT 1", targetUID,
+			).Load(&appBot)
+			if appErr != nil || cnt == 0 {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权限修改该用户头像", "status": 403})
+				return
+			}
+			switch appBot.Scope {
+			case "platform":
+				if err := c.CheckLoginRoleIsSuperAdmin(); err != nil {
+					c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权限修改该用户头像", "status": 403})
+					return
+				}
+			case "space":
+				// superAdmin 可管理任何 space Bot（与 updateBot admin 路由一致）
+				if saErr := c.CheckLoginRoleIsSuperAdmin(); saErr != nil {
+					// 非 superAdmin，fallback 到 space_member 校验
+					var member struct {
+						Role int `db:"role"`
+					}
+					mCnt, mErr := u.ctx.DB().SelectBySql(
+						"SELECT role FROM space_member WHERE space_id=? AND uid=? AND status=1 LIMIT 1", appBot.SpaceID, loginUID,
+					).Load(&member)
+					if mErr != nil || mCnt == 0 || member.Role < 1 {
+						c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权限修改该用户头像", "status": 403})
+						return
+					}
+				}
+			default:
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"msg": "无权限修改该用户头像", "status": 403})
+				return
+			}
+		}
+	}
+
+	if c.Request.MultipartForm == nil {
+		err := c.Request.ParseMultipartForm(1024 * 1024 * 20) // 20M
+		if err != nil {
+			u.Error("数据格式不正确！", zap.Error(err))
+			respondUserRequestInvalid(c, "")
+			return
+		}
+	}
+	file, _, err := c.Request.FormFile("file")
+	if err != nil {
+		u.Error("读取文件失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserFileOperationFailed)
+		return
+	}
+	avatarVersion := avatarversion.New()
+	avatarPath := userAvatarFilePath(targetUID, u.ctx.GetConfig().Avatar.Partition, avatarVersion)
+	_, err = u.fileService.UploadFile(avatarPath, "image/png", "", func(w io.Writer) error {
+		_, err := io.Copy(w, file)
+		return err
+	})
+	defer file.Close()
+	if err != nil {
+		u.Error("上传文件失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserFileOperationFailed)
+		return
+	}
+	// 更改用户上传头像状态和服务端版本；CMD 在 DB 成功后再发送，避免客户端收到通知后仍读到旧 path。
+	err = u.db.UpdateAvatarUploadStatus(targetUID, avatarVersion)
+	if err != nil {
+		u.Error("修改用户头像版本错误！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	friends, err := u.friendDB.QueryFriends(targetUID)
+	if err != nil {
+		u.Error("查询用户好友失败", zap.String("uid", targetUID), zap.Error(err))
+		c.ResponseOK()
+		return
+	}
+	if len(friends) > 0 {
+		uids := make([]string, 0)
+		for _, friend := range friends {
+			uids = append(uids, friend.ToUID)
+		}
+		// 发送头像更新命令
+		err = u.ctx.SendCMD(config.MsgCMDReq{
+			CMD:         common.CMDUserAvatarUpdate,
+			Subscribers: uids,
+			Param: map[string]interface{}{
+				"uid": targetUID,
+			},
+		})
+		if err != nil {
+			u.Error("发送个人头像更新命令失败！", zap.String("uid", targetUID), zap.Error(err))
+			c.ResponseOK()
+			return
+		}
+	}
+	c.ResponseOK()
+}
+
+// 获取用户的IM连接地址
+func (u *User) userIM(c *wkhttp.Context) {
+	uid := c.Param("uid")
+	headers := map[string]string{}
+	if mt := u.ctx.GetConfig().WuKongIM.ManagerToken; mt != "" {
+		headers["token"] = mt
+	}
+	resp, err := network.Get(fmt.Sprintf("%s/route?uid=%s", u.ctx.GetConfig().WuKongIM.APIURL, uid), nil, headers)
+	if err != nil {
+		u.Error("调用IM服务失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
+		return
+	}
+	var resultMap map[string]interface{}
+	err = util.ReadJsonByByte([]byte(resp.Body), &resultMap)
+	if err != nil {
+		u.Error("解析 IM 响应失败", zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+	c.JSON(resp.StatusCode, resultMap)
+}
+
+func (u *User) qrcodeMy(c *wkhttp.Context) {
+	userModel, err := u.db.QueryByUID(c.GetLoginUID())
+	if err != nil {
+		u.Error("查询当前用户信息失败！", zap.String("uid", c.GetLoginUID()), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userModel == nil {
+		respondUserError(c, errcode.ErrUserCurrentNotFound)
+		return
+	}
+	if userModel.QRVercode == "" {
+		respondUserError(c, errcode.ErrUserQRVerCodeMissing)
+		return
+	}
+	path := strings.ReplaceAll(u.ctx.GetConfig().QRCodeInfoURL, ":code", fmt.Sprintf("vercode_%s", userModel.QRVercode))
+	c.Response(gin.H{
+		"data": fmt.Sprintf("%s/%s", u.ctx.GetConfig().External.BaseURL, path),
+	})
+}
+
+// currentUser 返回当前登录用户的权威 profile（含 self 实名字段）。
+//
+// YUJ-413：/v1/user/login 和 GET /v1/user/current 必须下发 realname_verified /
+// real_name / realname_verified_at 三字段，否则 Web/Android/iOS 三端 self 实名
+// 徽章和 displayName 无法渲染（friend/sync、conversation/sync 对他人已下发
+// 同名字段，唯独 self 路径漏加）。
+//
+// 客户端调用场景：
+//   - Android VerifyLandingActivity → UserModel.refreshCurrentUser()；
+//   - iOS   WKRealnameVerifyManager Custom Tabs 回跳；
+//   - Web   loginSuccess() 后亦可作 fallback；
+//
+// 语义 vs POST /v1/user/login：
+//   - 结构完全对齐 loginUserDetailResp，客户端可共用 parser；
+//   - token 字段回显当前请求头里的 token（不换发），保持会话稳定；
+//   - realname_verified / real_name / realname_verified_at 从 user_verification
+//     表读取；未实名用户 realname_verified=false，其它字段 omitempty 省略。
+func (u *User) currentUser(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	if loginUID == "" {
+		respondUserNotLoggedIn(c)
+		return
+	}
+	userInfo, err := u.db.QueryByUID(loginUID)
+	if err != nil {
+		u.Error("查询当前用户信息失败", zap.Error(err), zap.String("uid", loginUID))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo == nil {
+		respondUserError(c, errcode.ErrUserCurrentNotFound)
+		return
+	}
+	// token 回显请求头 token：/user/current 不换发 token,避免干扰现有会话;
+	// 客户端本身就用这个 token 调的接口,回填仅为结构对齐 login response。
+	//
+	// Language 字段直接来自 userInfo.Language（DB SELECT *）——刻意不走
+	// LanguageService.Resolve / user_language:{uid} 热缓存：这里既然已经为
+	// 其他字段拉了完整行，再读 Redis 只会引入"刚 PUT 完语言 → DEL 命中 →
+	// Resolve 反取 DB → 写回热缓存"的多余 RTT，而且会让 GET 在 SetLanguage
+	// 失效窗口里看到 Redis 的旧值（DB 已新但 SET 未到）。热缓存的存在意义
+	// 是保护 AuthMiddleware 那条每请求都走的 hot path；/current 不在此列。
+	resp := newLoginUserDetailResp(userInfo, c.GetHeader("token"), u.ctx)
+	u.applyRealnameToLoginResp(resp, userInfo.UID)
+	c.Response(resp)
+}
+
+// setLanguageReq 接收 PUT /v1/user/language 的请求体。Language 为空字符串
+// 表示清空偏好（回到 OCTO_DEFAULT_LANGUAGE 语义）；非空时由 LanguageService
+// 走 MatchSupportedLanguage 严格校验，不在支持矩阵内一律拒绝。
+type setLanguageReq struct {
+	Language string `json:"language"`
+}
+
+// languageMaxLen 上界 BCP 47 tag 在落入服务层 / 日志前的字节长度。即使最长
+// 的合法标签（如 `zh-Hant-HK-x-private-extension`）也不会超过 ~35 字符；
+// DB 列定义 VARCHAR(16)。设 64 留 ~80% 余量，并在 handler 入口短路超长
+// payload，避免任意大小的客户端输入先被 zap.String 写进日志再被拒（PR
+// #182 reviewer 标的 log amplification 面）。
+const languageMaxLen = 64
+
+// setLanguage 更新当前用户的语言偏好。DB 持久化 + Redis user_language:{uid} 主动
+// DEL 由 LanguageService 处理；其他端的 token 缓存快照不会刷新——见 PR #181 的
+// 设计说明，下次请求由 AuthMiddleware 的 LanguageResolver 自动 hydrate 出
+// 新值，无需强制重新登录。
+func (u *User) setLanguage(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	if loginUID == "" {
+		respondUserNotLoggedIn(c)
+		return
+	}
+	var req setLanguageReq
+	if err := c.BindJSON(&req); err != nil {
+		u.Error("language 请求体格式错误", zap.Error(err), zap.String("uid", loginUID))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	// Length gate runs BEFORE any zap.String("language", req.Language) so an
+	// attacker can't amplify a multi-KB payload into the log pipeline.
+	if len(req.Language) > languageMaxLen {
+		u.Error("language 请求过长", zap.String("uid", loginUID), zap.Int("len", len(req.Language)))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if err := u.languageService.SetLanguage(c.Request.Context(), loginUID, req.Language); err != nil {
+		// Always log the wrapped service error server-side; only the
+		// classified user-facing message goes back on the wire so internal
+		// package prefixes / DB driver text don't leak. Matches the local
+		// convention in userUpdateWithField and neighbouring handlers.
+		u.Error("设置用户语言偏好失败",
+			zap.Error(err), zap.String("uid", loginUID), zap.String("language", req.Language))
+		if errors.Is(err, ErrUnsupportedLanguage) {
+			respondUserError(c, errcode.ErrUserLanguageUnsupported)
+			return
+		}
+		respondUserError(c, errcode.ErrUserLanguageSetFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// 修改用户信息
+func (u *User) userUpdateWithField(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+
+	var reqMap map[string]interface{}
+	if err := c.BindJSON(&reqMap); err != nil {
+		u.Error("数据格式有误！", zap.Error(err))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	// 查询用户信息
+	users, err := u.db.QueryByUID(loginUID)
+	if err != nil {
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if users == nil {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+
+	for key, value := range reqMap {
+		//是否允许更新此field
+		if !allowUpdateUserField(key) {
+			respondUserUpdateNotAllowed(c, key)
+			return
+		}
+		if key == "short_no" {
+			if u.ctx.GetConfig().ShortNo.EditOff {
+				respondUserUpdateNotAllowed(c, "")
+				return
+			}
+			if users.ShortStatus == 1 {
+				respondUserError(c, errcode.ErrUserShortNoAlreadyChanged)
+				return
+			}
+			if len(fmt.Sprintf("%v", value)) < 6 || len(fmt.Sprintf("%v", value)) > 20 {
+				respondUserError(c, errcode.ErrUserShortNoFormatInvalid)
+				return
+			}
+			isLetter := true
+			isIncludeNum := false
+			for index, r := range fmt.Sprintf("%v", value) {
+				if !unicode.IsLetter(r) && index == 0 {
+					isLetter = false
+					break
+				}
+				if unicode.Is(unicode.Han, r) {
+					isLetter = false
+					break
+				}
+				if unicode.IsDigit(r) {
+					isIncludeNum = true
+				}
+				if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '-' {
+					isLetter = false
+					break
+				}
+			}
+			if !isLetter || !isIncludeNum {
+				respondUserError(c, errcode.ErrUserShortNoFormatInvalid)
+				return
+			}
+			users, err = u.db.QueryUserWithOnlyShortNo(fmt.Sprintf("%v", value))
+			if err != nil {
+				u.Error("通过short_no查询用户失败！", zap.Error(err), zap.String("shortNo", key))
+				respondUserError(c, errcode.ErrUserQueryFailed)
+				return
+			}
+			if users != nil {
+				respondUserError(c, errcode.ErrUserAlreadyExists)
+				return
+			}
+
+			tx, err := u.db.session.Begin()
+			if err != nil {
+				u.Error("创建事务失败！", zap.Error(err))
+				respondUserError(c, errcode.ErrUserStoreFailed)
+				return
+			}
+			defer func() {
+				if err := recover(); err != nil {
+					tx.Rollback()
+					fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
+				}
+			}()
+			err = u.db.UpdateUsersWithFieldTx(key, fmt.Sprintf("%v", value), loginUID, tx)
+			if err != nil {
+				respondUserError(c, errcode.ErrUserStoreFailed)
+				tx.Rollback()
+				return
+			}
+			err = u.db.UpdateUsersWithFieldTx("short_status", "1", loginUID, tx)
+			if err != nil {
+				u.Error("修改用户资料失败", zap.Error(err), zap.Any(key, value))
+				respondUserError(c, errcode.ErrUserStoreFailed)
+				tx.Rollback()
+				return
+			}
+			err = tx.Commit()
+			if err != nil {
+				u.Error("数据库事物提交失败", zap.Error(err))
+				respondUserError(c, errcode.ErrUserStoreFailed)
+				tx.Rollback()
+				return
+			}
+			c.ResponseOK()
+			return
+		}
+		//修改用户信息
+		if key == "name" {
+			nameStr := fmt.Sprintf("%s", value)
+			if nameStr == "" {
+				respondUserRequestInvalid(c, "name")
+				return
+			}
+			if err := ValidateName(nameStr); err != nil {
+				u.Warn("用户名格式校验失败", zap.String("uid", loginUID), zap.Error(err))
+				respondUserRequestInvalid(c, "name")
+				return
+			}
+		}
+
+		err = u.db.UpdateUsersWithField(key, fmt.Sprintf("%v", value), loginUID)
+		if err != nil {
+			u.Error("修改用户资料失败", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return
+		}
+		if key == "name" {
+			// 只更新当前 bearer 的展示快照，原子保留它的剩余 TTL。并发
+			// logout 已删除 key 时不重建；历史永久 key 被 Session Store
+			// 首次触达后收敛到配置的有限 TokenExpire。
+			loginToken := c.GetHeader("token")
+			preservedLang, resolveErr := u.languageService.Resolve(c.Request.Context(), loginUID)
+			if resolveErr != nil {
+				// Resolver 故障时保留旧快照；只有权威读取和旧 token 读取都失败
+				// 才留空，避免一次资料更新扩大依赖故障影响。
+				oldInfo, validateErr := u.tokenValidator.Validate(c.Request.Context(), loginToken)
+				if validateErr == nil {
+					preservedLang = oldInfo.Language
+				} else {
+					u.Warn("解析用户语言及旧token快照均失败", zap.String("uid", loginUID), zap.Error(resolveErr))
+					preservedLang = ""
+				}
+			}
+			snapshot := auth.TokenInfo{
+				UID:      loginUID,
+				Name:     fmt.Sprintf("%v", value),
+				Role:     c.GetLoginRole(),
+				Language: preservedLang,
+			}
+			_, err = updateUserSessionSnapshot(c.Request.Context(), u.sessionStore, loginToken, snapshot)
+			if err != nil {
+				// The DB update above is already authoritative. A cache snapshot
+				// failure must not turn that committed mutation into a misleading
+				// API failure; the bearer keeps its old non-security display fields.
+				u.Warn("更新token展示快照失败", zap.Error(err))
+			}
+		}
+	}
+	// 发送频道刚刚消息给登录好友
+	friends, err := u.friendDB.QueryFriends(loginUID)
+	if err != nil {
+		u.Error("查询用户好友错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if len(friends) > 0 {
+		uids := make([]string, 0)
+		for _, friend := range friends {
+			uids = append(uids, friend.ToUID)
+		}
+		err = u.ctx.SendCMD(config.MsgCMDReq{
+			CMD:         common.CMDChannelUpdate,
+			Subscribers: uids,
+			Param: map[string]interface{}{
+				"channel_id":   loginUID,
+				"channel_type": common.ChannelTypePerson,
+			},
+		})
+		if err != nil {
+			u.Error("发送频道更改消息错误！", zap.Error(err))
+			respondUserError(c, errcode.ErrUserIMCallFailed)
+			return
+		}
+	}
+
+	c.ResponseOK()
+}
+
+func (u *User) userUpdateSetting(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+
+	var reqMap map[string]interface{}
+	if err := c.BindJSON(&reqMap); err != nil {
+		u.Error("数据格式有误！", zap.Error(err))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	// 查询用户信息
+	users, err := u.db.QueryByUID(loginUID)
+	if err != nil {
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if users == nil {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+	for key, value := range reqMap {
+		if key == "device_lock" ||
+			key == "search_by_phone" ||
+			key == "search_by_short" ||
+			key == "new_msg_notice" ||
+			key == "msg_show_detail" ||
+			key == "offline_protection" ||
+			key == "voice_on" ||
+			key == "shock_on" ||
+			key == "mute_of_app" {
+			if key == "device_lock" && fmt.Sprintf("%v", value) == "1" {
+				if users.Phone == "15900000002" || users.Phone == "15900000003" || users.Phone == "15900000004" || users.Phone == "15900000005" || users.Phone == "15900000006" {
+					respondUserError(c, errcode.ErrUserDemoLockUnsupported)
+					return
+				}
+
+			}
+			err = u.db.UpdateUsersWithField(key, fmt.Sprintf("%v", value), loginUID)
+			if err != nil {
+				u.Error("修改用户资料失败", zap.Error(err))
+				respondUserError(c, errcode.ErrUserStoreFailed)
+				return
+			}
+		}
+	}
+	c.ResponseOK()
+}
+
+// 获取用户详情
+func (u *User) get(c *wkhttp.Context) {
+	uid := c.Param("uid")
+	groupNo := c.Query("group_no")
+	loginUID := c.MustGet("uid").(string)
+
+	if u.ctx.GetConfig().IsVisitor(uid) { // 访客频道
+		c.Request.URL.Path = fmt.Sprintf("/v1/hotline/visitors/%s/im", uid)
+		u.ctx.GetHttpRoute().HandleContext(c)
+		return
+	}
+
+	// incoming webhook 合成发送者（iwh_ 前缀）不是真实用户，走 datasource 兜底，
+	// 否则会因查不到 user 记录返回错误。区分三种情况：真实查询故障→500（不可降级），
+	// webhook 真正不存在（含已删除）→not_found，命中→合成详情。
+	if strings.HasPrefix(uid, webhookUIDPrefix) {
+		ch, err := u.resolveWebhookChannel(uid, loginUID)
+		if err != nil {
+			u.Error("查询 webhook 发送者信息失败", zap.Error(err), zap.String("uid", uid))
+			respondUserErrorWithStatus(c, errcode.ErrUserQueryFailed)
+			return
+		}
+		if ch == nil {
+			respondUserError(c, errcode.ErrUserNotFound)
+			return
+		}
+		c.Response(newWebhookUserDetailResp(uid, ch))
+		return
+	}
+
+	userDetailResp, err := u.userService.GetUserDetail(uid, loginUID)
+	if err != nil {
+		// 目标不存在与查询故障必须分开：前者是稳定的 not_found（不能报"查询失败"误导
+		// 客户端重试），后者才是 5xx 语义的查询故障。
+		if errors.Is(err, ErrorUserNotExist) {
+			respondUserError(c, errcode.ErrUserNotFound)
+			return
+		}
+		u.Error("获取用户详情失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userDetailResp == nil {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+
+	// 对象级授权：无可见关系时降级为最小资料集，不再仅凭目标 UID 返回完整身份。
+	// 判定与 /v1/channels/:id/:type 共用 channel/service，两端口径不会漂移。
+	// 与 channelGet 最小集的差异：这里**保留** follow —— 资料页要靠它渲染加好友入口，
+	// 省略会让"陌生人可加好友"这个正常入口消失（channelGet 是发送者渲染，不需要）。
+	// 身份类放行（本人 / bot / 系统 Bot）先判定，不命中才付关系查询的代价。
+	// SyntheticIdentity 恒为 false：iwh_ 前缀在上方已提前 return，走不到这里。
+	// SystemBot 走 pkg/space.SystemBots 白名单，不看 category 字段——category=system 的
+	// 非白名单账号（如 admin 超管号）必须回落到关系检查，否则整份身份被任意用户读走。
+	fastPath := chservice.PersonProfileInput{
+		LoginUID:  loginUID,
+		PeerUID:   uid,
+		SystemBot: spacepkg.IsSystemBot(uid),
+		Robot:     userDetailResp.Robot == 1,
+	}
+	visible, err := chservice.PersonProfileVisible(fastPath, nil)
+	if err == nil && !visible {
+		// 关系腿走授权口径：不能用 userDetailResp.Follow（展示字段，其同 Space 来源
+		// 不校验 Space 活性，封禁 Space 的成员行仍在）。
+		var related bool
+		if related, err = u.userService.HasAuthzRelation(loginUID, uid); err == nil {
+			in := fastPath
+			in.Followed = related
+			visible, err = chservice.PersonProfileVisible(in, chservice.CommonGroupChecker(getCommonGroupChecker()))
+		}
+	}
+	if err != nil {
+		u.Error("查询用户资料可见关系失败", zap.Error(err), zap.String("uid", uid))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if !visible {
+		c.Response(newMinimalUserDetailResp(userDetailResp))
+		return
+	}
+	// BotFather 的命令菜单是服务端自有文案，按请求协商语言重渲染（#335）；
+	// 库存值只是部署默认语言兜底。其余 bot 的 commands 是创建者内容，不覆盖。
+	if uid == cmdmenu.BotFatherUID && userDetailResp.BotCommands != "" {
+		userDetailResp.BotCommands = cmdmenu.JSON(octoi18n.OutboundLanguage(c.Request.Context()))
+	}
+	isShowShortNo := false
+	vercode := ""
+	var groupMember *model.GroupMemberResp
+	// group_no 是**调用方传入**的，其富化会下发该群维度的数据：IsShowShortNo 在群
+	// ForbiddenAddFriend==0 时返回目标的 vercode，GetGroupMember 返回目标的成员行
+	// （role / status / 邀请人 / 入群时间）以及外部成员来源 Space 字段。两个 datasource
+	// 都只校验**目标**在该群的可见性规则，完全不接收调用方 uid ——所以必须在这里先确认
+	// 调用方自己是该群成员，否则任何能看到目标的人都可以拿一个自己不在的群号，反查该群
+	// 维度的元数据。
+	//
+	// 非成员（含 checker 未注入 → fail closed）时**静默忽略** group_no，等价于没传：
+	// 比报错更保守，不会打断持有过期/无效 group_no 的客户端，同时该群维度的字段一律不
+	// 下发。
+	if groupNo != "" {
+		callerInGroup := false
+		// 用**活跃成员**口径（排该群黑名单），与子区门禁 ExistMemberActive、共同群判定
+		// 保持一致：被该群拉黑的人不应还能凭该群号反查群维度元数据。不复用
+		// getGroupMemberChecker（ExistMember，只看 is_deleted），那个钩子还服务着置顶
+		// 频道校验等既有路径。
+		if checker := getActiveGroupMemberChecker(); checker != nil {
+			ok, err := checker(groupNo, loginUID)
+			if err != nil {
+				u.Error("查询调用方群成员关系失败", zap.Error(err), zap.String("group_no", groupNo))
+			}
+			callerInGroup = ok
+		}
+		if !callerInGroup {
+			groupNo = ""
+		}
+	}
+	if groupNo != "" {
+		modules := register.GetModules(u.ctx)
+		for _, m := range modules {
+			if m.BussDataSource.IsShowShortNo != nil && vercode == "" {
+				tempShowShortNo, tempVercode, _ := m.BussDataSource.IsShowShortNo(groupNo, uid, loginUID)
+				if tempShowShortNo {
+					isShowShortNo = tempShowShortNo
+					vercode = tempVercode
+				}
+			}
+			if m.BussDataSource.GetGroupMember != nil && groupMember == nil {
+				groupMember, _ = m.BussDataSource.GetGroupMember(groupNo, uid)
+			}
+		}
+	}
+
+	if groupMember != nil && groupMember.InviteUID != "" && groupMember.IsDeleted == 0 {
+		inviteJoinGroupUserInfo, err := u.userService.GetUserDetail(groupMember.InviteUID, uid)
+		if err != nil {
+			u.Error("获取加入群聊邀请用户详情失败！", zap.Error(err))
+		}
+		if inviteJoinGroupUserInfo != nil {
+			var name = inviteJoinGroupUserInfo.Name
+			if inviteJoinGroupUserInfo.Remark != "" {
+				name = inviteJoinGroupUserInfo.Remark
+			}
+			userDetailResp.JoinGroupInviteUID = groupMember.InviteUID
+			userDetailResp.JoinGroupTime = groupMember.CreatedAt
+			userDetailResp.JoinGroupInviteName = name
+		}
+		userDetailResp.GroupMember = &GroupMemberResp{
+			UID:                groupMember.UID,
+			Name:               groupMember.Name,
+			GroupNo:            groupMember.GroupNo,
+			Remark:             groupMember.Remark,
+			Role:               groupMember.Role,
+			Status:             groupMember.Status,
+			InviteUID:          groupMember.InviteUID,
+			Robot:              groupMember.Role,
+			ForbiddenExpirTime: groupMember.ForbiddenExpirTime,
+			CreatedAt:          groupMember.CreatedAt,
+		}
+		// YUJ-206：补齐外部来源 / 归属 Space 视图字段（is_external /
+		// source_space_id / source_space_name / home_space_id / home_space_name），
+		// 供 Web/Android/iOS UserInfo 判定"同 Space 非好友 → 直接发消息" vs
+		// "跨 Space 外部成员 → 仅可在群内交流"。
+		// 命名与 /groups/{no}/members 的 memberDetailResp 保持一致。
+		// Provider 由 group 模块在 init 阶段通过 RegisterGroupMemberExternalProvider
+		// 注入；失败仅 log，不影响主响应链路（字段缺省即回落到原"is_external=0"语义，
+		// 客户端会走非 Space 模式陌生人分支，属可接受的降级）。
+		if provider := getGroupMemberExternalProvider(); provider != nil {
+			if isExt, srcID, srcName, homeID, homeName, err := provider(groupNo, uid); err != nil {
+				u.Error("查询群成员外部来源字段失败", zap.Error(err),
+					zap.String("group_no", groupNo), zap.String("uid", uid))
+			} else {
+				userDetailResp.GroupMember.IsExternal = isExt
+				userDetailResp.GroupMember.SourceSpaceID = srcID
+				userDetailResp.GroupMember.SourceSpaceName = srcName
+				userDetailResp.GroupMember.HomeSpaceID = homeID
+				userDetailResp.GroupMember.HomeSpaceName = homeName
+			}
+		}
+	}
+
+	if userDetailResp.Follow == 1 || uid == loginUID {
+		isShowShortNo = true
+	}
+	if !isShowShortNo {
+		userDetailResp.ShortNo = ""
+		userDetailResp.Vercode = ""
+	} else {
+		if groupNo != "" {
+			userDetailResp.Vercode = vercode
+		}
+	}
+	c.Response(userDetailResp)
+}
+
+//	获取用户详情
+//
+//	func (u *User) userConversationInfoGet(c *wkhttp.Context) {
+//		uid := c.Param("uid")
+//		loginUID := c.MustGet("uid").(string)
+//		model, err := u.db.QueryDetailByUID(uid, loginUID)
+//		if err != nil {
+//			u.Error("查询用户信息失败！", zap.Error(err), zap.String("uid", uid))
+//			c.ResponseError(errors.New("查询用户信息失败！"))
+//			return
+//		}
+//		if model == nil {
+//			c.ResponseError(errors.New("用户信息不存在！"))
+//			return
+//		}
+//		userDetailResp := newUserDetailResp(model)
+//		if uid == loginUID {
+//			userDetailResp.Name = u.ctx.GetConfig().FileHelperName
+//		}
+//		c.Response(userDetailResp)
+//	}
+//
+// 微信登录
+func (u *User) wxLogin(c *wkhttp.Context) {
+	type wxLoginReq struct {
+		Code   string     `json:"code"`
+		Flag   int        `json:"flag"`
+		Device *deviceReq `json:"device"`
+	}
+	var req wxLoginReq
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if req.Code == "" {
+		respondUserRequestInvalid(c, "code")
+		return
+	}
+	accessTokenResp, err := network.Get("https://api.weixin.qq.com/sns/oauth2/access_token", map[string]string{
+		"appid":      u.ctx.GetConfig().Wechat.AppID,
+		"secret":     u.ctx.GetConfig().Wechat.AppSecret,
+		"code":       req.Code,
+		"grant_type": "authorization_code",
+	}, nil)
+	if err != nil {
+		u.Error("获取微信access_token错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserWeChatExchangeFailed)
+		return
+	}
+	if accessTokenResp.StatusCode != http.StatusOK {
+		u.Error("请求验证微信access_token错误", zap.Int("status", accessTokenResp.StatusCode))
+		respondUserError(c, errcode.ErrUserWeChatExchangeFailed)
+		return
+	}
+	var bodyMap map[string]interface{}
+	if err = util.ReadJsonByByte([]byte(accessTokenResp.Body), &bodyMap); err != nil {
+		u.Error("解码微信access_token返回数据失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserDecodeFailed)
+		return
+	}
+	accessToken, ok := bodyMap["access_token"].(string)
+	if !ok {
+		respondUserError(c, errcode.ErrUserWeChatResponseInvalid)
+		return
+	}
+	openid, ok := bodyMap["openid"].(string)
+	if !ok {
+		respondUserError(c, errcode.ErrUserWeChatResponseInvalid)
+		return
+	}
+	wxUserInfoResp, err := network.Get("https://api.weixin.qq.com/sns/userinfo", map[string]string{
+		"access_token": accessToken,
+		"openid":       openid,
+	}, nil)
+	if err != nil {
+		u.Error("获取微信用户资料错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserWeChatProfileFailed)
+		return
+	}
+
+	if wxUserInfoResp.StatusCode != http.StatusOK {
+		u.Error("获取微信用户资料请求错误", zap.Int("status", wxUserInfoResp.StatusCode))
+		respondUserError(c, errcode.ErrUserWeChatProfileFailed)
+		return
+	}
+
+	var wxUserInfoBodyMap map[string]interface{}
+	if err = util.ReadJsonByByte([]byte(wxUserInfoResp.Body), &wxUserInfoBodyMap); err != nil {
+		u.Error("解码微信用户信息返回数据失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserDecodeFailed)
+		return
+	}
+
+	unionid, _ := wxUserInfoBodyMap["unionid"].(string)
+	nickname, _ := wxUserInfoBodyMap["nickname"].(string)
+	var sex int64
+	if sexNum, ok := wxUserInfoBodyMap["sex"].(json.Number); ok {
+		sex, _ = sexNum.Int64()
+	}
+	headimgurl, _ := wxUserInfoBodyMap["headimgurl"].(string)
+	// 验证该用户是否存在
+	loginSpan := u.ctx.Tracer().StartSpan(
+		"login",
+		opentracing.ChildOf(c.GetSpanContext()),
+	)
+	loginSpanCtx := u.ctx.Tracer().ContextWithSpan(context.Background(), loginSpan)
+	loginSpan.SetTag("username", nickname)
+	defer loginSpan.Finish()
+
+	userInfo, err := u.db.queryWithWXOpenIDAndWxUnionidCtx(loginSpanCtx, openid, unionid)
+	if err != nil {
+		u.Error("通过微信openid查询用户是否存在错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo != nil {
+		loginSpanCtx, err = withUserSessionIssueFence(loginSpanCtx, u.sessionStore, userInfo.UID)
+		if err != nil {
+			u.Error("初始化微信登录会话栅栏失败", zap.Error(err))
+			respondUserServiceError(c)
+			return
+		}
+		userInfo, err = u.reloadUserAfterIssueFence(loginSpanCtx, userInfo.UID)
+		if err != nil {
+			if errors.Is(err, ErrorUserNotExist) {
+				respondUserError(c, errcode.ErrUserNotFound)
+				return
+			}
+			u.Error("会话栅栏后复核微信登录用户失败", zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
+		if userInfo.IsDestroy == IsDestroyDone {
+			respondUserError(c, errcode.ErrUserNotFound)
+			return
+		}
+		u.execLoginAndRespose(userInfo, config.DeviceFlag(req.Flag), req.Device, loginSpanCtx, c, "wechat")
+	} else {
+		// 创建用户
+		uid := util.GenerUUID()
+		var model = &createUserModel{
+			UID:       uid,
+			Zone:      "",
+			Phone:     "",
+			Password:  "",
+			Sex:       int(sex),
+			Name:      nickname,
+			WXOpenid:  openid,
+			WXUnionid: unionid,
+			Flag:      req.Flag,
+			Device:    req.Device,
+			LoginType: "wechat",
+		}
+		// 下载微信用户头像并上传
+		if headimgurl != "" {
+			timeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			imgReader, _ := u.fileService.DownloadImage(headimgurl, timeoutCtx)
+			cancel()
+			if imgReader != nil {
+				avatarVersion := avatarversion.New()
+				_, err = u.fileService.UploadFile(userAvatarFilePath(uid, u.ctx.GetConfig().Avatar.Partition, avatarVersion), "image/png", "", func(w io.Writer) error {
+					_, err := io.Copy(w, imgReader)
+					return err
+				})
+				defer imgReader.Close()
+				if err == nil {
+					// u.Error("上传文件失败！", zap.Error(err))
+					// c.ResponseError(errors.New("上传文件失败！"))
+					// return
+					model.IsUploadAvatar = 1
+					model.AvatarVersion = avatarVersion
+				}
+			}
+		}
+		u.createUser(loginSpanCtx, model, c, nil)
+	}
+}
+
+// 登录
+func (u *User) login(c *wkhttp.Context) {
+	if common2.EnsureSystemSettings(u.ctx).LocalLoginOff() {
+		respondUserError(c, errcode.ErrUserLocalLoginDisabled)
+		return
+	}
+
+	var req loginReq
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if err := req.Check(); err != nil {
+		// loginReq.Check returns one of "用户名不能为空 / 密码不能为空"; both are
+		// pure client-side input gaps. Field detail is left blank because the
+		// helper string-matches the message rather than tagging the offending
+		// field — fix-up follows the broader sentinel extraction (TODOS L219).
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if err := u.loginGuard.Check(req.Username); err != nil {
+		u.Warn("登录被临时锁定", zap.String("username", req.Username), zap.Error(err))
+		respondUserError(c, errcode.ErrUserLoginLocked)
+		return
+	}
+	publicIP := wkhttp.ClientIP(c.Request)
+	loginSpan := u.ctx.Tracer().StartSpan(
+		"login",
+		opentracing.ChildOf(c.GetSpanContext()),
+	)
+	loginSpanCtx := u.ctx.Tracer().ContextWithSpan(context.Background(), loginSpan)
+	loginSpan.SetTag("username", req.Username)
+	defer loginSpan.Finish()
+
+	userInfo, err := u.db.QueryByUsernameCxt(loginSpanCtx, req.Username)
+	if err != nil {
+		u.Error("查询用户信息失败！", zap.String("username", req.Username), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo != nil {
+		fencedUID := userInfo.UID
+		loginSpanCtx, err = withUserSessionIssueFence(loginSpanCtx, u.sessionStore, userInfo.UID)
+		if err != nil {
+			u.Error("初始化登录会话栅栏失败", zap.Error(err))
+			respondUserServiceError(c)
+			return
+		}
+		// BeginIssue must precede the authoritative credential read. If a
+		// password reset commits after the first lookup but before the fence,
+		// validating that stale in-memory hash would issue a session under the
+		// post-reset generation. Re-read the same login identity and require it
+		// to still resolve to the fenced UID; a later reset is stopped by the
+		// final fence CAS in IssueNewSession.
+		userInfo, err = u.db.QueryByUsernameCxt(loginSpanCtx, req.Username)
+		if err != nil {
+			u.Error("会话栅栏后复核用户信息失败", zap.String("username", req.Username), zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
+		if userInfo == nil || userInfo.UID != fencedUID {
+			u.loginGuard.RecordFailureLogged(req.Username)
+			u.loginLog.recordFailure(req.Username, publicIP, "username")
+			respondUserError(c, errcode.ErrUserInvalidCredentials)
+			return
+		}
+	}
+	// 已注销 / 被禁用账号统一拒绝；与 emailLogin / usernameLogin 行为对齐
+	if userInfo == nil || userInfo.IsDestroy == IsDestroyDone || userInfo.Status == 0 {
+		u.loginGuard.RecordFailureLogged(req.Username)
+		u.loginLog.recordFailure(req.Username, publicIP, "username")
+		// 统一错误消息，避免攻击者通过响应差异枚举有效账号
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
+		return
+	}
+	if userInfo.Password == "" {
+		// 同样走失败计数 + 通用错误消息，避免攻击者区分"账号不允许登录"与"密码错误"
+		u.loginGuard.RecordFailureLogged(req.Username)
+		u.loginLog.recordFailure(req.Username, publicIP, "username")
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
+		return
+	}
+	matched, needsMigration := CheckPassword(req.Password, userInfo.Password)
+	if !matched {
+		u.loginGuard.RecordFailureLogged(req.Username)
+		u.loginLog.recordFailure(req.Username, publicIP, "username")
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
+		return
+	}
+	u.loginGuard.ResetLogged(req.Username)
+	// 自动迁移 MD5 密码到 bcrypt
+	if needsMigration {
+		if newHash, err := HashPassword(req.Password); err == nil {
+			_ = u.db.updatePassword(newHash, userInfo.UID)
+		}
+	}
+	u.execLoginAndRespose(userInfo, config.DeviceFlag(req.Flag), req.Device, loginSpanCtx, c, "username")
+}
+
+// 验证登录用户信息
+func (u *User) execLoginAndRespose(userInfo *Model, flag config.DeviceFlag, device *deviceReq, loginSpanCtx context.Context, c *wkhttp.Context, loginType string) {
+
+	result, err := u.execLogin(userInfo, flag, device, loginSpanCtx)
+	if err != nil {
+		u.respondExecLoginError(c, err, userInfo)
+		return
+	}
+
+	c.Response(result)
+
+	publicIP := wkhttp.ClientIP(c.Request)
+	u.finishSuccessfulLogin(userInfo.UID, userInfo.Username, publicIP, loginType)
+}
+
+// respondExecLoginError is the single classifier for execLogin's returned error,
+// shared by every login entry point (main / OAuth / email / username) so the
+// same condition always yields the same status:
+//   - ErrUserNeedVerification → the bespoke 110 "需要验证手机号码" response;
+//   - ErrUserDisabled         → 403 (account banned);
+//   - ErrUserDeviceInfoRequired → 400 (missing device info);
+//   - anything else           → logged + generic 500 (genuine internal failure).
+//
+// Before this existed, the OAuth/email/username paths collapsed all of these
+// onto a single 500, so a disabled account or a missing-device request looked
+// like a server outage. Keeping the mapping here avoids that divergence.
+func (u *User) respondExecLoginError(c *wkhttp.Context, err error, userInfo *Model) {
+	switch {
+	case errors.Is(err, ErrUserNeedVerification):
+		phone := ""
+		if len(userInfo.Phone) > 5 {
+			phone = fmt.Sprintf("%s******%s", userInfo.Phone[0:3], userInfo.Phone[len(userInfo.Phone)-2:])
+		}
+		c.ResponseWithStatus(http.StatusBadRequest, map[string]interface{}{
+			"status": 110,
+			"msg":    "需要验证手机号码！",
+			"uid":    userInfo.UID,
+			"phone":  phone,
+		})
+	case errors.Is(err, ErrUserDisabled):
+		respondUserError(c, errcode.ErrUserAccountBanned)
+	case errors.Is(err, ErrUserDeviceInfoRequired):
+		respondUserRequestInvalid(c, "device")
+	default:
+		u.Error("登录执行失败", zap.String("uid", userInfo.UID), zap.Error(err))
+		respondUserServiceError(c)
+	}
+}
+
+func (u *User) execLogin(userInfo *Model, flag config.DeviceFlag, device *deviceReq, loginSpanCtx context.Context) (*loginUserDetailResp, error) {
+	issueFence, ok := userSessionIssueFenceFromContext(loginSpanCtx, userInfo.UID)
+	if !ok {
+		var err error
+		issueFence, err = beginUserSessionIssue(loginSpanCtx, u.sessionStore, userInfo.UID)
+		if err != nil {
+			return nil, fmt.Errorf("begin token issuance: %w", err)
+		}
+	}
+	if userInfo.Status == int(common.UserDisable) {
+		return nil, ErrUserDisabled
+	}
+	deviceLevel := config.DeviceLevelSlave
+	if flag == config.APP {
+		deviceLevel = config.DeviceLevelMaster
+	}
+	//app登录验证设备锁
+	if flag == 0 && userInfo.DeviceLock == 1 {
+		if device == nil {
+			return nil, ErrUserDeviceInfoRequired
+		}
+		var existDevice bool
+		var err error
+		existDevice, err = u.deviceDB.existDeviceWithDeviceIDAndUIDCtx(loginSpanCtx, device.DeviceID, userInfo.UID)
+		if err != nil {
+			u.Error("查询是否存在的设备失败", zap.Error(err))
+			return nil, errors.New("查询是否存在的设备失败")
+		}
+		if existDevice {
+			err = u.deviceDB.updateDeviceLastLoginCtx(loginSpanCtx, time.Now().Unix(), device.DeviceID, userInfo.UID)
+			if err != nil {
+				u.Error("更新用户登录设备失败", zap.Error(err))
+				return nil, errors.New("更新用户登录设备失败")
+			}
+		}
+		if !existDevice {
+			err := u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", u.ctx.GetConfig().Cache.LoginDeviceCachePrefix, userInfo.UID), util.ToJson(device), u.ctx.GetConfig().Cache.LoginDeviceCacheExpire)
+			if err != nil {
+				u.Error("缓存登录设备失败！", zap.Error(err))
+				return nil, errors.New("缓存登录设备失败！")
+			}
+			return nil, ErrUserNeedVerification
+		}
+	}
+	//更新最后一次登录设备信息
+	// flag == config.APP &&
+	if device != nil {
+		err := u.deviceDB.insertOrUpdateDeviceCtx(loginSpanCtx, &deviceModel{
+			UID:         userInfo.UID,
+			DeviceID:    device.DeviceID,
+			DeviceName:  device.DeviceName,
+			DeviceModel: device.DeviceModel,
+			LastLogin:   time.Now().Unix(),
+		})
+		if err != nil {
+			u.Error("更新用户登录设备失败", zap.Error(err))
+			return nil, errors.New("更新用户登录设备失败")
+		}
+
+	}
+	token := util.GenerUUID()
+	// 将token设置到缓存
+	tokenSpan, _ := u.ctx.Tracer().StartSpanFromContext(loginSpanCtx, "SetAndExpire")
+	tokenSpan.SetTag("key", "token")
+	// 获取老的token并清除老token数据
+	oldToken, err := u.sessionStore.DeviceToken(loginSpanCtx, userInfo.UID, int(flag))
+	if err != nil {
+		u.Error("获取旧token错误", zap.Error(err))
+		tokenSpan.Finish()
+		return nil, errors.New("获取旧token错误")
+	}
+	reuseExistingToken := false
+	if flag == config.APP {
+		// Checked before the revoke, same as replaceAPPToken. This is the
+		// primary login path and it has the same shape: revoking is not
+		// lease-gated (correctly — it is always safe) while issuing is, so
+		// discovering the fence only inside the issue turns a refused login
+		// into a logout.
+		if err := canIssueUserSession(u.sessionStore); err != nil {
+			u.Error("当前副本不可签发会话", zap.Error(err))
+			tokenSpan.Finish()
+			return nil, err
+		}
+		if oldToken != "" {
+			err = revokeCurrentUserSession(loginSpanCtx, u.sessionStore, oldToken, userInfo.UID, int(flag))
+			if err != nil {
+				u.Error("清除旧token数据错误", zap.Error(err))
+				tokenSpan.Finish()
+				return nil, errors.New("清除旧token数据错误")
+			}
+		}
+	} else { // PC暂时不执行删除操作，因为PC可以同时登陆
+		if strings.TrimSpace(oldToken) != "" { // 如果是web或pc类设备 因为支持多登所以这里依然使用老token
+			token = oldToken
+			reuseExistingToken = true
+		}
+	}
+
+	deviceID := ""
+	if device != nil {
+		deviceID = device.DeviceID
+	}
+	sessionInfo := auth.TokenInfo{
+		UID:        userInfo.UID,
+		Name:       userInfo.Name,
+		Role:       userInfo.Role,
+		Language:   userInfo.Language,
+		DeviceFlag: int(flag),
+		DeviceID:   deviceID,
+	}
+	if reuseExistingToken {
+		var refreshed bool
+		refreshed, err = reuseUserSession(loginSpanCtx, u.sessionStore, token, sessionInfo, issueFence)
+		if err != nil {
+			u.Error("刷新旧token缓存失败！", zap.Error(err))
+			tokenSpan.Finish()
+			return nil, errors.New("设置token缓存失败！")
+		}
+		if !refreshed {
+			token = util.GenerUUID()
+			reuseExistingToken = false
+		}
+	}
+	issuedNew := false
+	if !reuseExistingToken {
+		err = issueUserSession(loginSpanCtx, u.sessionStore, token, sessionInfo, issueFence)
+		if err != nil {
+			u.Error("设置token缓存失败！", zap.Error(err))
+			tokenSpan.Finish()
+			return nil, errors.New("设置token缓存失败！")
+		}
+		issuedNew = true
+	}
+	tokenSpan.Finish()
+
+	updateTokenSpan, _ := u.ctx.Tracer().StartSpanFromContext(loginSpanCtx, "UpdateIMToken")
+
+	imTokenReq := config.UpdateIMTokenReq{
+		UID:         userInfo.UID,
+		Token:       token,
+		DeviceFlag:  config.DeviceFlag(flag),
+		DeviceLevel: deviceLevel,
+	}
+	imResp, err := u.ctx.UpdateIMToken(imTokenReq)
+	if err != nil {
+		u.Error("更新IM的token失败！", zap.Error(err))
+		if issuedNew {
+			if revokeErr := u.compensateIssuedToken(token, userInfo.UID, int(flag)); revokeErr != nil {
+				u.Error("补偿撤销新签发token失败！", zap.Error(revokeErr))
+			}
+		}
+		updateTokenSpan.SetTag("err", err)
+		updateTokenSpan.Finish()
+		return nil, errors.New("更新IM的token失败！")
+	}
+	updateTokenSpan.Finish()
+
+	if imResp.Status == config.UpdateTokenStatusBan {
+		if issuedNew {
+			if revokeErr := u.compensateIssuedToken(token, userInfo.UID, int(flag)); revokeErr != nil {
+				u.Error("封禁响应后补偿撤销新签发token失败！", zap.Error(revokeErr))
+			}
+		}
+		return nil, errors.New("此账号已经被封禁！")
+	}
+
+	resp := newLoginUserDetailResp(userInfo, token, u.ctx)
+	u.applyRealnameToLoginResp(resp, userInfo.UID)
+	return resp, nil
+}
+
+func (u *User) reuseExistingLoginToken(ctx context.Context, token, payload, uid string, deviceFlag int) (bool, error) {
+	if u.sessionStore == nil {
+		return false, nil
+	}
+	return u.sessionStore.ReuseExisting(ctx, token, payload, uid, deviceFlag)
+}
+
+func beginUserSessionIssue(ctx context.Context, store userSessionStore, uid string) (auth.IssueFence, error) {
+	v3Store, ok := store.(v3UserSessionStore)
+	if !ok || !v3Store.Mode().WritesV3() {
+		return auth.IssueFence{}, nil
+	}
+	return v3Store.BeginIssue(ctx, uid)
+}
+
+func withUserSessionIssueFence(ctx context.Context, store userSessionStore, uid string) (context.Context, error) {
+	fence, err := beginUserSessionIssue(ctx, store, uid)
+	if err != nil {
+		return ctx, err
+	}
+	return context.WithValue(ctx, userSessionIssueContextKey{}, userSessionIssueContext{uid: uid, fence: fence}), nil
+}
+
+func userSessionIssueFenceFromContext(ctx context.Context, uid string) (auth.IssueFence, bool) {
+	value, ok := ctx.Value(userSessionIssueContextKey{}).(userSessionIssueContext)
+	if !ok || value.uid != uid {
+		return auth.IssueFence{}, false
+	}
+	return value.fence, true
+}
+
+func (u *User) reloadUserAfterIssueFence(ctx context.Context, uid string) (*Model, error) {
+	user, err := u.db.QueryByUID(uid)
+	if err != nil {
+		return nil, fmt.Errorf("reload fenced user: %w", err)
+	}
+	if user == nil || user.UID != uid {
+		return nil, ErrorUserNotExist
+	}
+	return user, nil
+}
+
+// canIssueUserSession lets a caller fail before a destructive step rather than
+// after it. Stores that do not expose the check (test doubles) are permissive,
+// because the real gate still runs inside the issue call.
+func canIssueUserSession(store userSessionStore) error {
+	if gated, ok := store.(interface{ CanIssue() error }); ok {
+		return gated.CanIssue()
+	}
+	return nil
+}
+
+func issueUserSession(ctx context.Context, store userSessionStore, token string, info auth.TokenInfo, fence auth.IssueFence) error {
+	if v3Store, ok := store.(v3UserSessionStore); ok && v3Store.Mode().WritesV3() {
+		return v3Store.IssueNewSession(ctx, token, info, fence)
+	}
+	payload, err := auth.Encode(info)
+	if err != nil {
+		return err
+	}
+	return store.IssueNew(ctx, token, payload, info.UID, info.DeviceFlag)
+}
+
+func reuseUserSession(ctx context.Context, store userSessionStore, token string, info auth.TokenInfo, fence auth.IssueFence) (bool, error) {
+	if v3Store, ok := store.(v3UserSessionStore); ok && v3Store.Mode().WritesV3() {
+		return v3Store.ReuseSession(ctx, token, info, fence)
+	}
+	payload, err := auth.Encode(info)
+	if err != nil {
+		return false, err
+	}
+	return store.ReuseExisting(ctx, token, payload, info.UID, info.DeviceFlag)
+}
+
+func revokeCurrentUserSession(ctx context.Context, store userSessionStore, token, uid string, deviceFlag int) error {
+	if v3Store, ok := store.(v3UserSessionStore); ok && v3Store.Mode().WritesV3() {
+		return v3Store.RevokeCurrent(ctx, token, uid, deviceFlag)
+	}
+	if invalidator, ok := store.(currentUserTokenInvalidator); ok {
+		return invalidator.InvalidateCurrentToken(ctx, uid, token)
+	}
+	if err := store.DeleteToken(ctx, token); err != nil {
+		return err
+	}
+	return nil
+}
+
+func updateUserSessionSnapshot(ctx context.Context, store userSessionStore, token string, info auth.TokenInfo) (bool, error) {
+	if v3Store, ok := store.(v3UserSessionStore); ok {
+		return v3Store.UpdateSessionSnapshot(ctx, token, info)
+	}
+	payload, err := auth.Encode(info)
+	if err != nil {
+		return false, err
+	}
+	return store.UpdatePayloadKeepDeadline(ctx, token, payload)
+}
+
+func invalidateCurrentUserToken(ctx context.Context, store userSessionStore, uid, token string) error {
+	securityCtx, cancel := postCommitSecurityContext(ctx)
+	defer cancel()
+	if invalidator, ok := store.(currentUserTokenInvalidator); ok {
+		return invalidator.InvalidateCurrentToken(securityCtx, uid, token)
+	}
+	return store.DeleteToken(securityCtx, token)
+}
+
+func (u *User) compensateIssuedToken(token, uid string, deviceFlag int) error {
+	// 请求取消不能跳过 credential 补偿；Redis client 自身另有严格超时，
+	// 这里再给整个清理动作一个总 deadline，避免失败路径无限占用 goroutine。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	return u.sessionStore.RevokeIssued(ctx, token, uid, deviceFlag)
+}
+
+// replaceAPPToken keeps device-verification login aligned with the existing
+// APP single-session policy: revoke the currently indexed HTTP bearer before
+// publishing a new credential. Every step uses the shared Redis-backed Session
+// Store rather than a process-local lock; a Redis failure stops issuance. Full
+// concurrent-issuance serialization remains part of the v3 generation/CAS
+// release described by the task brief.
+func (u *User) replaceAPPToken(ctx context.Context, token, payload, uid string) error {
+	// Checked before the delete below, not just inside IssueNew. Revoking first
+	// and discovering afterwards that this replica may not issue turns a
+	// refused login into a logout.
+	if err := canIssueUserSession(u.sessionStore); err != nil {
+		return err
+	}
+	oldToken, err := u.sessionStore.DeviceToken(ctx, uid, int(config.APP))
+	if err != nil {
+		return fmt.Errorf("load previous APP token: %w", err)
+	}
+	if strings.TrimSpace(oldToken) != "" {
+		if err := u.sessionStore.DeleteToken(ctx, oldToken); err != nil {
+			return fmt.Errorf("revoke previous APP token: %w", err)
+		}
+	}
+	if err := u.sessionStore.IssueNew(ctx, token, payload, uid, int(config.APP)); err != nil {
+		return fmt.Errorf("issue APP token: %w", err)
+	}
+	return nil
+}
+
+func (u *User) replaceAPPTokenSession(ctx context.Context, token string, info auth.TokenInfo, fence auth.IssueFence) error {
+	if err := canIssueUserSession(u.sessionStore); err != nil {
+		return err
+	}
+	oldToken, err := u.sessionStore.DeviceToken(ctx, info.UID, int(config.APP))
+	if err != nil {
+		return fmt.Errorf("load previous APP token: %w", err)
+	}
+	if strings.TrimSpace(oldToken) != "" {
+		if err := revokeCurrentUserSession(ctx, u.sessionStore, oldToken, info.UID, int(config.APP)); err != nil {
+			return fmt.Errorf("revoke previous APP token: %w", err)
+		}
+	}
+	if err := issueUserSession(ctx, u.sessionStore, token, info, fence); err != nil {
+		return fmt.Errorf("issue APP token: %w", err)
+	}
+	return nil
+}
+
+// finishSuccessfulLogin 统一处理登录成功后的收尾动作，顺序是有语义的：
+//
+//  1. 先读"上次登录信息"——必须在写入本次登录日志**之前**。否则 sentWelcomeMsg
+//     里的 getLastLoginIP 会读到刚写进去的本次登录，把本次当成上次展示给用户。
+//     （历史上 loginLog.add 写在 sentWelcomeMsg 末尾，顺序天然正确；把日志写入
+//     从欢迎语里解耦出来时就必须显式保住这个顺序。）
+//  2. 异步发欢迎语（含 500ms 等持久化的 sleep，不能占住请求）。
+//  3. 落本次登录日志。
+//
+// 所有登录入口都应调用本函数，而不是各自拼这三步 —— 顺序错了不会报错，只会静默
+// 把欢迎语内容弄错。
+func (u *User) finishSuccessfulLogin(uid, account, publicIP, loginType string) {
+	prevLogin := u.loginLog.getLastLoginIP(uid)
+	go u.sentWelcomeMsg(publicIP, uid, prevLogin)
+	u.loginLog.recordSuccess(uid, account, publicIP, loginType)
+}
+
+// sendWelcomeMsg 发送欢迎语
+//
+// prevLogin 由调用方在写入本次登录日志之前取好（见 finishSuccessfulLogin）；
+// 本函数不再自己查询，避免读到刚写入的本次登录。
+func (u *User) sentWelcomeMsg(publicIP, uid string, prevLogin *loginLogResp) {
+	appconfig, err := u.commonService.GetAppConfig()
+	if err != nil || appconfig == nil {
+		// 必须 return：本函数只以 `go u.sentWelcomeMsg(...)` 调用，裸 goroutine 里的
+		// panic 逃不出 gin 的 recovery，会带走整个进程而不是单个请求。GetAppConfig
+		// 查询失败时返回 (nil, err)，只打日志不返回就会在下一行解引用空指针 ——
+		// 数据库抖动期间每次成功登录都触发一次，正好在数据库已经不健康时把服务打成
+		// 崩溃循环。配置读不出来就跳过欢迎语是正确的降级：审计行由调用方 goroutine 上
+		// 的 recordSuccess 写，不依赖这里。
+		u.Error("获取应用配置错误", zap.Error(err))
+		return
+	}
+	// 管理员可以在后台把欢迎语关掉（common 的 app_config.send_welcome_message_on，
+	// 列默认 1）。这个开关必须独立于上面的空配置守卫：两者都 return，但语义不同，
+	// 合并会让"修空指针"顺手删掉一个运维开关 —— 本 PR 上一版正是这么回归的。
+	// 注意 app_config 无行时 GetAppConfig 返回零值 &AppConfigResp{}，也落在这里，
+	// 与旧行为一致（旧代码在零值上同样 return）。
+	if appconfig.SendWelcomeMessageOn == 0 {
+		return
+	}
+	// 等待用户数据持久化完成（该函数在 goroutine 中调用）
+	time.Sleep(500 * time.Millisecond)
+	//发送登录欢迎消息
+	lastLoginLog := prevLogin
+	content := u.ctx.GetConfig().WelcomeMessage
+	var sentContent string
+
+	if appconfig.WelcomeMessage != "" {
+		content = appconfig.WelcomeMessage
+	}
+	if lastLoginLog != nil {
+		ipStr := fmt.Sprintf("上次的登录信息：%s %s\n本次登录的信息：%s %s", lastLoginLog.LoginIP, lastLoginLog.CreateAt, publicIP, util.ToyyyyMMddHHmmss(time.Now()))
+		sentContent = fmt.Sprintf("%s\n%s", content, ipStr)
+	} else {
+		ipStr := fmt.Sprintf("本次登录的信息：%s %s", publicIP, util.ToyyyyMMddHHmmss(time.Now()))
+		sentContent = fmt.Sprintf("%s\n%s", content, ipStr)
+	}
+	// YUJ-674 / Mininglamp-OSS#37: PERSONAL DM 走 NewPersonalMsgSendReq builder。
+	// SystemUID 是平台级账户，没有 Space 上下文 → senderSpaceID = ""，builder
+	// 会 fail-closed strip，与"系统欢迎消息不归属任何 Space"语义一致。
+	err = u.ctx.SendMessage(config.NewPersonalMsgSendReq(
+		uid,
+		u.ctx.GetConfig().Account.SystemUID,
+		map[string]interface{}{
+			"content": sentContent,
+			"type":    common.Text,
+		},
+		"", // SystemUID is Space-agnostic; builder strips any client-supplied space_id.
+		config.PersonalMsgOptions{Header: config.MsgHeader{RedDot: 1}},
+	))
+	if err != nil {
+		u.Error("发送登录消息欢迎消息失败", zap.Error(err))
+	}
+}
+
+// 注册
+func (u *User) register(c *wkhttp.Context) {
+	var req registerReq
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if err := req.CheckRegister(); err != nil {
+		// CheckRegister returns "用户名不能为空 / 区号不能为空 / 手机号不能为空 /
+		// 验证码不能为空 / 密码不能为空 / 名字格式错误". All client-side input
+		// gaps with no field tagging (TODOS L219 sentinel follow-up). Password
+		// strength has its own dedicated codes, checked after the policy gates.
+		respondUserRequestInvalid(c, "")
+		return
+	}
+
+	if common2.EnsureSystemSettings(u.ctx).RegisterOff() {
+		respondUserError(c, errcode.ErrUserRegistrationClosed)
+		return
+	}
+	// 仅中国号码闸门必须在 register 这里再判一次：sendRegisterCode 处的
+	// 校验只能拦"取码"动作，但管理员把 only_china 切到 1 之前已发出去的
+	// 验证码、或任何能让 smsService.Verify 通过的外部路径，都还能拿着
+	// 非 0086 区号走到这里完成注册。把判断前移到 createUser 之前，
+	// 闭合 time-of-check vs time-of-use 缺口。
+	if common2.EnsureSystemSettings(u.ctx).RegisterOnlyChina() &&
+		strings.TrimSpace(req.Zone) != "0086" {
+		respondUserError(c, errcode.ErrUserPhoneRegionUnsupported)
+		return
+	}
+	// 密码强度校验放在两个策略闸门之后：注册通道关闭 / 号码归属地不允许 是比
+	// "密码不够强" 更根本的拒绝理由，先返回它们能让错误语义更稳定，也避免
+	// 弱密码把 only_china 这类安全闸门的响应挡掉（TestPhoneRegisterBlockedByOnlyChina
+	// 断言的就是该闸门必须生效）。
+	if err := ValidatePasswordStrength(req.Password); err != nil {
+		respondPasswordStrengthError(c, err)
+		return
+	}
+	appConfig, err := u.commonService.GetAppConfig()
+	if err != nil {
+		u.Error("查询应用设置错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	var registerInviteOn = 0
+	if appConfig != nil {
+		registerInviteOn = appConfig.RegisterInviteOn
+	}
+	var invite *model.Invite
+	if registerInviteOn == 1 {
+		if req.InviteCode == "" {
+			respondUserRequestInvalid(c, "invite_code")
+			return
+		}
+		var inviteCodeIsExist = false
+		modules := register.GetModules(u.ctx)
+		for _, m := range modules {
+			if m.BussDataSource.GetInviteCode != nil {
+				invite, _ = m.BussDataSource.GetInviteCode(req.InviteCode)
+				if invite != nil && invite.Uid != "" {
+					inviteCodeIsExist = true
+					break
+				}
+			}
+		}
+		if !inviteCodeIsExist {
+			respondUserError(c, errcode.ErrUserInviteCodeNotFound)
+			return
+		}
+	}
+	registerSpan := u.ctx.Tracer().StartSpan(
+		"user.register",
+		opentracing.ChildOf(c.GetSpanContext()),
+	)
+	defer registerSpan.Finish()
+	registerSpanCtx := u.ctx.Tracer().ContextWithSpan(context.Background(), registerSpan)
+
+	registerSpan.SetTag("username", fmt.Sprintf("%s%s", req.Zone, req.Phone))
+	//验证手机号是否注册
+	userInfo, err := u.db.QueryByUsernameCxt(registerSpanCtx, fmt.Sprintf("%s%s", req.Zone, req.Phone))
+	if err != nil {
+		u.Error("查询用户信息失败！", zap.String("username", req.Phone), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo != nil {
+		respondUserError(c, errcode.ErrUserAlreadyExists)
+		return
+	}
+	//测试模式（仅非 release 生效）
+	if commonapi.IsTestCodeEnabled(u.ctx.GetConfig()) {
+		if !commonapi.MatchTestCode(u.ctx.GetConfig(), req.Code) {
+			respondUserError(c, errcode.ErrUserCodeInvalid)
+			return
+		}
+	} else {
+		//线上验证短信验证码
+		err = u.smsServie.Verify(registerSpanCtx, req.Zone, req.Phone, req.Code, commonapi.CodeTypeRegister)
+		if err != nil {
+			u.Warn("注册短信校验失败", zap.String("phone", req.Phone), zap.Error(err))
+			respondUserError(c, errcode.ErrUserCodeInvalid)
+			return
+		}
+	}
+	uid := util.GenerUUID()
+	var model = &createUserModel{
+		UID:      uid,
+		Sex:      1,
+		Name:     req.Name,
+		Zone:     req.Zone,
+		Phone:    req.Phone,
+		Password: req.Password,
+		Flag:     int(req.Flag),
+		Device:   req.Device,
+	}
+	u.createUser(registerSpanCtx, model, c, invite)
+}
+
+// 搜索用户
+func (u *User) search(c *wkhttp.Context) {
+	keyword := c.Query("keyword")
+	spaceID := c.Query("space_id")
+	useModel, err := u.db.QueryByKeyword(keyword)
+	if err != nil {
+		u.Error("查询用户信息失败！", zap.Error(err), zap.String("keyword", keyword))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if useModel == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"exist": 0,
+		})
+		return
+	}
+	// Space 模式：搜索结果只返回 Space 成员
+	if spaceID != "" {
+		isMember, err := spacepkg.CheckMembership(u.ctx.DB(), spaceID, useModel.UID)
+		if err != nil {
+			u.Error("校验 Space 成员错误", zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
+		if !isMember {
+			c.JSON(http.StatusOK, gin.H{
+				"exist": 0,
+			})
+			return
+		}
+	} else {
+		// 未指定 Space：仅允许查询自己或与登录用户至少共享一个 Space 的用户，
+		// 防止通过 short_no/phone/email 跨 Space 探测用户存在性。
+		loginUID := c.GetLoginUID()
+		if loginUID != "" && loginUID != useModel.UID {
+			shared, err := spacepkg.HaveCommonSpace(u.ctx.DB(), loginUID, useModel.UID)
+			if err != nil {
+				u.Error("校验共同 Space 错误", zap.Error(err))
+				respondUserError(c, errcode.ErrUserQueryFailed)
+				return
+			}
+			if !shared {
+				c.JSON(http.StatusOK, gin.H{
+					"exist": 0,
+				})
+				return
+			}
+		}
+	}
+	appconfig, _ := u.commonService.GetAppConfig()
+
+	if keyword == useModel.Phone {
+		//关闭了手机号搜索
+		if useModel.SearchByPhone == 0 || (appconfig != nil && appconfig.SearchByPhone == 0) || u.ctx.GetConfig().PhoneSearchOff {
+			c.JSON(http.StatusOK, gin.H{
+				"exist": 0,
+			})
+			return
+		}
+	}
+
+	if useModel.SearchByShort == 0 {
+		//关闭了短编号搜索
+		if strings.EqualFold(keyword, useModel.ShortNo) {
+			c.JSON(http.StatusOK, gin.H{
+				"exist": 0,
+			})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"exist": 1,
+		"data":  newUserResp(useModel),
+	})
+}
+
+// 注册用户设备token
+func (u *User) registerUserDeviceToken(c *wkhttp.Context) {
+	loginUID := c.MustGet("uid").(string)
+	var req struct {
+		DeviceToken string `json:"device_token"` // 设备token
+		DeviceType  string `json:"device_type"`  // 设备类型 IOS，MI，HMS
+		BundleID    string `json:"bundle_id"`    // app的唯一ID标示
+	}
+	if err := c.BindJSON(&req); err != nil {
+		u.Error("数据格式有误！", zap.Error(err))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if strings.TrimSpace(req.DeviceToken) == "" {
+		respondUserRequestInvalid(c, "device_token")
+		return
+	}
+	if strings.TrimSpace(req.DeviceType) == "" {
+		respondUserRequestInvalid(c, "device_type")
+		return
+	}
+	if strings.TrimSpace(req.BundleID) == "" {
+		respondUserRequestInvalid(c, "bundle_id")
+		return
+	}
+	err := u.ctx.GetRedisConn().Hmset(fmt.Sprintf("%s%s", u.userDeviceTokenPrefix, loginUID), "device_type", req.DeviceType, "device_token", req.DeviceToken, "bundle_id", req.BundleID)
+	if err != nil {
+		u.Error("存储用户设备token失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// 注册用户设备红点数量
+func (u *User) registerUserDeviceBadge(c *wkhttp.Context) {
+	loginUID := c.MustGet("uid").(string)
+	var req struct {
+		Badge int `json:"badge"` // 设备红点数量
+	}
+	if err := c.BindJSON(&req); err != nil {
+		u.Error("数据格式有误！", zap.Error(err))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	err := u.setUserBadge(loginUID, int64(req.Badge))
+	if err != nil {
+		u.Error("存储用户红点失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+func (u *User) setUserBadge(uid string, badge int64) error {
+	err := u.ctx.GetRedisConn().Hset(common.UserDeviceBadgePrefix, uid, fmt.Sprintf("%d", badge))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// 卸载注册设备token
+func (u *User) unregisterUserDeviceToken(c *wkhttp.Context) {
+	loginUID := c.MustGet("uid").(string)
+
+	err := u.ctx.GetRedisConn().Del(fmt.Sprintf("%s%s", u.userDeviceTokenPrefix, loginUID))
+	if err != nil {
+		u.Error("删除设备token失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// 获取登录的uuid（web登录）
+func (u *User) getLoginUUID(c *wkhttp.Context) {
+	if !common2.EnsureSystemSettings(u.ctx).ScanLoginEnabled() {
+		respondUserError(c, errcode.ErrUserScanLoginDisabled)
+		return
+	}
+	uuid := util.GenerUUID()
+	deviceId := c.Query("device_id")
+	deviceName := c.Query("device_name")
+	deviceModel := c.Query("device_model")
+	err := u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(common.NewQRCodeModel(common.QRCodeTypeScanLogin, map[string]interface{}{
+		"app_id":  "wukongchat",
+		"status":  common.ScanLoginStatusWaitScan,
+		"pub_key": c.Query("pub_key"),
+	})), time.Minute*1)
+	if err != nil {
+		u.Error("设置登录uuid失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	// 缓存设备信息
+	if deviceId != "" && deviceName != "" && deviceModel != "" {
+		err := u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.DeviceCacheUUIDPrefix, uuid), util.ToJson(map[string]interface{}{
+			"device_id":    deviceId,
+			"device_name":  deviceName,
+			"device_model": deviceModel,
+		}), time.Minute*2)
+		if err != nil {
+			u.Error("设置登录设备信息失败！", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return
+		}
+	}
+	// 轮询密钥：把「二维码状态里的敏感字段」绑定到申请二维码的这个浏览器会话。
+	//
+	// 没有它时，uuid 是读取 auth_code 的唯一凭据 —— 任何看得到二维码的人（肩窥、
+	// 转发的截图、投屏、录屏）都能轮询出 auth_code 并兑换成受害者的 token。
+	//
+	// 注意它挡不住 QRLJacking（攻击者自建二维码钓鱼）：那条链路里攻击者就是调用本
+	// 接口的人，密钥连同 uuid 一起发给了他。那条只能靠确认环节的人识破，服务端无解。
+	//
+	// 明文只出现在本响应里，绝不写进 qrcode:{uuid} 的 payload —— 那份 payload 正是
+	// getloginStatus 要回显给匿名轮询方的内容。
+	pollSecret, err := u.mintScanLoginPollSecret(uuid)
+	if err != nil {
+		u.Error("生成扫码轮询密钥失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	// 响应体里带着 bearer 级别的密钥，任何中间缓存或浏览器 bfcache 留存都等于泄露它。
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{
+		"uuid":        uuid,
+		"poll_secret": pollSecret,
+		"qrcode":      fmt.Sprintf("%s/%s", u.ctx.GetConfig().External.BaseURL, strings.ReplaceAll(u.ctx.GetConfig().QRCodeInfoURL, ":code", uuid)),
+	})
+}
+
+// 通过loginUUID获取登录状态
+//
+// 本接口按设计保持匿名可达（二维码在用户登录之前就要渲染，此时没有任何 token 可用），
+// 故不挂 AuthMiddleware。取而代之的边界是 poll_secret：只有持有 getLoginUUID 下发的
+// 那枚密钥的调用方，才能读到 auth_code / uid / encrypt 这些凭据字段；其余调用方拿到的
+// 是被 stripScanLoginSensitiveFields 剥过的状态。
+//
+// 校验失败时刻意返回「真实 status + 剥掉敏感字段」而不是报错：发布窗口内仍持有旧
+// bundle 的浏览器会停在授权页等待（用户刷新即恢复），而不是被 expired 状态推去无限
+// 重新申请二维码。安全性不因此打折 —— 旧 bundle 同样拿不到 auth_code。
+func (u *User) getloginStatus(c *wkhttp.Context) {
+	if !common2.EnsureSystemSettings(u.ctx).ScanLoginEnabled() {
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, gin.H{"status": scanLoginStatusDisabled})
+		return
+	}
+	uuid := c.Query("uuid")
+	qrcodeInfo, err := u.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid))
+	if err != nil {
+		u.Error("获取uuid绑定的二维码信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if qrcodeInfo == "" {
+		c.JSON(http.StatusOK, gin.H{
+			"status": common.ScanLoginStatusExpired,
+		})
+		return
+	}
+	var qrcodeModel *common.QRCodeModel
+	err = util.ReadJsonByByte([]byte(qrcodeInfo), &qrcodeModel)
+	if err != nil {
+		u.Error("解码二维码信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserDecodeFailed)
+		return
+	}
+	if qrcodeModel == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"status": common.ScanLoginStatusExpired,
+		})
+		return
+	}
+	// 授权判定放在所有早退分支之后：过期 / 未知 uuid 上面已经返回，不必为它们多花一次
+	// Redis 读 —— 本接口未认证，任何「无效输入也要付出后端开销」的路径都是放大器。
+	// 在进入长轮询前一次性定下，避免 select 的多个出口重复查询。
+	authorized := u.scanLoginPollSecretMatches(uuid, strings.TrimSpace(c.Query(scanLoginPollSecretQuery)))
+	respondStatus := func(model *common.QRCodeModel) {
+		// 这个响应在授权分支上携带 auth_code / uid / encrypt。没有显式新鲜度信息的
+		// 200 GET 是可被启发式缓存的（RFC 9111 §4.2.2），而同文件的头像路由就故意下发
+		// Cache-Control: public, max-age=86400 —— 说明这个源站前面本来就预期有缓存。
+		// 无条件 no-store：凭据响应不该被任何中间层留存。
+		//
+		// 顺带说明为什么没有 Vary：密钥现在走 query，已经进了缓存键，所以「不带密钥的
+		// 请求命中带密钥的缓存条目」这条路本身不成立。若将来改回请求头通道，必须同时
+		// 加上 Vary，否则两种请求的 URL 完全相同、缓存无从区分。
+		c.Header("Cache-Control", "no-store")
+		if model == nil {
+			// channel 被同 uuid 的另一个请求关掉时会收到 nil。此处必须仍然写出响应：
+			// 上一版直接 return，gin 会发一个零长度的 200，前端 result.status 变成
+			// undefined → loginStatus=undefined → 状态机匹配不到分支 → 轮询永久停摆。
+			// 回落到请求开始时读到的状态，客户端至少能继续推进。
+			model = qrcodeModel
+		}
+		if model == nil {
+			c.JSON(http.StatusOK, gin.H{"status": common.ScanLoginStatusExpired})
+			return
+		}
+		if !authorized {
+			c.JSON(http.StatusOK, ensureScanLoginStatus(filterScanLoginPublicFields(model.Data), model.Data))
+			return
+		}
+		c.JSON(http.StatusOK, model.Data)
+	}
+	// authed is terminal for this polling cycle. In a multi-replica deployment,
+	// grant_login may have published the state through another process, so this
+	// process cannot receive its in-memory channel notification. Once the shared
+	// Redis read already shows authed, entering the 10-second long poll only adds
+	// latency and retains a goroutine without waiting for any useful transition.
+	// Authorized and unauthorized callers take the same early return, so it does
+	// not reveal whether poll_secret matched. respondStatus still strips credential
+	// fields for unauthorized callers, and the strict per-IP limiter remains the
+	// abuse-control fallback for repeated terminal-state polling.
+	if scanLoginStatusIs(qrcodeModel, string(common.ScanLoginStatusAuthed)) {
+		respondStatus(qrcodeModel)
+		return
+	}
+	// 只有持密钥的一方才注册推送 channel。
+	//
+	// getQRCodeModelChan 对同一 uuid 是无条件覆盖写，所以未授权方一旦也能注册，就能靠
+	// 反复轮询持续把合法轮询方的 channel 顶掉：grantLogin 的推送落到攻击者那一侧（凭据
+	// 有白名单拦着不会泄露），而合法方收不到通知，每轮白等满 10 秒才拿到旧状态 —— 未认证
+	// 端点上的一个廉价登录延迟惩罚。未授权方本来也只能拿到白名单字段，订阅对它毫无意义。
+	//
+	// 不注册时 qrcodeChan 为 nil：从 nil channel 接收永远阻塞，select 自然落到超时分支。
+	// 对尚未 authed 的状态，刻意让未授权方等满 10 秒 —— 此时立刻返回会泄露「密钥
+	// 对不对」的时序信号，也会让攻击者能高频轮询。上面的 authed 终态短路对授权与
+	// 未授权方一致，因此不携带这类密钥判定信号。
+	var qrcodeChan <-chan *common.QRCodeModel
+	if authorized {
+		qrcodeChan = u.getQRCodeModelChan(uuid)
+	}
+	// 显式 Timer 而非 time.After：加了 ctx.Done() 分支后，提前返回的路径会把
+	// time.After 的底层 timer 留到 10s 后才被 GC 回收；Stop 掉更干净。
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
+	select {
+	case pushed := <-qrcodeChan:
+		u.removeQRCodeChanOwned(uuid, qrcodeChan)
+		respondStatus(pushed)
+	case <-c.Request.Context().Done():
+		// 客户端断开（关页面 / 切登录方式 / 网关超时）时立即释放，不再空转满 10 秒。
+		// 该接口未认证且长轮询挂起，缺这一路等于让任意断开的连接都占住一个 goroutine
+		// 与一个 channel 槽位直到超时。此处不写响应 —— 连接已经没了。
+		u.removeQRCodeChanOwned(uuid, qrcodeChan)
+	case <-timeout.C:
+		u.removeQRCodeChanOwned(uuid, qrcodeChan)
+		respondStatus(qrcodeModel)
+	}
+}
+
+// 通过authCode登录
+func (u *User) loginWithAuthCode(c *wkhttp.Context) {
+	if !common2.EnsureSystemSettings(u.ctx).ScanLoginEnabled() {
+		respondUserError(c, errcode.ErrUserScanLoginDisabled)
+		return
+	}
+	authCode := c.Param("auth_code")
+	authCodeKey := scanLoginReadyAuthorizationKey(authCode)
+	flagI64, _ := strconv.ParseInt(c.Query("flag"), 10, 64)
+	var flag config.DeviceFlag
+	if flagI64 == 0 {
+		flag = config.Web // loginWithAuthCode 默认为web登陆
+	} else {
+		flag = config.DeviceFlag(flagI64)
+	}
+	authInfo, err := u.ctx.GetRedisConn().GetString(authCodeKey)
+	if err != nil {
+		u.Error("获取授权信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if authInfo == "" {
+		respondUserError(c, errcode.ErrUserAuthCodeNotFound)
+		return
+	}
+	var authInfoMap map[string]interface{}
+	err = util.ReadJsonByByte([]byte(authInfo), &authInfoMap)
+	if err != nil {
+		u.Error("解码授权信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserDecodeFailed)
+		return
+	}
+	authType, ok := authInfoMap["type"].(string)
+	if !ok {
+		respondUserAuthInfoInvalid(c, "type")
+		return
+	}
+	if authType != string(common.AuthCodeTypeScanLogin) {
+		respondUserError(c, errcode.ErrUserAuthCodeWrongType)
+		return
+	}
+	scaner, ok := authInfoMap["scaner"].(string)
+	if !ok {
+		respondUserAuthInfoInvalid(c, "scaner")
+		return
+	}
+	uuid, ok := authInfoMap["uuid"].(string)
+	if !ok || uuid == "" {
+		respondUserAuthInfoInvalid(c, "uuid")
+		return
+	}
+	if !u.scanLoginPollSecretMatches(uuid, strings.TrimSpace(c.Query(scanLoginPollSecretQuery))) {
+		// Missing and wrong browser credentials intentionally collapse to the
+		// same response as an unknown authorization code.
+		respondUserError(c, errcode.ErrUserAuthCodeNotFound)
+		return
+	}
+	issueFence, err := beginUserSessionIssue(c.Request.Context(), u.sessionStore, scaner)
+	if err != nil {
+		u.Error("初始化扫码登录会话栅栏失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	consumed, err := u.scanLoginAuthorizations.Consume(authCode, authInfo)
+	if err != nil {
+		u.Error("原子消费扫码授权码失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if !consumed {
+		respondUserError(c, errcode.ErrUserAuthCodeNotFound)
+		return
+	}
+	redemptionAudit := newScanLoginRedemptionAudit(u.Log, uuid, scaner)
+	defer redemptionAudit.WarnIfIncomplete()
+	// Consumption happens before any login side effect. A downstream failure
+	// burns this authorization and requires a fresh scan; fail-closed behavior
+	// is preferable to making a credential replayable across replicas.
+	// 获取老的token
+	token, err := u.sessionStore.DeviceToken(c.Request.Context(), scaner, int(flag))
+	if err != nil {
+		u.Error("获取旧token错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserIMCallFailed)
+		return
+	}
+	// 复用 uidtoken 反查到的旧 token 前,必须确认 token:<oldToken> 仍存在,
+	// 否则与并发 logout 删除 token 形成 TOCTOU 竞态,会复活已登出的会话。
+	// 这里只标记是否复用,真正写缓存时用 SET XX 校验(见下方 UpdateIMToken 之前)。
+	reuseExistingToken := strings.TrimSpace(token) != ""
+	if !reuseExistingToken {
+		token = util.GenerUUID()
+	}
+
+	userModel, err := u.db.QueryByUID(scaner)
+	if err != nil {
+		u.Error("查询用户信息失败", zap.String("uid", scaner), zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	// 已禁用或已注销账号拒绝授权登录；冷静期账号允许（与其他登录路径一致）。
+	// issuance fence 只能阻止安全事件前开始的请求穿越撤销，事件后兑换仍需
+	// 以这里的权威账号状态拒绝，否则 live auth code 会签出新 generation bearer。
+	if userModel == nil || userModel.IsDestroy == IsDestroyDone {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+	if userModel.Status == int(common.UserDisable) {
+		respondUserError(c, errcode.ErrUserAccountBanned)
+		return
+	}
+	// 获取缓存设备
+	sessionDeviceID := ""
+	if uuid != "" {
+		deviceCache, err := u.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", common.DeviceCacheUUIDPrefix, uuid))
+		if err != nil {
+			u.Error("获取登录设备信息失败！", zap.Error(err))
+			respondUserError(c, errcode.ErrUserQueryFailed)
+			return
+		}
+		if deviceCache != "" {
+			var deviceInfoMap map[string]interface{}
+			err = util.ReadJsonByByte([]byte(deviceCache), &deviceInfoMap)
+			if err != nil {
+				u.Error("解码设备信息失败！", zap.Error(err))
+				respondUserError(c, errcode.ErrUserDecodeFailed)
+				return
+			}
+			deviceId, _ := deviceInfoMap["device_id"].(string)
+			sessionDeviceID = deviceId
+			deviceName, _ := deviceInfoMap["device_name"].(string)
+			dmodel, _ := deviceInfoMap["device_model"].(string)
+			if deviceId != "" && deviceName != "" && dmodel != "" {
+				span := u.ctx.Tracer().StartSpan(
+					"user.authCodeLogin",
+					opentracing.ChildOf(c.GetSpanContext()),
+				)
+				defer span.Finish()
+				spanCtx := u.ctx.Tracer().ContextWithSpan(context.Background(), span)
+				// 更新设备信息
+				err := u.deviceDB.insertOrUpdateDeviceCtx(spanCtx, &deviceModel{
+					UID:         userModel.UID,
+					DeviceID:    deviceId,
+					DeviceName:  deviceName,
+					DeviceModel: dmodel,
+					LastLogin:   time.Now().Unix(),
+				})
+				if err != nil {
+					u.Error("更新用户登录设备失败", zap.Error(err))
+					respondUserError(c, errcode.ErrUserStoreFailed)
+					return
+				}
+			}
+		}
+	}
+	// 在调用 IM 之前确定最终 token 并写入缓存。
+	// 复用旧 token 时用 SET XX(SetIfExists):仅当 token:<oldToken> 仍存在才刷新;
+	// 若已被并发 logout 删除,则回退到新 UUID,避免复活已登出的 token。
+	sessionInfo := auth.TokenInfo{
+		UID:        userModel.UID,
+		Name:       userModel.Name,
+		Role:       userModel.Role,
+		Language:   userModel.Language,
+		DeviceFlag: int(flag),
+		DeviceID:   sessionDeviceID,
+	}
+	if reuseExistingToken {
+		refreshed, err := reuseUserSession(c.Request.Context(), u.sessionStore, token, sessionInfo, issueFence)
+		if err != nil {
+			u.Error("刷新旧token缓存失败！", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return
+		}
+		if !refreshed {
+			token = util.GenerUUID()
+			reuseExistingToken = false
+		}
+	}
+	issuedNew := false
+	if !reuseExistingToken {
+		err = issueUserSession(c.Request.Context(), u.sessionStore, token, sessionInfo, issueFence)
+		if err != nil {
+			u.Error("设置token缓存失败！", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return
+		}
+		issuedNew = true
+	}
+
+	imResp, err := u.ctx.UpdateIMToken(config.UpdateIMTokenReq{
+		UID:         scaner,
+		Token:       token,
+		DeviceFlag:  flag,
+		DeviceLevel: config.DeviceLevelSlave,
+	})
+	if err != nil {
+		u.Error("更新IM的token失败！", zap.Error(err))
+		if issuedNew {
+			if revokeErr := u.compensateIssuedToken(token, userModel.UID, int(flag)); revokeErr != nil {
+				u.Error("补偿撤销扫码登录新token失败！", zap.Error(revokeErr))
+			}
+		}
+		respondUserError(c, errcode.ErrUserIMCallFailed)
+		return
+	}
+	if imResp.Status == config.UpdateTokenStatusBan {
+		if issuedNew {
+			if revokeErr := u.compensateIssuedToken(token, userModel.UID, int(flag)); revokeErr != nil {
+				u.Error("封禁响应后补偿撤销扫码登录新token失败！", zap.Error(revokeErr))
+			}
+		}
+		respondUserError(c, errcode.ErrUserAccountBanned)
+		return
+	}
+
+	// 登录已完成，把这一轮扫码留下的状态全部清掉，
+	// 不给已完成的会话留任何残余窗口。两处失败都不阻断登录（各自 TTL 会兜底）。
+	//   - 轮询密钥：留着等于多一段能读出凭据字段的时间
+	//   - qrcode:{uuid}：还携带 uid / auth_code / encrypt，其中 encrypt 是 Signal 密钥
+	//     材料，登录完成后没有任何理由继续留在 Redis 里
+	u.deleteScanLoginPollSecret(uuid)
+	if uuid != "" {
+		if delErr := u.ctx.GetRedisConn().Del(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid)); delErr != nil {
+			u.Warn("清理扫码二维码状态失败", zap.String("uuid", uuid), zap.Error(delErr))
+		}
+	}
+
+	resp := map[string]interface{}{
+		"app_id":     userModel.AppID,
+		"name":       userModel.Name,
+		"username":   userModel.Username,
+		"uid":        userModel.UID,
+		"token":      token,
+		"short_no":   userModel.ShortNo,
+		"avatar":     u.ctx.GetConfig().GetAvatarPath(userModel.UID),
+		"im_pub_key": "",
+	}
+	// YUJ-413 R5 Blocking #2:auth-code 登录走手写 map,没经过
+	// newLoginUserDetailResp,必须单独补三个实名字段 —— 否则扫码登录的客户端
+	// 永远拿不到 self 实名态,和 POST /v1/user/login 契约不一致。
+	u.applyRealnameToAuthCodeMap(resp, userModel.UID)
+	redemptionAudit.MarkCompleted()
+	c.Response(resp)
+	u.finishSuccessfulLogin(userModel.UID, userModel.Username, wkhttp.ClientIP(c.Request), "scan_login")
+}
+
+// 获取二维码数据的管道
+func (u *User) getQRCodeModelChan(uuid string) <-chan *common.QRCodeModel {
+	qrcodeModelChan := make(chan *common.QRCodeModel, 1) // buffered: prevent message loss between return and receive
+	qrcodeChanLock.Lock()
+	qrcodeChanMap[uuid] = qrcodeModelChan
+	qrcodeChanLock.Unlock()
+	return qrcodeModelChan
+}
+
+// removeQRCodeChanOwned 只在 map 中登记的仍是本请求注册的那个 channel 时才摘除并关闭。
+//
+// getQRCodeModelChan 对同一 uuid 是无条件覆盖写，而 loginstatus 未认证 —— 任何知道
+// uuid 的人（在钓鱼场景里 uuid 就是攻击者自己的，其余场景直接从展示中的二维码读出）
+// 反复发起并立刻中断请求，就能借 removeQRCodeChan 把合法轮询方登记的 channel 关掉：
+// 对方立刻收到 nil，本轮长轮询作废；grantLogin 的推送则落到已被替换的 channel 上，
+// 在 SendQRCodeInfo 的 default 分支被静默丢弃。带归属校验后，每个请求只回收自己那个。
+func (u *User) removeQRCodeChanOwned(uuid string, own <-chan *common.QRCodeModel) {
+	if own == nil {
+		return // 未授权的轮询方压根没注册，没有东西要回收
+	}
+	qrcodeChanLock.Lock()
+	defer qrcodeChanLock.Unlock()
+	ch, exist := qrcodeChanMap[uuid]
+	if !exist || ch != own {
+		return
+	}
+	delete(qrcodeChanMap, uuid)
+	close(ch) // close channel to unblock any pending sender
+}
+
+// SendQRCodeInfo 发送二维码数据
+func SendQRCodeInfo(uuid string, qrcode *common.QRCodeModel) {
+	qrcodeChanLock.Lock()
+	defer qrcodeChanLock.Unlock()
+
+	qrcodeChan := qrcodeChanMap[uuid]
+	if qrcodeChan != nil {
+		select {
+		case qrcodeChan <- qrcode:
+		default:
+			// channel 已满或无接收者
+		}
+	}
+}
+
+// 授权登录
+func (u *User) grantLogin(c *wkhttp.Context) {
+	if !common2.EnsureSystemSettings(u.ctx).ScanLoginEnabled() {
+		respondUserError(c, errcode.ErrUserScanLoginDisabled)
+		return
+	}
+	authCode := c.Query("auth_code")
+	loginUID := c.MustGet("uid").(string)
+	encrypt := c.Query("encrypt") // signal相关密钥
+	if authCode == "" {
+		respondUserRequestInvalid(c, "auth_code")
+		return
+	}
+	authInfo, err := u.ctx.GetRedisConn().GetString(scanLoginPendingAuthorizationKey(authCode))
+	if err != nil {
+		u.Error("获取授权信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if authInfo == "" {
+		respondUserError(c, errcode.ErrUserAuthCodeNotFound)
+		return
+	}
+	var authInfoMap map[string]interface{}
+	err = util.ReadJsonByByte([]byte(authInfo), &authInfoMap)
+	if err != nil {
+		u.Error("解码授权信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserDecodeFailed)
+		return
+	}
+	authType, ok := authInfoMap["type"].(string)
+	if !ok {
+		respondUserAuthInfoInvalid(c, "type")
+		return
+	}
+	if authType != string(common.AuthCodeTypeScanLogin) {
+		respondUserError(c, errcode.ErrUserAuthCodeWrongType)
+		return
+	}
+	scaner, ok := authInfoMap["scaner"].(string)
+	if !ok {
+		respondUserAuthInfoInvalid(c, "scaner")
+		return
+	}
+	if scaner != loginUID {
+		respondUserError(c, errcode.ErrUserAuthScannerMismatch)
+		return
+	}
+	uuid, ok := authInfoMap["uuid"].(string)
+	if !ok || uuid == "" {
+		respondUserAuthInfoInvalid(c, "uuid")
+		return
+	}
+	promoted, err := u.scanLoginAuthorizations.Promote(authCode, authInfo, ScanLoginAuthCodeTTL)
+	if err != nil {
+		u.Error("提升扫码授权码失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if !promoted {
+		respondUserError(c, errcode.ErrUserAuthCodeNotFound)
+		return
+	}
+	qrcodeInfo := common.NewQRCodeModel(common.QRCodeTypeScanLogin, map[string]interface{}{
+		"app_id":    "wukongchat",
+		"status":    common.ScanLoginStatusAuthed,
+		"uid":       loginUID,
+		"auth_code": authCode,
+		"encrypt":   encrypt,
+	})
+	err = u.ctx.GetRedisConn().SetAndExpire(fmt.Sprintf("%s%s", common.QRCodeCachePrefix, uuid), util.ToJson(qrcodeInfo), ScanLoginConfirmWindow)
+	if err != nil {
+		u.Error("更新二维码信息失败！", zap.Error(err))
+		if restored, rollbackErr := u.scanLoginAuthorizations.RollbackPromotion(
+			authCode, authInfo, ScanLoginConfirmWindow,
+		); rollbackErr != nil {
+			u.Warn("恢复扫码待确认授权失败！", zap.String("uuid", uuid), zap.Error(rollbackErr))
+		} else if !restored {
+			u.Warn("扫码授权码在状态写入失败后已无法恢复", zap.String("uuid", uuid))
+		}
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	SendQRCodeInfo(uuid, qrcodeInfo)
+	c.ResponseOK()
+}
+
+// addBlacklist 添加黑名单
+func (u *User) addBlacklist(c *wkhttp.Context) {
+	loginUID := c.MustGet("uid").(string)
+	uid := c.Param("uid")
+	if strings.TrimSpace(uid) == "" {
+		respondUserRequestInvalid(c, "uid")
+		return
+	}
+	model, err := u.settingDB.QueryUserSettingModel(uid, loginUID)
+	if err != nil {
+		u.Error("查询用户设置失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	//如果没有设置记录先添加一条记录
+	if model == nil || strings.TrimSpace(model.UID) == "" {
+		userSettingModel := &SettingModel{
+			UID:   loginUID,
+			ToUID: uid,
+		}
+		err = u.settingDB.InsertUserSettingModel(userSettingModel)
+		if err != nil {
+			u.Error("添加用户设置失败", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return
+		}
+	}
+
+	//添加黑名单
+	version, err := u.ctx.GenSeq(common.UserSettingSeqKey)
+	if err != nil {
+		u.Error("生成用户设置版本号失败", zap.String("uid", loginUID), zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+	friendVersion, err := u.ctx.GenSeq(common.FriendSeqKey)
+	if err != nil {
+		u.Error("生成好友版本号失败", zap.String("uid", loginUID), zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+	tx, err := u.ctx.DB().Begin()
+	if err != nil {
+		u.Error("开启事务失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			tx.Rollback()
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
+		}
+	}()
+	err = u.db.AddOrRemoveBlacklistTx(loginUID, uid, 1, version, tx)
+	if err != nil {
+		tx.Rollback()
+		u.Error("添加黑名单失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	err = u.friendDB.updateVersionTx(friendVersion, loginUID, uid, tx)
+	if err != nil {
+		tx.Rollback()
+		u.Error("更新好友的版本号失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		tx.Rollback()
+		u.Error("提交数据库失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+
+	// DB事务提交成功后，再请求IM服务器设置黑名单
+	err = u.ctx.IMBlacklistAdd(config.ChannelBlacklistReq{
+		ChannelReq: config.ChannelReq{
+			ChannelID:   loginUID,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		},
+		UIDs: []string{uid},
+	})
+	if err != nil {
+		u.Error("IM设置黑名单失败，DB已提交", zap.Error(err), zap.String("loginUID", loginUID), zap.String("uid", uid))
+	}
+
+	// 发送给被拉黑的人去更新拉黑人的频道
+	err = u.ctx.SendChannelUpdate(config.ChannelReq{
+		ChannelID:   uid,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+	}, config.ChannelReq{
+		ChannelID:   loginUID,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+	})
+	if err != nil {
+		u.Warn("发送频道更新命令失败！", zap.Error(err))
+	}
+
+	// 发送给操作者，去更新被拉黑的人的频道
+	err = u.ctx.SendChannelUpdate(config.ChannelReq{
+		ChannelID:   loginUID,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+	}, config.ChannelReq{
+		ChannelID:   uid,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+	})
+	if err != nil {
+		u.Warn("发送频道更新命令失败！", zap.Error(err))
+	}
+
+	c.ResponseOK()
+}
+
+// removeBlacklist 移除黑名单
+func (u *User) removeBlacklist(c *wkhttp.Context) {
+	loginUID := c.MustGet("uid").(string)
+	uid := c.Param("uid")
+	if strings.TrimSpace(uid) == "" {
+		respondUserRequestInvalid(c, "uid")
+		return
+	}
+
+	version, err := u.ctx.GenSeq(common.UserSettingSeqKey)
+	if err != nil {
+		u.Error("生成用户设置版本号失败", zap.String("uid", loginUID), zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+	friendVersion, err := u.ctx.GenSeq(common.FriendSeqKey)
+	if err != nil {
+		u.Error("生成好友版本号失败", zap.String("uid", loginUID), zap.Error(err))
+		respondUserServiceError(c)
+		return
+	}
+
+	tx, err := u.ctx.DB().Begin()
+	if err != nil {
+		u.Error("开启事务失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			tx.Rollback()
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
+		}
+	}()
+	err = u.db.AddOrRemoveBlacklistTx(loginUID, uid, 0, version, tx)
+	if err != nil {
+		tx.Rollback()
+		u.Error("移除黑名单失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	err = u.friendDB.updateVersionTx(friendVersion, loginUID, uid, tx)
+	if err != nil {
+		tx.Rollback()
+		u.Error("更新好友的版本号失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		tx.Rollback()
+		u.Error("提交数据库失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+
+	// DB事务提交成功后，再请求IM服务器移除黑名单
+	err = u.ctx.IMBlacklistRemove(config.ChannelBlacklistReq{
+		ChannelReq: config.ChannelReq{
+			ChannelID:   loginUID,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		},
+		UIDs: []string{uid},
+	})
+	if err != nil {
+		u.Error("IM移除黑名单失败，DB已提交", zap.Error(err), zap.String("loginUID", loginUID), zap.String("uid", uid))
+	}
+
+	// 发送给被拉黑的人去更新拉黑人的频道
+	err = u.ctx.SendChannelUpdate(config.ChannelReq{
+		ChannelID:   uid,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+	}, config.ChannelReq{
+		ChannelID:   loginUID,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+	})
+	if err != nil {
+		u.Warn("发送频道更新命令失败！", zap.Error(err))
+	}
+
+	// 发送给操作者，去更新被拉黑的人的频道
+	err = u.ctx.SendChannelUpdate(config.ChannelReq{
+		ChannelID:   loginUID,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+	}, config.ChannelReq{
+		ChannelID:   uid,
+		ChannelType: common.ChannelTypePerson.Uint8(),
+	})
+	if err != nil {
+		u.Warn("发送频道更新命令失败！", zap.Error(err))
+	}
+
+	c.ResponseOK()
+}
+
+// blacklists 获取黑名单列表
+func (u *User) blacklists(c *wkhttp.Context) {
+	loginUID := c.MustGet("uid").(string)
+	list, err := u.db.Blacklists(loginUID)
+	if err != nil {
+		u.Error("查询黑名单列表失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	blacklists := []*blacklistResp{}
+	for _, result := range list {
+		blacklists = append(blacklists, &blacklistResp{
+			UID:      result.UID,
+			Name:     result.Name,
+			Username: result.Username,
+		})
+	}
+	c.Response(blacklists)
+}
+
+// sendRegisterCode 发送注册短信
+func (u *User) sendRegisterCode(c *wkhttp.Context) {
+	if common2.EnsureSystemSettings(u.ctx).RegisterOff() {
+		respondUserError(c, errcode.ErrUserRegistrationClosed)
+		return
+	}
+	var req codeReq
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if strings.TrimSpace(req.Zone) == "" {
+		respondUserRequestInvalid(c, "zone")
+		return
+	}
+	if strings.TrimSpace(req.Phone) == "" {
+		respondUserRequestInvalid(c, "phone")
+		return
+	}
+	if common2.EnsureSystemSettings(u.ctx).RegisterOnlyChina() {
+		if strings.TrimSpace(req.Zone) != "0086" {
+			respondUserError(c, errcode.ErrUserPhoneRegionUnsupported)
+			return
+		}
+	}
+
+	span := u.ctx.Tracer().StartSpan(
+		"user.sendRegisterCode",
+		opentracing.ChildOf(c.GetSpanContext()),
+	)
+	defer span.Finish()
+	spanCtx := u.ctx.Tracer().ContextWithSpan(context.Background(), span)
+
+	model, err := u.db.QueryByPhone(req.Zone, req.Phone)
+	if err != nil {
+		u.Error("查询用户信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if model != nil {
+		c.Response(map[string]interface{}{
+			"exist": 1,
+		})
+		return
+	}
+	err = u.smsServie.SendVerifyCode(spanCtx, req.Zone, req.Phone, commonapi.CodeTypeRegister)
+	if err != nil {
+		u.Error("发送短信验证码失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserSMSSendFailed)
+		return
+	}
+	c.Response(map[string]interface{}{
+		"exist": 0,
+	})
+}
+
+// setChatPwd 修改用户聊天密码
+func (u *User) setChatPwd(c *wkhttp.Context) {
+	var req chatPwdReq
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if strings.TrimSpace(req.ChatPwd) == "" {
+		respondUserRequestInvalid(c, "chat_pwd")
+		return
+	}
+	if strings.TrimSpace(req.LoginPwd) == "" {
+		respondUserRequestInvalid(c, "login_pwd")
+		return
+	}
+	loginUID := c.MustGet("uid").(string)
+	user, err := u.db.QueryByUID(loginUID)
+	if err != nil {
+		u.Error("查询用户信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	pwdMatched, _ := CheckPassword(req.LoginPwd, user.Password)
+	if !pwdMatched {
+		respondUserError(c, errcode.ErrUserInvalidCredentials)
+		return
+	}
+	//修改用户聊天密码
+	hashedChatPwd, err := HashPassword(req.ChatPwd)
+	if err != nil {
+		u.Error("哈希聊天密码失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserChatPwdUpdateFailed)
+		return
+	}
+	err = u.db.UpdateUsersWithField("chat_pwd", hashedChatPwd, loginUID)
+	if err != nil {
+		u.Error("查询用户信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserChatPwdUpdateFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// 设置锁屏密码
+func (u *User) lockScreenAfterMinuteSet(c *wkhttp.Context) {
+	var req struct {
+		LockAfterMinute int `json:"lock_after_minute"` // 在几分钟后锁屏
+	}
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if req.LockAfterMinute < 0 {
+		respondUserLockMinuteOutOfRange(c)
+		return
+	}
+	if req.LockAfterMinute > 60 {
+		respondUserLockMinuteOutOfRange(c)
+		return
+	}
+	loginUID := c.GetLoginUID()
+	err := u.db.UpdateUsersWithField("lock_after_minute", strconv.FormatInt(int64(req.LockAfterMinute), 10), loginUID)
+	if err != nil {
+		u.Error("修改用户锁屏密码错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserLockScreenPwdUpdateFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// 设置锁屏密码
+func (u *User) setLockScreenPwd(c *wkhttp.Context) {
+	var req struct {
+		LockScreenPwd string `json:"lock_screen_pwd"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if strings.TrimSpace(req.LockScreenPwd) == "" {
+		respondUserRequestInvalid(c, "lock_screen_pwd")
+		return
+	}
+
+	loginUID := c.GetLoginUID()
+	hashedLockPwd, err := HashPassword(req.LockScreenPwd)
+	if err != nil {
+		u.Error("哈希锁屏密码失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserLockScreenPwdUpdateFailed)
+		return
+	}
+	err = u.db.UpdateUsersWithField("lock_screen_pwd", hashedLockPwd, loginUID)
+	if err != nil {
+		u.Error("修改用户锁屏密码错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserLockScreenPwdUpdateFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// 关闭锁屏密码
+func (u *User) closeLockScreenPwd(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	err := u.db.UpdateUsersWithField("lock_screen_pwd", "", loginUID)
+	if err != nil {
+		u.Error("修改用户锁屏密码错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserLockScreenPwdUpdateFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// sendLoginCheckPhoneCode 发送登录验证短信
+func (u *User) sendLoginCheckPhoneCode(c *wkhttp.Context) {
+	// 设备验证短信是本地登录二阶段的一部分,local_off=1 时必须连发码也拒,
+	// 否则攻击者跳过 /v1/user/login 直接走二阶段仍能拿到 token,
+	// 同时还把短信通道当作免费枚举/滥发入口。
+	if common2.EnsureSystemSettings(u.ctx).LocalLoginOff() {
+		respondUserError(c, errcode.ErrUserLocalLoginDisabled)
+		return
+	}
+	var req struct {
+		UID string `json:"uid"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		u.Error("数据格式有误！", zap.Error(err))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if req.UID == "" {
+		respondUserRequestInvalid(c, "uid")
+		return
+	}
+
+	span := u.ctx.Tracer().StartSpan(
+		"user.sendLoginCheckPhoneCode",
+		opentracing.ChildOf(c.GetSpanContext()),
+	)
+	defer span.Finish()
+	spanCtx := u.ctx.Tracer().ContextWithSpan(context.Background(), span)
+
+	userinfo, err := u.db.QueryByUID(req.UID)
+	if err != nil {
+		// User-lookup failure here is a DB query error, NOT a chat-password
+		// update failure (mirror this code with loginCheckPhone below).
+		u.Error("查询用户信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userinfo == nil {
+		u.Error("该用户不存在", zap.Error(err))
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+	//发送短信
+	// if u.ctx.GetConfig().Test {
+	// 	c.ResponseOK()
+	// 	return
+	// }
+	err = u.smsServie.SendVerifyCode(spanCtx, userinfo.Zone, userinfo.Phone, commonapi.CodeTypeCheckMobile)
+	if err != nil {
+		u.Error("发送短信失败", zap.Error(err))
+		ext.LogError(span, err)
+		respondUserError(c, errcode.ErrUserSMSSendFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// loginCheckPhone 登录验证设备短信
+func (u *User) loginCheckPhone(c *wkhttp.Context) {
+	if common2.EnsureSystemSettings(u.ctx).LocalLoginOff() {
+		respondUserError(c, errcode.ErrUserLocalLoginDisabled)
+		return
+	}
+	var req struct {
+		UID  string `json:"uid"`
+		Code string `json:"code"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		u.Error("数据格式有误！", zap.Error(err))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if req.UID == "" {
+		respondUserRequestInvalid(c, "uid")
+		return
+	}
+	if req.Code == "" {
+		respondUserRequestInvalid(c, "code")
+		return
+	}
+	span := u.ctx.Tracer().StartSpan(
+		"user.loginCheckPhone",
+		opentracing.ChildOf(c.GetSpanContext()),
+	)
+	defer span.Finish()
+	spanCtx := u.ctx.Tracer().ContextWithSpan(context.Background(), span)
+
+	userInfo, err := u.db.QueryByUID(req.UID)
+	if err != nil {
+		// User-lookup failure is a DB query error; mirror sendLoginCheckPhoneCode.
+		u.Error("查询用户信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo == nil {
+		u.Error("该用户不存在", zap.Error(err))
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+	// 已注销账号拒绝设备验证登录；冷静期账号允许
+	if userInfo.IsDestroy == IsDestroyDone {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+	issueFence, err := beginUserSessionIssue(spanCtx, u.sessionStore, userInfo.UID)
+	if err != nil {
+		u.Error("初始化设备验证登录会话栅栏失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	userInfo, err = u.reloadUserAfterIssueFence(spanCtx, userInfo.UID)
+	if err != nil {
+		if errors.Is(err, ErrorUserNotExist) {
+			respondUserError(c, errcode.ErrUserNotFound)
+			return
+		}
+		u.Error("会话栅栏后复核设备验证用户失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo.IsDestroy == IsDestroyDone {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+	if userInfo.Status == int(common.UserDisable) {
+		respondUserError(c, errcode.ErrUserAccountUnavailable)
+		return
+	}
+	err = u.smsServie.Verify(spanCtx, userInfo.Zone, userInfo.Phone, req.Code, commonapi.CodeTypeCheckMobile)
+	if err != nil {
+		u.Error("验证短信失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserCodeInvalid)
+		return
+	}
+
+	loginDeviceJsonStr, err := u.ctx.GetRedisConn().GetString(fmt.Sprintf("%s%s", u.ctx.GetConfig().Cache.LoginDeviceCachePrefix, req.UID))
+	if err != nil {
+		u.Error("获取登录设备缓存失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if loginDeviceJsonStr == "" {
+		respondUserError(c, errcode.ErrUserLoginDeviceExpired)
+		return
+	}
+	var loginDeivce *deviceReq
+	err = util.ReadJsonByByte([]byte(loginDeviceJsonStr), &loginDeivce)
+	if err != nil {
+		u.Error("解码登录设备信息失败！", zap.Error(err), zap.String("uid", req.UID))
+		respondUserError(c, errcode.ErrUserDecodeFailed)
+		return
+	}
+	err = u.deviceDB.insertOrUpdateDeviceCtx(spanCtx, &deviceModel{
+		UID:         userInfo.UID,
+		DeviceID:    loginDeivce.DeviceID,
+		DeviceName:  loginDeivce.DeviceName,
+		DeviceModel: loginDeivce.DeviceModel,
+		LastLogin:   time.Now().Unix(),
+	})
+	if err != nil {
+		u.Error("添加或更新登录设备信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	token := util.GenerUUID()
+	sessionInfo := auth.TokenInfo{
+		UID:        userInfo.UID,
+		Name:       userInfo.Name,
+		Role:       userInfo.Role,
+		Language:   userInfo.Language,
+		DeviceFlag: int(config.APP),
+		DeviceID:   loginDeivce.DeviceID,
+	}
+	err = u.replaceAPPTokenSession(spanCtx, token, sessionInfo, issueFence)
+	if err != nil {
+		u.Error("设置token缓存失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	// err = u.ctx.UpdateIMToken(userInfo.UID, token, config.DeviceFlag(0), config.DeviceLevelMaster)
+	imResp, err := u.ctx.UpdateIMToken(config.UpdateIMTokenReq{
+		UID:         userInfo.UID,
+		Token:       token,
+		DeviceFlag:  config.APP,
+		DeviceLevel: config.DeviceLevelMaster,
+	})
+	if err != nil {
+		u.Error("更新IM的token失败！", zap.Error(err))
+		if revokeErr := u.compensateIssuedToken(token, userInfo.UID, int(config.APP)); revokeErr != nil {
+			u.Error("补偿撤销设备验证新token失败！", zap.Error(revokeErr))
+		}
+		respondUserError(c, errcode.ErrUserIMCallFailed)
+		return
+	}
+	if imResp.Status == config.UpdateTokenStatusBan {
+		if revokeErr := u.compensateIssuedToken(token, userInfo.UID, int(config.APP)); revokeErr != nil {
+			u.Error("封禁响应后补偿撤销设备验证新token失败！", zap.Error(revokeErr))
+		}
+		respondUserError(c, errcode.ErrUserAccountBanned)
+		return
+	}
+	resp := newLoginUserDetailResp(userInfo, token, u.ctx)
+	u.applyRealnameToLoginResp(resp, userInfo.UID)
+	c.Response(resp)
+	u.finishSuccessfulLogin(userInfo.UID, userInfo.Username, wkhttp.ClientIP(c.Request), "phone_verify")
+}
+
+// customerservices 客服列表
+func (u *User) customerservices(c *wkhttp.Context) {
+	list, err := u.db.QueryByCategory(CategoryCustomerService)
+	if err != nil {
+		u.Error("查询客服列表失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	results := []*customerservicesResp{}
+	if len(list) > 0 {
+		for _, user := range list {
+			results = append(results, &customerservicesResp{
+				UID:  user.UID,
+				Name: user.Name,
+			})
+		}
+	}
+	c.Response(results)
+}
+
+// 发送注销账号验证吗
+func (u *User) sendDestroyCode(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	userInfo, err := u.db.QueryByUID(loginUID)
+	if err != nil {
+		u.Error("查询登录用户信息错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo == nil {
+		respondUserError(c, errcode.ErrUserCurrentNotFound)
+		return
+	}
+	switch userInfo.IsDestroy {
+	case IsDestroyApplying:
+		respondUserError(c, errcode.ErrUserAccountDestroying)
+		return
+	case IsDestroyDone:
+		respondUserError(c, errcode.ErrUserAccountDestroyed)
+		return
+	}
+	err = u.smsServie.SendVerifyCode(c.Context, userInfo.Zone, userInfo.Phone, commonapi.CodeTypeDestroyAccount)
+	if err != nil {
+		u.Error("注销验证码短信发送失败", zap.String("uid", loginUID), zap.Error(err))
+		respondUserError(c, errcode.ErrUserSMSSendFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// 注销账号
+func (u *User) destroyAccount(c *wkhttp.Context) {
+	code := c.Param("code")
+	loginUID := c.GetLoginUID()
+	if code == "" {
+		respondUserRequestInvalid(c, "code")
+		return
+	}
+	userInfo, err := u.db.QueryByUID(loginUID)
+	if err != nil {
+		u.Error("查询登录用户信息错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo == nil {
+		respondUserError(c, errcode.ErrUserCurrentNotFound)
+		return
+	}
+	var retryIntent *sessionRevocationIntent
+	switch userInfo.IsDestroy {
+	case IsDestroyApplying:
+		respondUserError(c, errcode.ErrUserAccountDestroying)
+		return
+	case IsDestroyDone:
+		if sessionRevocationActive(u.sessionStore) {
+			retryIntent, err = u.db.pendingSessionRevocation(c.Request.Context(), loginUID, "account_destroy")
+			if err != nil {
+				u.Error("查询待重试的注销会话撤销任务失败", zap.Error(err))
+				respondUserError(c, errcode.ErrUserDestroyFailed)
+				return
+			}
+		}
+		if retryIntent == nil {
+			respondUserError(c, errcode.ErrUserAccountDestroyed)
+			return
+		}
+	}
+	if retryIntent == nil {
+		//测试模式（仅非 release 生效）
+		if commonapi.IsTestCodeEnabled(u.ctx.GetConfig()) {
+			if !commonapi.MatchTestCode(u.ctx.GetConfig(), code) {
+				respondUserError(c, errcode.ErrUserCodeInvalid)
+				return
+			}
+		} else {
+			//线上验证短信验证码
+			// 校验验证码
+			err = u.smsServie.Verify(c.Context, userInfo.Zone, userInfo.Phone, code, commonapi.CodeTypeDestroyAccount)
+			if err != nil {
+				u.Warn("注销验证码校验失败", zap.String("uid", loginUID), zap.Error(err))
+				respondUserError(c, errcode.ErrUserCodeInvalid)
+				return
+			}
+		}
+	}
+
+	if retryIntent != nil {
+		err = u.applySessionRevocationIntent(c.Request.Context(), retryIntent)
+	} else {
+		// 毫秒时间戳：13 位足够保证唯一（UnixNano 19 位会撑爆 varchar(40)）。
+		// username 通过 anonymizeUsername 兜底防溢出（海外长手机号时回退 hash 形式）。
+		stamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+		phone := fmt.Sprintf("%s@%s@delete", userInfo.Phone, stamp)
+		username := anonymizeUsername(loginUID, userInfo.Zone, phone, stamp)
+		if sessionRevocationActive(u.sessionStore) {
+			intent, mutateErr := u.db.destroyAccountWithSessionRevocation(c.Request.Context(), loginUID, username, phone, IsDestroyNo)
+			if mutateErr != nil {
+				u.Error("注销账号错误", zap.Error(mutateErr))
+				respondUserError(c, errcode.ErrUserDestroyFailed)
+				return
+			}
+			err = u.applySessionRevocationIntent(c.Request.Context(), intent)
+		} else {
+			err = u.db.destroyAccount(loginUID, username, phone)
+			if err != nil {
+				u.Error("注销账号错误", zap.Error(err))
+				respondUserError(c, errcode.ErrUserDestroyFailed)
+				return
+			}
+		}
+	}
+	revocationErr := err
+	imErr := u.ctx.QuitUserDevice(c.GetLoginUID(), -1) // 退出全部登陆设备
+	if imErr != nil {
+		u.Error("退出登陆设备失败", zap.Error(imErr))
+	}
+	if revocationErr != nil {
+		u.Error("注销账号后的会话撤销尚未完成", zap.Error(revocationErr))
+		respondUserError(c, errcode.ErrUserDestroyFailed)
+		return
+	}
+	if imErr != nil {
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+
+	c.ResponseOK()
+}
+
+// 处理注册用户和文件助手互为好友
+func (u *User) addFileHelperFriend(uid string) error {
+	if uid == "" {
+		u.Error("用户ID不能为空")
+		return errors.New("用户ID不能为空")
+	}
+	isFriend, err := u.friendDB.IsFriend(uid, u.ctx.GetConfig().Account.FileHelperUID)
+	if err != nil {
+		u.Error("查询用户关系失败")
+		return err
+	}
+	if !isFriend {
+		version, err := u.ctx.GenSeq(common.FriendSeqKey)
+		if err != nil {
+			u.Error("GenSeq failed", zap.Error(err))
+			return err
+		}
+		err = u.friendDB.Insert(&FriendModel{
+			UID:     uid,
+			ToUID:   u.ctx.GetConfig().Account.FileHelperUID,
+			Version: version,
+		})
+		if err != nil {
+			u.Error("注册用户和文件助手成为好友失败")
+			return err
+		}
+	}
+	return nil
+}
+
+// addBotFatherFriend 处理注册用户和BotFather互为好友（双向记录 + 白名单 + CMD同步，使用事务）
+func (u *User) addBotFatherFriend(uid string) error {
+	const botFatherUID = "botfather"
+	if uid == "" {
+		return errors.New("用户ID不能为空")
+	}
+
+	// 检查正向好友关系，若已存在则跳过
+	isFriend, err := u.friendDB.IsFriend(uid, botFatherUID)
+	if err != nil {
+		u.Error("查询用户与BotFather关系失败", zap.Error(err))
+		return err
+	}
+	if isFriend {
+		return nil
+	}
+
+	// 使用事务保证双向好友关系的原子性
+	tx, err := u.friendDB.session.Begin()
+	if err != nil {
+		u.Error("创建数据库事务失败", zap.Error(err))
+		return errors.New("创建数据库事务失败")
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			tx.Rollback()
+			fmt.Fprintf(os.Stderr, "recovered panic in addBotFatherFriend: %v\n%s\n", err, debug.Stack())
+		}
+	}()
+
+	// 正向：uid → botfather
+	version, err := u.ctx.GenSeq(common.FriendSeqKey)
+	if err != nil {
+		u.Error("GenSeq failed", zap.Error(err))
+		tx.Rollback()
+		return err
+	}
+	err = u.friendDB.InsertTx(&FriendModel{
+		UID:     uid,
+		ToUID:   botFatherUID,
+		Version: version,
+	}, tx)
+	if err != nil {
+		u.Error("注册用户和BotFather成为好友失败", zap.Error(err))
+		tx.Rollback()
+		return err
+	}
+
+	// 反向：botfather → uid
+	version2, err := u.ctx.GenSeq(common.FriendSeqKey)
+	if err != nil {
+		u.Error("GenSeq failed", zap.Error(err))
+		tx.Rollback()
+		return err
+	}
+	err = u.friendDB.InsertTx(&FriendModel{
+		UID:     botFatherUID,
+		ToUID:   uid,
+		Version: version2,
+	}, tx)
+	if err != nil {
+		u.Error("BotFather和注册用户成为好友失败", zap.Error(err))
+		tx.Rollback()
+		return err
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		u.Error("提交事务失败", zap.Error(err))
+		return err
+	}
+
+	// 双向IM白名单
+	err = u.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
+		ChannelReq: config.ChannelReq{
+			ChannelID:   uid,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		},
+		UIDs: []string{botFatherUID},
+	})
+	if err != nil {
+		u.Error("添加IM白名单失败(user->botfather)", zap.Error(err))
+	}
+	err = u.ctx.IMWhitelistAdd(config.ChannelWhitelistReq{
+		ChannelReq: config.ChannelReq{
+			ChannelID:   botFatherUID,
+			ChannelType: common.ChannelTypePerson.Uint8(),
+		},
+		UIDs: []string{uid},
+	})
+	if err != nil {
+		u.Error("添加IM白名单失败(botfather->user)", zap.Error(err))
+	}
+
+	// 发送好友同步CMD，通知客户端更新好友列表
+	err = u.ctx.SendCMD(config.MsgCMDReq{
+		CMD:         common.CMDFriendAccept,
+		Subscribers: []string{uid, botFatherUID},
+		Param: map[string]interface{}{
+			"to_uid":   uid,
+			"from_uid": botFatherUID,
+		},
+	})
+	if err != nil {
+		u.Error("发送BotFather好友同步CMD失败", zap.Error(err))
+	}
+	return nil
+}
+
+// addSystemFriend 处理注册用户和系统账号互为好友
+func (u *User) addSystemFriend(uid string) error {
+
+	if uid == "" {
+		u.Error("用户ID不能为空")
+		return errors.New("用户ID不能为空")
+	}
+	isFriend, err := u.friendDB.IsFriend(uid, u.ctx.GetConfig().Account.SystemUID)
+	if err != nil {
+		u.Error("查询用户关系失败")
+		return err
+	}
+	tx, err := u.friendDB.session.Begin()
+	if err != nil {
+		u.Error("创建数据库事物失败")
+		return errors.New("创建数据库事物失败")
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			tx.Rollback()
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
+		}
+	}()
+	if !isFriend {
+		version, err := u.ctx.GenSeq(common.FriendSeqKey)
+		if err != nil {
+			u.Error("GenSeq failed", zap.Error(err))
+			return err
+		}
+		err = u.friendDB.InsertTx(&FriendModel{
+			UID:     uid,
+			ToUID:   u.ctx.GetConfig().Account.SystemUID,
+			Version: version,
+		}, tx)
+		if err != nil {
+			u.Error("注册用户和系统账号成为好友失败")
+			tx.Rollback()
+			return err
+		}
+	}
+	// systemIsFriend, err := u.friendDB.IsFriend(u.ctx.GetConfig().SystemUID, uid)
+	// if err != nil {
+	// 	u.Error("查询系统账号和注册用户关系失败")
+	// 	tx.Rollback()
+	// 	return err
+	// }
+	// if !systemIsFriend {
+	// 	version := u.ctx.GenSeq(common.FriendSeqKey)
+	// 	err := u.friendDB.InsertTx(&FriendModel{
+	// 		UID:     u.ctx.GetConfig().SystemUID,
+	// 		ToUID:   uid,
+	// 		Version: version,
+	// 	}, tx)
+	// 	if err != nil {
+	// 		u.Error("系统账号和注册用户成为好友失败")
+	// 		tx.Rollback()
+	// 		return err
+	// 	}
+	// }
+	err = tx.Commit()
+	if err != nil {
+		tx.Rollback()
+		u.Error("用户注册数据库事物提交失败", zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+// 重置登录密码
+func (u *User) pwdforget(c *wkhttp.Context) {
+	var req resetPwdReq
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if strings.TrimSpace(req.Zone) == "" {
+		respondUserRequestInvalid(c, "zone")
+		return
+	}
+	if strings.TrimSpace(req.Phone) == "" {
+		respondUserRequestInvalid(c, "phone")
+		return
+	}
+	if strings.TrimSpace(req.Code) == "" {
+		respondUserRequestInvalid(c, "code")
+		return
+	}
+	if strings.TrimSpace(req.Pwd) == "" {
+		respondUserRequestInvalid(c, "password")
+		return
+	}
+	if err := ValidatePasswordStrength(req.Pwd); err != nil {
+		respondPasswordStrengthError(c, err)
+		return
+	}
+	userInfo, err := u.db.QueryByPhone(req.Zone, req.Phone)
+	if err != nil {
+		u.Error("查询用户信息错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if userInfo == nil {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+	//测试模式（仅非 release 生效）
+	if commonapi.IsTestCodeEnabled(u.ctx.GetConfig()) {
+		if !commonapi.MatchTestCode(u.ctx.GetConfig(), req.Code) {
+			respondUserError(c, errcode.ErrUserCodeInvalid)
+			return
+		}
+	} else {
+		//线上验证短信验证码
+		err = u.smsServie.Verify(context.Background(), req.Zone, req.Phone, req.Code, commonapi.CodeTypeForgetLoginPWD)
+		if err != nil {
+			u.Warn("忘记密码验证码校验失败", zap.String("phone", req.Phone), zap.Error(err))
+			respondUserError(c, errcode.ErrUserCodeInvalid)
+			return
+		}
+	}
+
+	hashedPassword, hashErr := HashPassword(req.Pwd)
+	if hashErr != nil {
+		u.Error("密码哈希失败", zap.Error(hashErr))
+		respondUserError(c, errcode.ErrUserPasswordProcessFailed)
+		return
+	}
+	err = updatePasswordAndRevokeSessions(c.Request.Context(), u.db, u.sessionStore, u.ctx.QuitUserDevice, userInfo.UID, hashedPassword, "password_reset")
+	if err != nil {
+		u.Error("修改登录密码错误", zap.Error(err))
+		respondUserError(c, errcode.ErrUserLoginPwdUpdateFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// 获取忘记密码验证码
+func (u *User) getForgetPwdSMS(c *wkhttp.Context) {
+	var req codeReq
+	if err := c.BindJSON(&req); err != nil {
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if strings.TrimSpace(req.Zone) == "" {
+		respondUserRequestInvalid(c, "zone")
+		return
+	}
+	if strings.TrimSpace(req.Phone) == "" {
+		respondUserRequestInvalid(c, "phone")
+		return
+	}
+
+	span := u.ctx.Tracer().StartSpan(
+		"user.sendForgetPwdCode",
+		opentracing.ChildOf(c.GetSpanContext()),
+	)
+	defer span.Finish()
+	spanCtx := u.ctx.Tracer().ContextWithSpan(context.Background(), span)
+
+	model, err := u.db.QueryByPhone(req.Zone, req.Phone)
+	if err != nil {
+		u.Error("查询用户信息失败！", zap.Error(err))
+		respondUserError(c, errcode.ErrUserQueryFailed)
+		return
+	}
+	if model == nil {
+		respondUserError(c, errcode.ErrUserNotFound)
+		return
+	}
+	err = u.smsServie.SendVerifyCode(spanCtx, req.Zone, req.Phone, commonapi.CodeTypeForgetLoginPWD)
+	if err != nil {
+		u.Error("发送短信验证码失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserSMSSendFailed)
+		return
+	}
+	c.ResponseOK()
+}
+
+// 是否允许更新
+func allowUpdateUserField(field string) bool {
+	allowfields := []string{"sex", "short_no", "name", "search_by_phone", "search_by_short", "new_msg_notice", "msg_show_detail", "voice_on", "shock_on", "msg_expire_second"}
+	for _, allowFiled := range allowfields {
+		if field == allowFiled {
+			return true
+		}
+	}
+	return false
+}
+
+func (u *User) createUser(registerSpanCtx context.Context, createUser *createUserModel, c *wkhttp.Context, invite *model.Invite) {
+	tx, err := u.db.session.Begin()
+	if err != nil {
+		u.Error("创建数据库事物失败", zap.Error(err))
+		respondUserError(c, errcode.ErrUserStoreFailed)
+		return
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			tx.Rollback()
+			fmt.Fprintf(os.Stderr, "recovered panic in goroutine: %v\n%s\n", err, debug.Stack())
+		}
+	}()
+	publicIP := wkhttp.ClientIP(c.Request)
+	resp, err := u.createUserWithRespAndTx(registerSpanCtx, createUser, publicIP, invite, tx, func() error {
+		err := tx.Commit()
+		if err != nil {
+			tx.Rollback()
+			u.Error("数据库事物提交失败", zap.Error(err))
+			respondUserError(c, errcode.ErrUserStoreFailed)
+			return nil
+		}
+		return nil
+	})
+	if err != nil {
+		tx.Rollback()
+		respondUserError(c, errcode.ErrUserRegisterFailed)
+		return
+	}
+	c.Response(resp)
+}
+
+func (u *User) createUserTx(registerSpanCtx context.Context, createUser *createUserModel, c *wkhttp.Context, commitCallback func() error, invite *model.Invite, tx *dbr.Tx) {
+	publicIP := wkhttp.ClientIP(c.Request)
+	resp, err := u.createUserWithRespAndTx(registerSpanCtx, createUser, publicIP, invite, tx, commitCallback)
+	if err != nil {
+		respondUserError(c, errcode.ErrUserRegisterFailed)
+		return
+	}
+	c.Response(resp)
+}
+
+func (u *User) createUserWithRespAndTx(registerSpanCtx context.Context, createUser *createUserModel, publicIP string, invite *model.Invite, tx *dbr.Tx, commitCallback func() error) (*loginUserDetailResp, error) {
+	var (
+		shortNo = ""
+		err     error
+	)
+	if u.ctx.GetConfig().ShortNo.NumOn {
+		shortNo, err = u.commonService.GetShortno()
+		if err != nil {
+			u.Error("获取短编号失败！", zap.Error(err))
+			return nil, err
+		}
+	} else {
+		shortNo = util.Ten2Hex(time.Now().UnixNano())
+	}
+
+	userModel := &Model{}
+	userModel.UID = createUser.UID
+	if createUser.Name != "" {
+		userModel.Name = createUser.Name
+	} else {
+		appconfig, err := u.commonService.GetAppConfig()
+		if err != nil {
+			u.Error("获取应用配置失败！", zap.Error(err))
+			return nil, err
+		}
+		if appconfig != nil && appconfig.RegisterUserMustCompleteInfoOn == 1 {
+			userModel.Name = ""
+		} else {
+			userModel.Name = Names[rand.Intn(len(Names)-1)]
+		}
+	}
+	userModel.Sex = createUser.Sex
+	userModel.Vercode = fmt.Sprintf("%s@%d", util.GenerUUID(), common.User)
+	userModel.QRVercode = fmt.Sprintf("%s@%d", util.GenerUUID(), common.QRCode)
+	userModel.Phone = createUser.Phone
+	userModel.Zone = createUser.Zone
+	userModel.Email = createUser.Email
+	if createUser.Phone != "" {
+		userModel.Username = fmt.Sprintf("%s%s", createUser.Zone, createUser.Phone)
+	}
+	if createUser.Password != "" {
+		// 兜底校验：本函数是所有建号路径的共享出口，各 handler 已在入口校验过，
+		// 这里再挡一次，防止将来新增的调用方绕过复杂度策略（Web3 找回密码就曾因
+		// 只在单个 handler 里接校验而漏掉）。现有调用方要么传空密码
+		// （github/gitee/OIDC），要么传已校验过的值，因此这里不改变既有行为。
+		if err := ValidatePasswordStrength(createUser.Password); err != nil {
+			u.Error("建号口令不满足复杂度策略", zap.Error(err))
+			return nil, err
+		}
+		hashedPwd, hashErr := HashPassword(createUser.Password)
+		if hashErr != nil {
+			u.Error("密码哈希失败", zap.Error(hashErr))
+			return nil, hashErr
+		}
+		userModel.Password = hashedPwd
+	}
+	if createUser.Username != "" {
+		userModel.Username = createUser.Username
+	}
+
+	userModel.ShortNo = shortNo
+	userModel.OfflineProtection = 0
+	userModel.NewMsgNotice = 1
+	userModel.MsgShowDetail = 1
+	userModel.SearchByPhone = 1
+	userModel.SearchByShort = 1
+	userModel.VoiceOn = 1
+	userModel.ShockOn = 1
+	userModel.IsUploadAvatar = createUser.IsUploadAvatar
+	userModel.AvatarVersion = createUser.AvatarVersion
+	userModel.WXOpenid = createUser.WXOpenid
+	userModel.WXUnionid = createUser.WXUnionid
+	userModel.GiteeUID = createUser.GiteeUID
+	userModel.GithubUID = createUser.GithubUID
+	userModel.Status = int(common.UserAvailable)
+	err = u.db.insertTx(userModel, tx)
+	if err != nil {
+		u.Error("注册用户失败", zap.Error(err))
+		return nil, err
+	}
+	if createUser.Device != nil {
+		err = u.deviceDB.insertOrUpdateDeviceTx(&deviceModel{
+			UID:         createUser.UID,
+			DeviceID:    createUser.Device.DeviceID,
+			DeviceName:  createUser.Device.DeviceName,
+			DeviceModel: createUser.Device.DeviceModel,
+			LastLogin:   time.Now().Unix(),
+		}, tx)
+		if err != nil {
+			u.Error("添加用户设备信息失败", zap.Error(err))
+			return nil, err
+		}
+	}
+	err = u.addSystemFriend(createUser.UID)
+	if err != nil {
+		u.Error("添加注册用户和系统账号为好友关系失败", zap.Error(err))
+		return nil, err
+	}
+	err = u.addFileHelperFriend(createUser.UID)
+	if err != nil {
+		u.Error("添加注册用户和文件助手为好友关系失败", zap.Error(err))
+		return nil, err
+	}
+	// Space 模式下不再自动添加 BotFather 为好友
+	// Bot 通过 Space 成员关系自动可用
+	// err = u.addBotFatherFriend(createUser.UID)
+	// if err != nil {
+	// 	u.Warn("添加注册用户和BotFather为好友关系失败", zap.Error(err))
+	// }
+	inviteCode := ""
+	inviteUID := ""
+	vercode := ""
+	if invite != nil {
+		inviteCode = invite.InviteCode
+		inviteUID = invite.Uid
+		vercode = invite.Vercode
+	}
+	//发送用户注册事件
+	eventID, err := u.ctx.EventBegin(&wkevent.Data{
+		Event: event.EventUserRegister,
+		Type:  wkevent.Message,
+		Data: map[string]interface{}{
+			"uid":            createUser.UID,
+			"invite_code":    inviteCode,
+			"invite_uid":     inviteUID,
+			"invite_vercode": vercode,
+		},
+	}, tx)
+	if err != nil {
+		u.Error("开启事件失败！", zap.Error(err))
+		return nil, err
+	}
+
+	if commitCallback != nil {
+		if err := commitCallback(); err != nil {
+			return nil, err
+		}
+	}
+	u.ctx.EventCommit(eventID)
+	token := util.GenerUUID()
+	issueFence, err := beginUserSessionIssue(registerSpanCtx, u.sessionStore, userModel.UID)
+	if err != nil {
+		u.Error("初始化注册登录会话栅栏失败", zap.Error(err))
+		return nil, err
+	}
+	deviceID := ""
+	if createUser.Device != nil {
+		deviceID = createUser.Device.DeviceID
+	}
+	sessionInfo := auth.TokenInfo{
+		UID:        userModel.UID,
+		Name:       userModel.Name,
+		Role:       userModel.Role,
+		Language:   userModel.Language,
+		DeviceFlag: createUser.Flag,
+		DeviceID:   deviceID,
+	}
+	err = issueUserSession(registerSpanCtx, u.sessionStore, token, sessionInfo, issueFence)
+	if err != nil {
+		u.Error("设置token缓存失败！", zap.Error(err))
+		return nil, err
+	}
+	_, err = u.ctx.UpdateIMToken(config.UpdateIMTokenReq{
+		UID:         createUser.UID,
+		Token:       token,
+		DeviceFlag:  config.DeviceFlag(createUser.Flag),
+		DeviceLevel: config.DeviceLevelSlave,
+	})
+	if err != nil {
+		u.Error("更新IM的token失败！", zap.Error(err))
+		if revokeErr := u.compensateIssuedToken(token, userModel.UID, createUser.Flag); revokeErr != nil {
+			u.Error("补偿撤销注册新token失败！", zap.Error(revokeErr))
+		}
+		return nil, err
+	}
+	u.finishSuccessfulLogin(createUser.UID, userModel.Username, publicIP, createUser.auditLoginType())
+
+	if u.ctx.GetConfig().ShortNo.NumOn {
+		err = u.commonService.SetShortnoUsed(userModel.ShortNo, "user")
+		if err != nil {
+			u.Error("设置短编号被使用失败！", zap.Error(err), zap.String("shortNo", userModel.ShortNo))
+		}
+	}
+
+	resp := newLoginUserDetailResp(userModel, token, u.ctx)
+	u.applyRealnameToLoginResp(resp, userModel.UID)
+	return resp, nil
+}
+
+// ---------- vo ----------
+type createUserModel struct {
+	UID            string
+	Name           string
+	Zone           string
+	Phone          string
+	Email          string
+	Sex            int
+	Password       string
+	WXOpenid       string
+	WXUnionid      string
+	GiteeUID       string
+	GithubUID      string
+	Username       string
+	Flag           int
+	IsUploadAvatar int
+	AvatarVersion  int64
+	Device         *deviceReq
+	// LoginType records the external identity source when account creation is
+	// itself the first login. Empty means an ordinary registration.
+	LoginType string
+}
+
+func (m *createUserModel) auditLoginType() string {
+	if m == nil || m.LoginType == "" {
+		return "register"
+	}
+	return m.LoginType
+}
+
+// 重置登录密码
+type resetPwdReq struct {
+	Zone  string `json:"zone"`  //区号
+	Phone string `json:"phone"` //手机号
+	Code  string `json:"code"`  //验证码
+	Pwd   string `json:"pwd"`   //密码
+}
+type customerservicesResp struct {
+	UID  string `json:"uid"`
+	Name string `json:"name"`
+}
+type registerReq struct {
+	Name       string     `json:"name"`
+	Zone       string     `json:"zone"`
+	Phone      string     `json:"phone"`
+	Code       string     `json:"code"`
+	Password   string     `json:"password"`
+	Flag       uint8      `json:"flag"`        // 注册设备的标记 0.APP 1.PC
+	Device     *deviceReq `json:"device"`      //注册用户设备信息
+	InviteCode string     `json:"invite_code"` // 邀请码
+}
+
+func (r registerReq) CheckRegister() error {
+	if strings.TrimSpace(r.Name) == "" {
+		return errors.New("用户名不能为空！")
+	}
+	if err := ValidateName(r.Name); err != nil {
+		return err
+	}
+	if strings.TrimSpace(r.Zone) == "" {
+		return errors.New("区号不能为空！")
+	}
+	if strings.TrimSpace(r.Phone) == "" {
+		return errors.New("手机号不能为空！")
+	}
+	if strings.TrimSpace(r.Code) == "" {
+		return errors.New("验证码不能为空！")
+	}
+	if strings.TrimSpace(r.Password) == "" {
+		return errors.New("密码不能为空！")
+	}
+	return nil
+}
+
+// 设置聊天密码请求
+type chatPwdReq struct {
+	ChatPwd  string `json:"chat_pwd"`  //聊天密码
+	LoginPwd string `json:"login_pwd"` //登录密码
+}
+
+// 注册验证码请求
+type codeReq struct {
+	Zone  string `json:"zone"`
+	Phone string `json:"phone"`
+}
+type loginReq struct {
+	Username string     `json:"username"`
+	Password string     `json:"password"`
+	Flag     int        `json:"flag"`   // 设备标示 0.APP 1.PC
+	Device   *deviceReq `json:"device"` //登录设备信息
+}
+
+func (r loginReq) Check() error {
+	if strings.TrimSpace(r.Username) == "" {
+		return errors.New("用户名不能为空！")
+	}
+	if strings.TrimSpace(r.Password) == "" {
+		return errors.New("密码不能为空！")
+	}
+	return nil
+}
+
+type userResp struct {
+	UID     string `json:"uid"`
+	Name    string `json:"name"`
+	Vercode string `json:"vercode"`
+}
+
+func newUserResp(m *Model) userResp {
+	return userResp{
+		UID:     m.UID,
+		Name:    m.Name,
+		Vercode: m.Vercode,
+	}
+}
+
+type deviceReq struct {
+	DeviceID    string `json:"device_id"`    //设备唯一ID
+	DeviceName  string `json:"device_name"`  //设备名称
+	DeviceModel string `json:"device_model"` //设备model
+}
+
+type loginUserDetailResp struct {
+	UID             string  `json:"uid"`
+	AppID           string  `json:"app_id"`
+	Name            string  `json:"name"`
+	Username        string  `json:"username"`
+	Sex             int     `json:"sex"`               //性别1:男
+	Category        string  `json:"category"`          //用户分类 '客服'
+	ShortNo         string  `json:"short_no"`          // 用户唯一短编号
+	Zone            string  `json:"zone"`              //区号
+	Phone           string  `json:"phone"`             //手机号
+	Token           string  `json:"token"`             //token
+	ChatPwd         string  `json:"chat_pwd"`          //聊天密码
+	LockScreenPwd   string  `json:"lock_screen_pwd"`   // 锁屏密码
+	LockAfterMinute int     `json:"lock_after_minute"` // 在N分钟后锁屏
+	Setting         setting `json:"setting"`
+	RSAPublicKey    string  `json:"rsa_public_key"` // 应用公钥做一些消息验证 base64编码
+	ShortStatus     int     `json:"short_status"`
+	MsgExpireSecond int64   `json:"msg_expire_second"` // 消息过期时长
+	// Language 是用户语言偏好（BCP 47，空字符串表示"未显式设置，沿用 OCTO_DEFAULT_LANGUAGE"）。
+	// 客户端读到非空值时应当持久化到本地并随后续请求带 X-Octo-Lang / cookie；
+	// 读到空值时不要本地强行回填一个默认，避免覆盖服务端的"未设置"状态。
+	Language string `json:"language"`
+	// 注销状态提示：仅当账号处于冷静期（is_destroy=1）时下发
+	// DestroyStatus: 0=正常 1=注销申请中
+	// DestroyRemainingDays: 距到期还剩天数（向上取整，最小 0）
+	DestroyStatus        int   `json:"destroy_status,omitempty"`
+	DestroyRemainingDays int   `json:"destroy_remaining_days,omitempty"`
+	DestroyExpireAt      int64 `json:"destroy_expire_at,omitempty"` // Unix 秒
+	// YUJ-413: self 实名字段（必须下发，否则 Web/Android/iOS 三端 self 徽章和
+	// displayName 全部瞎 —— friend/sync、conversation/sync 对他人已下发同名字段，
+	// 这里补 self 路径）。
+	// 字段语义和 UserDetailResp 对齐：
+	//   RealnameVerified    - 是否已完成 OCTO 实名（user_verification 表有记录）
+	//   RealName            - 已认证时的权威姓名；未认证留空
+	//   RealnameVerifiedAt  - 实名完成时间(Unix 秒)；未认证为 0 并被 omitempty 剥离
+	RealnameVerified   bool   `json:"realname_verified"`
+	RealName           string `json:"real_name,omitempty"`
+	RealnameVerifiedAt int64  `json:"realname_verified_at,omitempty"`
+}
+
+type setting struct {
+	SearchByPhone     int `json:"search_by_phone"`    //是否可以通过手机号搜索0.否1.是
+	SearchByShort     int `json:"search_by_short"`    //是否可以通过短编号搜索0.否1.是
+	NewMsgNotice      int `json:"new_msg_notice"`     //新消息通知0.否1.是
+	MsgShowDetail     int `json:"msg_show_detail"`    //显示消息通知详情0.否1.是
+	VoiceOn           int `json:"voice_on"`           //声音0.否1.是
+	ShockOn           int `json:"shock_on"`           //震动0.否1.是
+	OfflineProtection int `json:"offline_protection"` //离线保护，断网屏保
+	DeviceLock        int `json:"device_lock"`        // 设备锁
+	MuteOfApp         int `json:"mute_of_app"`        // web登录 app是否静音
+}
+
+type blacklistResp struct {
+	UID      string `json:"uid"`
+	Name     string `json:"name"`
+	Username string `json:"usename"`
+}
+
+func newLoginUserDetailResp(m *Model, token string, ctx *config.Context) *loginUserDetailResp {
+
+	var destroyStatus, destroyRemainingDays int
+	var destroyExpireAt int64
+	if m.IsDestroy == IsDestroyApplying && m.DestroyExpireAt.Valid {
+		destroyStatus = IsDestroyApplying
+		destroyExpireAt = m.DestroyExpireAt.Time.Unix()
+		destroyRemainingDays = remainingDays(m.DestroyExpireAt.Time)
+	}
+
+	return &loginUserDetailResp{
+		DestroyStatus:        destroyStatus,
+		DestroyRemainingDays: destroyRemainingDays,
+		DestroyExpireAt:      destroyExpireAt,
+		UID:                  m.UID,
+		AppID:                m.AppID,
+		Name:                 m.Name,
+		Username:             m.Username,
+		Sex:                  m.Sex,
+		Category:             m.Category,
+		ShortNo:              m.ShortNo,
+		Zone:                 m.Zone,
+		Phone:                m.Phone,
+		Token:                token,
+		ChatPwd:              m.ChatPwd,
+		LockScreenPwd:        m.LockScreenPwd,
+		LockAfterMinute:      m.LockAfterMinute,
+		ShortStatus:          m.ShortStatus,
+		RSAPublicKey:         base64.StdEncoding.EncodeToString([]byte(ctx.GetConfig().AppRSAPubKey)),
+		MsgExpireSecond:      m.MsgExpireSecond,
+		Language:             m.Language,
+		Setting: setting{
+			SearchByPhone:     m.SearchByPhone,
+			SearchByShort:     m.SearchByShort,
+			NewMsgNotice:      m.NewMsgNotice,
+			MsgShowDetail:     m.MsgShowDetail,
+			VoiceOn:           m.VoiceOn,
+			ShockOn:           m.ShockOn,
+			OfflineProtection: m.OfflineProtection,
+			DeviceLock:        m.DeviceLock,
+			MuteOfApp:         m.MuteOfApp,
+		},
+	}
+}
+
+// applyRealnameToLoginResp 从 user_verification 表读取 self 实名字段并写入
+// login / current response。YUJ-413：/v1/user/login、GET /v1/user/current 必须下发
+// realname_verified / real_name / realname_verified_at 三字段，否则 Web/Android/iOS
+// 三端 self 徽章和 displayName 无法渲染（friend/sync、conversation/sync 对他人已
+// 下发同名字段，这里补齐 self 路径）。
+//
+// 语义：
+//   - 未实名 / 查询失败 → realname_verified=false，其它字段保持零值（被 omitempty 剥离）；
+//   - 已实名 → realname_verified=true，real_name 回填，verified_at 转 Unix 秒。
+//
+// 查询失败仅 warn 不阻断登录 —— 实名是增强信息，查询抖动不应让登录失败。
+func (u *User) applyRealnameToLoginResp(resp *loginUserDetailResp, uid string) {
+	if resp == nil || uid == "" {
+		return
+	}
+	vr, err := u.verificationDB.QueryByUID(uid)
+	if err != nil {
+		u.Warn("查询 self 实名认证记录失败", zap.Error(err), zap.String("uid", uid))
+		return
+	}
+	if vr == nil {
+		return
+	}
+	resp.RealnameVerified = true
+	resp.RealName = vr.RealName
+	if !vr.VerifiedAt.IsZero() {
+		resp.RealnameVerifiedAt = vr.VerifiedAt.Unix()
+	}
+}
+
+// applyRealnameToAuthCodeMap 往 loginWithAuthCode 的 map[string]interface{}
+// 响应里写三个实名字段（YUJ-413 R5 Blocking #2）。
+//
+// loginWithAuthCode 走的是手写 map（历史扫码登录协议保留了一组最小字段），
+// 不经过 newLoginUserDetailResp / applyRealnameToLoginResp，之前完全没有
+// 实名字段 —— 扫码登录进来的客户端永远拿不到 self 实名态。语义和
+// applyRealnameToLoginResp 对齐:
+//   - realname_verified 一律下发(true/false)，保留三态语义，key 存在即表示
+//     "服务器已表态"，缺失表示"数据链路有问题"。这是客户端 parser 的硬契约。
+//   - real_name / realname_verified_at 仅已实名时加（和 loginUserDetailResp
+//     的 omitempty 语义对齐）。
+//   - 查询失败只 warn 不阻断登录。
+func (u *User) applyRealnameToAuthCodeMap(m map[string]interface{}, uid string) {
+	if m == nil || uid == "" {
+		return
+	}
+	// 默认已先标 false，避免 DB 查询分支里忘记写默认值。
+	m["realname_verified"] = false
+	vr, err := u.verificationDB.QueryByUID(uid)
+	if err != nil {
+		u.Warn("auth-code 登录查询实名认证记录失败", zap.Error(err), zap.String("uid", uid))
+		return
+	}
+	if vr == nil {
+		return
+	}
+	m["realname_verified"] = true
+	if vr.RealName != "" {
+		m["real_name"] = vr.RealName
+	}
+	if !vr.VerifiedAt.IsZero() {
+		m["realname_verified_at"] = vr.VerifiedAt.Unix()
+	}
+}
+
+// ValidateName checks that a display name is non-blank and does not contain the
+// @ character, which is used as delimiter in token cache entries (uid@name@role).
+// Allowing @ in names would enable privilege escalation via role injection.
+//
+// 非空校验（需求模块3）：去除空白、控制字符、零宽/格式字符后无可见内容则拒绝。
+// ValidateName 是昵称写入的统一守门（注册、改名、管理员建/改号都经过它），
+// 第三方登录刻意绕开本函数，故此处加非空不影响第三方 nickname 为空的登录流程。
+func ValidateName(name string) error {
+	if isBlankName(name) {
+		return errors.New("名字不能为空！")
+	}
+	if strings.Contains(name, "@") {
+		return errors.New("名字不能包含@字符！")
+	}
+	return nil
+}
+
+// isBlankName 报告 name 去除所有空白、控制字符、Unicode 格式字符（零宽连接符、
+// BOM 等）后是否无可见内容。
+func isBlankName(name string) bool {
+	for _, r := range name {
+		switch {
+		case unicode.IsSpace(r): // 半角/全角空格、Tab、换行、不间断空格等
+		case unicode.Is(unicode.Cc, r): // 控制字符
+		case unicode.Is(unicode.Cf, r): // 格式字符：ZWSP/ZWNJ/ZWJ/BOM/WJ 等
+		default:
+			return false // 命中一个可见字符
+		}
+	}
+	return true
+}
+
+// ==================== Aegis OIDC Phase 2d — verify-token 翻译层 ====================
+
+// getVerifyTokenAegisURL 返回老 App 调 /v1/internal/verify-token 后我们要返回的跳转地址。
+//
+// OSS 部署者必须通过 OCTO_VERIFY_URL 环境变量配置自己的 Aegis/verify 服务入口。
+// 内部线上环境通过部署脚本注入对应值，不再硬编码到源码里。
+//
+// 为保持向后兼容（没设置 env 时行为），保留了原 Mininglamp 内部 URL 作为默认值 ——
+// 这样 internal dev / staging 不会因为漏配 env 而 regress。OSS release 流水线会通过
+// module_rewrites 把这个 default 改成 example.com。
+//
+// 注意:
+//   - URL 本身不再签 HMAC / JWT（YUJ-394），只是稳定代理一个地址。
+//   - return_to 必须是 dmwork:// 深链,不能是 https://,避免钓鱼。
+func getVerifyTokenAegisURL() string {
+	if v := os.Getenv("OCTO_VERIFY_URL"); v != "" {
+		return v
+	}
+	// Internal default for backward compat (pre-env config). OSS
+	// builds rewrite this string via octo-release module_rewrites.
+	return "https://accounts.example.com/profile/info?anchor=verification&return_to=octo://verified"
+}
+
+// verifyTokenAegisExpiresIn 老 App 合同里 expires_in 是秒数;Aegis URL 本身没有过期概念,
+// 但老 App 拿到后会在这个窗口内打开浏览器,保持 5 分钟这个历史默认值即可。
+const verifyTokenAegisExpiresIn = 300
+
+// verifyTokenAegisRedirect 是 /v1/internal/verify-token 的 Aegis 翻译层 handler。
+//
+// Phase 1 把该接口改成 410 Gone,导致老 App 点"去认证"直接报错;Phase 2d 恢复为翻译层:
+// 已登录用户请求 → 200 + {url: Aegis 账户页, expires_in: 300};
+// 未登录用户 → AuthMiddleware 自动拒 401。
+//
+// 与老 verify-service 版本的区别:
+//   - 不再签 5 分钟 JWT,URL 里没有任何用户态。
+//   - 不携带 HMAC 签名,只是一个稳定的公开 URL。
+//   - Aegis 页面自己走 OIDC session 识别用户,dmworkim 这边只负责把老 App 导过去。
+func (u *User) verifyTokenAegisRedirect(c *wkhttp.Context) {
+	// AuthMiddleware 已经保证未登录会被拒;这里再 double-check 一次 LoginUID,
+	// 避免将来有人不小心把中间件摘掉导致 return_to 泄露给匿名用户。
+	if strings.TrimSpace(c.GetLoginUID()) == "" {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "login required"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"url":        getVerifyTokenAegisURL(),
+		"expires_in": verifyTokenAegisExpiresIn,
+	})
+}
+
+// ==================== Auth Verify API (for Gateway / Microservices) ====================
+
+type authVerifyTokenReq struct {
+	Token string `json:"token"`
+}
+
+type ownedBot struct {
+	UID  string `json:"uid"`
+	Name string `json:"name"`
+}
+
+type authVerifyTokenResp struct {
+	UID       string     `json:"uid"`
+	Name      string     `json:"name"`
+	Role      string     `json:"role"`
+	OwnedBots []ownedBot `json:"owned_bots"`
+
+	// v3 §4.5 (fleet fail-closed signal): explicit flag set true when
+	// the caller passed ?include=context AND server is v2-or-later.
+	// Lets fleet/matter distinguish "server returned empty spaces (caller
+	// truly belongs to zero spaces)" from "pre-v2 server omitted the field
+	// because it doesn't speak the contract" — without this, both shapes
+	// look identical after omitempty erases empty []. Fleet uses this to
+	// pick fail-closed (v2) vs fallback (pre-v2) for X-Space-Id checks.
+	ContextIncluded bool `json:"context_included,omitempty"`
+
+	// Populated only when ?include=context. Kept as separate fields so the
+	// default response shape (UID/Name/Role/OwnedBots) is byte-identical to
+	// the pre-v2 contract — old IM clients and admin tools rely on the
+	// existing schema. fleet/matter middleware passes ?include=context to
+	// get these extra fields and stops reading the legacy OwnedBots list
+	// (which lacks per-space grouping).
+	Spaces           []string            `json:"spaces,omitempty"`
+	OwnedBotsBySpace map[string][]string `json:"owned_bots_by_space,omitempty"`
+}
+
+// authVerifyToken validates a user token and returns identity + owned bots.
+//
+// Query params:
+//   - include=context : also return spaces (server-validated space membership
+//     list) and owned_bots_by_space (map keyed by space_id, listing bot_uids
+//     the user owns in each space). fleet/matter middleware passes this to
+//     enforce X-Space-Id membership and per-handler bot ownership; older
+//     callers (IM, admin) omit the param and keep the original schema.
+func (u *User) authVerifyToken(c *wkhttp.Context) {
+	var req authVerifyTokenReq
+	if err := c.BindJSON(&req); err != nil {
+		u.Warn("authVerifyToken 请求体格式错误", zap.Error(err))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if req.Token == "" {
+		respondUserTokenRequired(c, "token")
+		return
+	}
+
+	info, validateErr := u.tokenValidator.Validate(c.Request.Context(), req.Token)
+	if validateErr != nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "invalid or expired token"})
+		return
+	}
+
+	resp := authVerifyTokenResp{
+		UID:       info.UID,
+		Name:      info.Name,
+		Role:      info.Role,
+		OwnedBots: make([]ownedBot, 0),
+	}
+
+	// Query owned bots: robot.creator_uid = uid
+	//
+	// v3.3.5 — load OwnedBots UNCONDITIONALLY (revert v3.3.4 N1).
+	//
+	// v3.3.4 attempted to skip this load on the `?include=context` path
+	// as a "pure latency win" — assuming context callers only consume
+	// the new `owned_bots_by_space` map. That assumption was wrong:
+	// matter's `applyUserResult` (internal/auth/middleware.go) builds
+	// `related_uids` from top-level `OwnedBots` regardless of
+	// `ContextIncluded`, and `related_uids` feeds the matter-access gate
+	// (`canAccessMatter` → `isCreator`/`HasAccess` with `CallerUIDs IN ?`).
+	// Emptying OwnedBots on the context path fail-closed web user access
+	// to matters created by the user's own bots (yujiawei v3.3.4 P1).
+	//
+	// If we ever want to do this optimization, it must be a coordinated
+	// PR that first migrates matter's applyUserResult to read
+	// `OwnedBotsBySpace` (flatten map values). See plan §9.
+	type botRow struct {
+		RobotID string `db:"robot_id"`
+		Name    string `db:"name"`
+	}
+	var bots []botRow
+	_, err := u.db.session.SelectBySql(
+		"SELECT r.robot_id, IFNULL(u.name,'') as name FROM robot r "+
+			"INNER JOIN `user` u ON r.robot_id = u.uid "+
+			"WHERE r.creator_uid = ? AND r.status = 1", resp.UID,
+	).Load(&bots)
+	if err == nil {
+		for _, b := range bots {
+			resp.OwnedBots = append(resp.OwnedBots, ownedBot{UID: b.RobotID, Name: b.Name})
+		}
+	}
+
+	// Opt-in: fleet/matter ask for full context to drive per-request
+	// authorization (X-Space-Id check + bot ownership check). On failure
+	// we leave the new fields empty rather than 500 — middleware will
+	// reject downstream authz that depends on them, which is safer than
+	// masking the issue.
+	if c.Query("include") == "context" {
+		spaces, ownedByspace, ctxErr := u.queryUserSpaceContext(resp.UID)
+		if ctxErr != nil {
+			u.Warn("authVerifyToken include=context 查询失败",
+				zap.Error(ctxErr), zap.String("uid", resp.UID))
+			spaces = []string{}
+			ownedByspace = map[string][]string{}
+		}
+		resp.ContextIncluded = true
+		resp.Spaces = spaces
+		resp.OwnedBotsBySpace = ownedByspace
+	}
+
+	c.Response(resp)
+}
+
+// queryUserSpaceContext fetches (spaces, owned_bots_by_space) for a user
+// in one round trip — two SELECTs but no N+1. Used by authVerifyToken when
+// ?include=context is set.
+//
+// Note: owned_bots are grouped by space_id via the bot's space_member row
+// (bot is itself a user; robot table has no space_id). Mirrors the join
+// pattern in botfather/db.go queryRobotsByCreatorUIDAndSpaceID.
+func (u *User) queryUserSpaceContext(uid string) ([]string, map[string][]string, error) {
+	// (1) spaces the user is an active member of.
+	//
+	// v3.3.1 §A.1 (Jerry-Xin Critical 三审): INNER JOIN space ON s.status=1
+	// closes the gap where a soft-deleted space (s.status=0) with a lingering
+	// active space_member row would otherwise surface in `spaces` and
+	// downstream `owned_bots_by_space`. Symmetric with the api_key path
+	// (verify-api-key step 2 + resolve.go assertSpaceMember) which v3 §2.3
+	// already hardened; this is the token-path call site v3 missed in
+	// the same function.
+	//
+	// v3.3.1 §A.2 (yujiawei P1 三审): silent-truncation guard. The previous
+	// LIMIT 100 with no over-fetch + no warn matched the bots query's pre-v3.2
+	// shape; v3.2 had hardened bots with LIMIT 1001 + warn but the symmetric
+	// spaces cap was missed in the same function. spaces feeds the same
+	// derived authz cache (owned_bots_by_space is whitelisted through this
+	// list), so truncation at the spaces side cascades into bots silently.
+	// Over-fetch to LIMIT 101, slice + warn when len > 100. ORDER BY makes
+	// LIMIT deterministic across calls (was random per MySQL engine choice).
+	type spaceRow struct {
+		SpaceID string `db:"space_id"`
+	}
+	const userSpacesLimit = 100
+	var spaceRows []spaceRow
+	_, err := u.db.session.SelectBySql(
+		`SELECT sm.space_id FROM space_member sm
+		 INNER JOIN space s ON s.space_id=sm.space_id AND s.status=1
+		 WHERE sm.uid=? AND sm.status=1
+		 ORDER BY sm.space_id
+		 LIMIT 101`,
+		uid,
+	).Load(&spaceRows)
+	if err != nil {
+		return nil, nil, err
+	}
+	spaces := make([]string, 0, len(spaceRows))
+	for _, r := range spaceRows {
+		spaces = append(spaces, r.SpaceID)
+	}
+	if len(spaces) > userSpacesLimit {
+		u.Warn("queryUserSpaceContext spaces truncated at policy limit",
+			zap.String("uid", uid),
+			zap.Int("limit", userSpacesLimit),
+			zap.Int("returned", len(spaces)))
+		spaces = spaces[:userSpacesLimit]
+	}
+
+	// (2) bots the user created, joined with each bot's space membership.
+	//
+	// v3.2 silent-truncation guard: LIMIT 1001 (not 1000) + warn log when
+	// the result count hits 1001. owned_bots_by_space is fed to fleet/matter
+	// as an authz primitive — silently dropping bots past the limit could
+	// produce "this user owns bot X but the authz cache says they don't",
+	// a notoriously hard-to-diagnose authz hole. We don't raise the limit
+	// (1000 is still the policy cap for one user's bots) but we make the
+	// truncation observable so ops can spot the rare power user hitting it.
+	// v3.3.1 §A.2 yujiawei P2: ORDER BY r.robot_id makes the truncated
+	// window deterministic across calls — same root cause as the spaces
+	// query above.
+	type botSpaceRow struct {
+		RobotID string `db:"robot_id"`
+		SpaceID string `db:"space_id"`
+	}
+	// Policy ceiling on owned (bot, space) PAIRS per user.
+	//
+	// v3.3.6 §P2#2 (yujiawei R2): the SQL below is `SELECT r.robot_id,
+	// sm.space_id FROM robot r INNER JOIN space_member sm ON sm.uid=
+	// r.robot_id` with NO DISTINCT/GROUP BY — a bot in N spaces yields
+	// N rows. The 1000 cap therefore truncates (bot, space) PAIRS, not
+	// distinct bots: a user with 600 bots × avg 2 spaces = 1200 pairs
+	// hits the cap despite owning only 600 distinct bots. Authz stays
+	// fail-safe (truncated pairs fall through to owner_uid SQL filters),
+	// but the metric is pair-count, not bot-count — keep this in mind
+	// when raising the limit or alerting on the warn below.
+	//
+	// Documented in the "Heads-up #2" section of the v3 PR comment
+	// (server PR #290). Raising this requires (a) confirming consumer
+	// side (fleet/matter middleware) handles a larger owned_bots_by_space
+	// payload and (b) updating the warn log threshold below.
+	const ownedBotsLimit = 1000
+	var botRows []botSpaceRow
+	_, err = u.db.session.SelectBySql(
+		`SELECT r.robot_id, sm.space_id FROM robot r
+		 INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.status=1
+		 WHERE r.creator_uid=? AND r.status=1
+		 ORDER BY r.robot_id
+		 LIMIT 1001`,
+		uid,
+	).Load(&botRows)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(botRows) > ownedBotsLimit {
+		// >1000 means we hit the cap. Truncate to the policy limit so
+		// downstream consumers see a deterministic size, but emit a warn
+		// so ops can react. Authz remains fail-safe (extra bots get no
+		// access via owned_bots_by_space; they fall through to the
+		// pre-v2 related_uids / SQL owner_uid filters). v3.3.6 §P2#2:
+		// the limit is on (bot, space) pairs — a bot in N spaces counts
+		// as N — distinct-bot count may be lower.
+		u.Warn("queryUserSpaceContext owned_bots truncated at policy limit",
+			zap.String("uid", uid),
+			zap.Int("pair_limit", ownedBotsLimit),
+			zap.Int("pairs_returned", len(botRows)),
+			zap.String("note", "limit is (bot,space) pairs, not distinct bots"))
+		botRows = botRows[:ownedBotsLimit]
+	}
+
+	// Initialize map with one bucket per known space so callers always see
+	// a stable map shape (even when a space has no owned bots). v3 §2.4
+	// (Jerry-Xin Critical 2 / yujiawei P2): the bot rows are looked up by
+	// the *bot's* membership only, so a bot the caller owns that also
+	// lives in a space the caller is NOT a member of would otherwise leak
+	// a foreign space_id into owned_bots_by_space (which would then
+	// disagree with the `spaces` list, breaking consumers that use
+	// owned_bots as a derived authz cache). Filter through a whitelist of
+	// the caller's *active* spaces from query (1) so the two fields stay
+	// in lockstep — the sibling queryOwnedBotsBySpace (api_key path) does
+	// this correctly via SQL `AND sm.space_id=?`; token path mirrors here
+	// at the Go layer because it iterates over many spaces.
+	validSpaces := make(map[string]struct{}, len(spaces))
+	ownedByspace := make(map[string][]string, len(spaces))
+	for _, sid := range spaces {
+		validSpaces[sid] = struct{}{}
+		ownedByspace[sid] = []string{}
+	}
+	for _, b := range botRows {
+		if _, ok := validSpaces[b.SpaceID]; ok {
+			ownedByspace[b.SpaceID] = append(ownedByspace[b.SpaceID], b.RobotID)
+		}
+	}
+	return spaces, ownedByspace, nil
+}
+
+type authVerifyBotReq struct {
+	BotToken string `json:"bot_token"`
+}
+
+type authVerifyBotResp struct {
+	BotUID    string `json:"bot_uid"`
+	BotName   string `json:"bot_name"`
+	OwnerUID  string `json:"owner_uid"`
+	OwnerName string `json:"owner_name"`
+	SpaceID   string `json:"space_id"`
+}
+
+// authVerifyBot validates a Bot token (BotFather Bearer token) and returns bot + owner info.
+func (u *User) authVerifyBot(c *wkhttp.Context) {
+	var req authVerifyBotReq
+	if err := c.BindJSON(&req); err != nil {
+		u.Warn("authVerifyBot 请求体格式错误", zap.Error(err))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if req.BotToken == "" {
+		respondUserTokenRequired(c, "bot_token")
+		return
+	}
+
+	// Query robot by bot_token
+	var botInfo struct {
+		RobotID    string `db:"robot_id"`
+		CreatorUID string `db:"creator_uid"`
+	}
+	err := u.db.session.Select("robot_id", "IFNULL(creator_uid,'') as creator_uid").
+		From("robot").
+		Where("bot_token = ? AND bot_token != '' AND status = 1", req.BotToken).
+		LoadOne(&botInfo)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"msg": "invalid bot token"})
+		return
+	}
+
+	// Get bot display name
+	botName := botInfo.RobotID
+	botUser, _ := u.userService.GetUser(botInfo.RobotID)
+	if botUser != nil {
+		botName = botUser.Name
+	}
+
+	// Get owner name
+	ownerName := ""
+	if botInfo.CreatorUID != "" {
+		ownerUser, _ := u.userService.GetUser(botInfo.CreatorUID)
+		if ownerUser != nil {
+			ownerName = ownerUser.Name
+		}
+	}
+
+	// Get bot's Space (first active space_member record)
+	var spaceID string
+	_ = u.db.session.Select("space_id").From("space_member").
+		Where("uid = ? AND status = 1", botInfo.RobotID).
+		OrderDir("created_at", false).
+		Limit(1).
+		LoadOne(&spaceID)
+
+	c.Response(authVerifyBotResp{
+		BotUID:    botInfo.RobotID,
+		BotName:   botName,
+		OwnerUID:  botInfo.CreatorUID,
+		OwnerName: ownerName,
+		SpaceID:   spaceID,
+	})
+}
+
+type authVerifyAPIKeyReq struct {
+	APIKey string `json:"api_key"`
+}
+
+type authVerifyAPIKeyResp struct {
+	UID     string `json:"uid"`
+	SpaceID string `json:"space_id"`
+
+	// v3 §4.5: same explicit signal as authVerifyTokenResp so fleet/matter
+	// pick fail-closed vs fallback consistently across token/api_key paths.
+	ContextIncluded bool                `json:"context_included,omitempty"`
+	OwnedBots       map[string][]string `json:"owned_bots,omitempty"` // populated only when ?include=context
+}
+
+// authVerifyAPIKey validates a daemon API key (uk_ prefix) and returns the
+// bound user + space. Used by fleet/matter AuthMiddleware to verify api_key
+// Bearer tokens (合并 plan §3).
+//
+// Query params:
+//   - include=context : also return owned_bots (single-space map keyed on the
+//     api_key's bound space). fleet/matter call with this; other callers do not.
+//     Absent param keeps the original {uid, space_id} schema for callers that
+//     do not need ownership data.
+func (u *User) authVerifyAPIKey(c *wkhttp.Context) {
+	var req authVerifyAPIKeyReq
+	if err := c.BindJSON(&req); err != nil {
+		u.Warn("authVerifyAPIKey 请求体格式错误", zap.Error(err))
+		respondUserRequestInvalid(c, "")
+		return
+	}
+	if req.APIKey == "" {
+		respondUserTokenRequired(c, "api_key")
+		return
+	}
+
+	// Step 1: lookup api_key, reject legacy space_id=''.
+	// status=1 / client_id='botfather' gate the post-main schema additions:
+	// status filters out revoked keys (status=0), and client_id restricts
+	// verify-api-key to native octo keys — integration-client keys
+	// (client_id != 'botfather') must not validate on the daemon path.
+	// Literals mirror user_api_key's active status + native client; the
+	// canonical botfather constants are unexported and the user package
+	// cannot import botfather (botfather -> user import cycle).
+	var keyInfo struct {
+		UID     string `db:"uid"`
+		SpaceID string `db:"space_id"`
+	}
+	_, err := u.db.session.Select("uid", "space_id").From("user_api_key").
+		Where("api_key=? AND space_id!='' AND status=? AND client_id=?", req.APIKey, 1, "botfather").
+		Load(&keyInfo)
+	if err != nil || keyInfo.UID == "" {
+		u.Warn("authVerifyAPIKey: api_key not resolvable", zap.Error(err))
+		respondUserAPIKeyInvalid(c)
+		return
+	}
+
+	// Step 2: assert owner still member of space (撤销 = 退 space, 同
+	// resolveAPIKey 现有语义). v3 §2.3 (Jerry-Xin Critical 1): also check
+	// space.status=1 — without this, an api_key whose space was disabled /
+	// soft-deleted (space.status=0) keeps verifying as long as the user's
+	// space_member row was left active. Mirrors modules/space/db.go's
+	// canonical membership pattern (s.status=1 + sm.status=1).
+	//
+	// v3.3.6 §P1 (yujiawei R2): also gate on user.status=1 to close the
+	// account-ban bypass. liftBanUser (api_manager.go:909) sets
+	// user.status=0 + ban IM channel + QuitUserDevice; the redis token
+	// cache clear handles session-token path, but daemon api_key sits
+	// behind no such cache — without this join, a globally banned user's
+	// daemon keeps a fully valid api_key. execLogin already gates
+	// userInfo.Status (api.go:1418); v3 verify-api-key sat behind no
+	// equivalent gate. assertSpaceMember (bot_provision/resolve.go) gets
+	// the symmetric fix to cover botToken + mintBot.
+	var n int
+	err = u.db.session.SelectBySql(
+		`SELECT COUNT(*) FROM space_member sm
+		 INNER JOIN space s ON s.space_id=sm.space_id AND s.status=1
+		 INNER JOIN `+"`user`"+` u ON u.uid=sm.uid AND u.status=1
+		 WHERE sm.space_id=? AND sm.uid=? AND sm.status=1`,
+		keyInfo.SpaceID, keyInfo.UID,
+	).LoadOne(&n)
+	if err != nil || n == 0 {
+		u.Warn("authVerifyAPIKey: api_key owner not a member of bound space", zap.Error(err))
+		respondUserAPIKeyInvalid(c)
+		return
+	}
+
+	resp := authVerifyAPIKeyResp{
+		UID:     keyInfo.UID,
+		SpaceID: keyInfo.SpaceID,
+	}
+
+	// Step 3 (opt-in): when ?include=context, fetch owned_bots for the bound
+	// space. Returned as a map for symmetry with /v1/auth/verify response,
+	// even though api_key is bound to exactly one space.
+	if c.Query("include") == "context" {
+		ownedBots, err := u.queryOwnedBotsBySpace(keyInfo.UID, keyInfo.SpaceID)
+		if err != nil {
+			u.Warn("authVerifyAPIKey owned_bots 查询失败", zap.Error(err), zap.String("uid", keyInfo.UID))
+			// Fail-secure: empty list rather than crash. Caller (fleet/matter
+			// middleware) will reject downstream ownership checks if expected
+			// bot is missing — better than masking the issue with a 500.
+			ownedBots = []string{}
+		}
+		resp.ContextIncluded = true
+		resp.OwnedBots = map[string][]string{
+			keyInfo.SpaceID: ownedBots,
+		}
+	}
+
+	c.Response(resp)
+}
+
+// queryOwnedBotsBySpace returns the bot_uids the user owns in the given
+// space. bot is itself a user, and its space membership lives in
+// space_member (robot table has no space_id). Mirrors the join pattern in
+// botfather/db.go queryRobotsByCreatorUIDAndSpaceID.
+//
+// v3.3.2 (yujiawei + Jerry-Xin R4 nit): same silent-truncation guard as
+// queryUserSpaceContext (v3.2 bots LIMIT 1001 + v3.3.1 §A.2 spaces
+// LIMIT 101). Over-fetch LIMIT 1001 + ORDER BY r.robot_id (deterministic
+// truncation window) + warn when len > 1000. Authz still fail-safe — a
+// truncated bot falls through to fleet/matter SQL owner_uid filters
+// downstream — but the warn surfaces the rare power user hitting the cap
+// instead of leaving the loss invisible.
+func (u *User) queryOwnedBotsBySpace(creatorUID, spaceID string) ([]string, error) {
+	type row struct {
+		RobotID string `db:"robot_id"`
+	}
+	const ownedBotsLimit = 1000
+	var rows []row
+	_, err := u.db.session.SelectBySql(
+		`SELECT r.robot_id FROM robot r
+		 INNER JOIN space_member sm ON sm.uid=r.robot_id AND sm.space_id=? AND sm.status=1
+		 WHERE r.creator_uid=? AND r.status=1
+		 ORDER BY r.robot_id
+		 LIMIT 1001`,
+		spaceID, creatorUID,
+	).Load(&rows)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.RobotID)
+	}
+	if len(out) > ownedBotsLimit {
+		u.Warn("queryOwnedBotsBySpace owned bots truncated at policy limit",
+			zap.String("uid", creatorUID),
+			zap.String("space_id", spaceID),
+			zap.Int("limit", ownedBotsLimit),
+			zap.Int("returned", len(out)))
+		out = out[:ownedBotsLimit]
+	}
+	return out, nil
+}

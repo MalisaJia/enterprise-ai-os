@@ -1,0 +1,22 @@
+{
+  "app": {
+    "name": "OCTO 管理后台"
+  },
+  "language": {
+    "label": "语言",
+    "en-US": "English",
+    "zh-CN": "简体中文"
+  },
+  "action": {
+    "search": "搜索",
+    "refresh": "刷新",
+    "confirm": "确认",
+    "cancel": "取消"
+  },
+  "column": {
+    "id": "ID"
+  },
+  "table": {
+    "total": "共 {{count}} 条"
+  }
+}

@@ -1,0 +1,15 @@
+node_modules/
+package-lock.json
+# Track lockfile for create-openclaw-octo so publish workflows' `npm ci` works.
+!create-openclaw-octo/package-lock.json
+dist/
+src/**/*.js
+src/**/*.js.map
+src/**/*.d.ts
+.env
+.env.*
+*.tgz
+.DS_Store
+.idea/
+.claude/
+TASK.md

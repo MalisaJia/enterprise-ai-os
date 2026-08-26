@@ -1,0 +1,41 @@
+//
+//  WKConversationChannelHeader.h
+//  WuKongBase
+//
+//  Created by tt on 2021/8/20.
+//
+
+#import <UIKit/UIKit.h>
+#import "WuKongBase.h"
+NS_ASSUME_NONNULL_BEGIN
+
+@interface WKConversationChannelHeader : UIView
+
+
+@property(nonatomic,strong) UIButton *voiceCallBtn;
+
+@property(nonatomic,strong) UIButton *videoCallBtn;
+
+@property(nonatomic,strong) UIButton *moreDotsBtn; // 三个点按钮（打开群组设置）
+
+@property(nonatomic,strong) UIButton *summaryBtn; // 智能总结入口 (sparkle), 群/私/子区都显示
+
+@property(nonatomic,assign) NSInteger memberCount; // 成员数量
+
+@property(nonatomic,strong) WKChannelInfo *channelInfo; // 频道信息
+
+@property(nonatomic,copy, nullable) NSString *subtitleText; // 副标题文本 (子区用 "来自: 群名")
+
+@property(nonatomic,copy) void(^onInfo)(void); // 资料信息被点击
+
+@property(nonatomic,copy) void(^onVoiceCall)(void); // 拨打语音
+@property(nonatomic,copy) void(^onVideoCall)(void); // 拨打视频
+@property(nonatomic,copy) void(^onSummary)(void);   // 发起智能总结
+
+- (void)viewConfigChange:(WKViewConfigChangeType)type;
+
+
+
+@end
+
+NS_ASSUME_NONNULL_END

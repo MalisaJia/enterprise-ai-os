@@ -1,0 +1,1326 @@
+package common
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/Mininglamp-OSS/octo-lib/config"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/util"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-lib/testutil"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestAddAppVersion_RequiresSuperAdmin pins the issue #363 gate: POST
+// /v1/common/appversion (sets the client download source — supply-chain
+// sensitive) must reject a plain admin and only let superAdmin through. The
+// denial goes through the generic forbidden envelope (anti-enumeration).
+func TestAddAppVersion_RequiresSuperAdmin(t *testing.T) {
+	// testutil.NewTestServer already registers every module's routes via
+	// module.Setup, so the appversion handler is live — don't call cn.Route
+	// (double registration panics). It also does not wire the i18n renderer, so
+	// mirror main.go here to get a populated error.code in the envelope.
+	s, ctx := testutil.NewTestServer()
+	defer testutil.CleanAllTables(ctx)
+	s.GetRoute().SetErrorRenderer(i18n.NewErrorRenderer(i18n.NewLocalizer(i18n.DefaultLanguage)))
+
+	cacheCfg := ctx.GetConfig().Cache
+	body := util.ToJson(&appVersionReq{
+		AppVersion:  "9.9",
+		OS:          "android",
+		DownloadURL: "http://example.com/x.apk",
+		IsForce:     1,
+		UpdateDesc:  "x",
+	})
+
+	// plain admin → rejected by the generic forbidden envelope
+	adminTok := "common-appver-admin"
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+adminTok, "admin-uid@admin@"+string(wkhttp.Admin)))
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/common/appversion", bytes.NewReader([]byte(body)))
+	req.Header.Set("token", adminTok)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Contains(t, w.Body.String(), "err.shared.auth.forbidden", "plain admin must be rejected: %s", w.Body.String())
+
+	// superAdmin → passes the role gate (downstream insert outcome is irrelevant
+	// to this assertion; we only prove the gate let it through)
+	superTok := "common-appver-superadmin"
+	require.NoError(t, ctx.Cache().Set(cacheCfg.TokenCachePrefix+superTok, "root-uid@root@"+string(wkhttp.SuperAdmin)))
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("POST", "/v1/common/appversion", bytes.NewReader([]byte(body)))
+	req2.Header.Set("token", superTok)
+	s.GetRoute().ServeHTTP(w2, req2)
+	assert.NotContains(t, w2.Body.String(), "err.shared.auth.forbidden", "superAdmin must pass the role gate: %s", w2.Body.String())
+}
+
+func cleanAllTablesAndReloadSettings(t *testing.T, ctx *config.Context) {
+	t.Helper()
+	require.NoError(t, testutil.CleanAllTables(ctx))
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
+// setStickerHandleRequiredSetting upserts system_setting sticker.handle_required
+// and reloads the shared snapshot. Enforcement policy lives in the DB (not env),
+// so tests write the row. Call AFTER cleanAllTablesAndReloadSettings (which wipes
+// system_setting).
+func setStickerHandleRequiredSetting(t *testing.T, ctx *config.Context, required bool) {
+	t.Helper()
+	v := "0"
+	if required {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("sticker", "handle_required", v, "bool").Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
+// setStickerCustomEnabledSetting upserts system_setting sticker.custom_enabled
+// and reloads the shared snapshot. This is the appconfig-facing display toggle
+// for custom sticker management.
+func setStickerCustomEnabledSetting(t *testing.T, ctx *config.Context, enabled bool) {
+	t.Helper()
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("sticker", "custom_enabled", v, "bool").Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
+// setDocsEnabledSetting upserts system_setting docs.enabled and reloads the
+// shared snapshot. This is the appconfig-facing display toggle for the docs
+// module (octo-docs-backend).
+func setDocsEnabledSetting(t *testing.T, ctx *config.Context, enabled bool) {
+	t.Helper()
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("docs", "enabled", v, "bool").Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
+// setDocsSearchEnabledSetting upserts system_setting docs.search_enabled and
+// reloads the shared snapshot. This is the appconfig-facing display toggle for
+// cloud-doc full-text search, decoupled from docs.enabled.
+func setDocsSearchEnabledSetting(t *testing.T, ctx *config.Context, enabled bool) {
+	t.Helper()
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("docs", "search_enabled", v, "bool").Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
+func TestAddVersion(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	f.Route(s.GetRoute())
+	//清除数据
+	cleanAllTablesAndReloadSettings(t, ctx)
+	w := httptest.NewRecorder()
+	model := &appVersionReq{
+		AppVersion:  "1.0",
+		OS:          "android",
+		DownloadURL: "http://www.githubim.com/download/test.apk",
+		IsForce:     1,
+		UpdateDesc:  "发布新版本",
+	}
+	req, _ := http.NewRequest("POST", "/v1/common/appversion", bytes.NewReader([]byte(util.ToJson(model))))
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestGetNewVersion(t *testing.T) {
+	t.Skip("OCTO migration TODO: see https://github.com/Mininglamp-OSS/octo-server/issues/17")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	//清除数据
+	cleanAllTablesAndReloadSettings(t, ctx)
+	_, err := f.db.insertAppVersion(&appVersionModel{
+		AppVersion:  "1.0",
+		OS:          "android",
+		DownloadURL: "http://www.githubim.com",
+		IsForce:     1,
+		UpdateDesc:  "发布新版本",
+	})
+	assert.NoError(t, err)
+
+	_, err = f.db.insertAppVersion(&appVersionModel{
+		AppVersion:  "1.2",
+		OS:          "android",
+		DownloadURL: "http://www.githubim.com",
+		IsForce:     1,
+		UpdateDesc:  "发布新版本",
+	})
+	assert.NoError(t, err)
+
+	f.Route(s.GetRoute())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appversion/android/1.2", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, true, strings.Contains(w.Body.String(), `"app_version":1.0`))
+}
+
+func TestGetAppConfig(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	//清除数据
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{
+		WelcomeMessage:                 "欢迎使用DMWork",
+		NewUserJoinSystemGroup:         1,
+		RegisterInviteOn:               1,
+		InviteSystemAccountJoinGroupOn: 1,
+		SendWelcomeMessageOn:           1,
+	})
+	assert.NoError(t, err)
+	//f.Route(s.GetRoute())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, true, strings.Contains(w.Body.String(), `"invite_system_account_join_group_on":1`))
+	// YUJ-219 / GH#1283: system_bot_uids 必须出现在 appconfig 响应里，
+	// 作为三端消除 SYSTEM_BOTS 硬编码漂移的单一真源。
+	body := w.Body.String()
+	assert.Contains(t, body, `"system_bot_uids":`)
+	assert.Contains(t, body, `"botfather"`)
+	assert.Contains(t, body, `"u_10000"`)
+	assert.Contains(t, body, `"fileHelper"`)
+}
+
+// YUJ-219 / GH#1283: 即使客户端带上相同 version 触发短路分支，
+// appconfig 也必须回吐 system_bot_uids，避免客户端升级后因 version 命中
+// 缓存短路永远拿不到新字段（旧客户端只跟 Version 走）。
+func TestGetAppConfig_SystemBotUIDsOnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	// 带一个极大 version 强制命中短路分支
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"system_bot_uids":`)
+	assert.Contains(t, body, `"botfather"`)
+	assert.Contains(t, body, `"u_10000"`)
+	assert.Contains(t, body, `"fileHelper"`)
+}
+
+// 消息搜索开关下发：search_enabled 与 messages_search_on 必须同源同值。
+// messages_search_on 是收敛后的真源 key（octo-web ChannelSearch 读它，与
+// octo-admin messages_search 命名一致），search_enabled 保留作向后兼容。
+// OCTO_SEARCH_BACKEND=es → 两者都为 true。
+func TestGetAppConfig_MessagesSearchOn_Enabled(t *testing.T) {
+	t.Setenv("OCTO_SEARCH_BACKEND", "es")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"messages_search_on":true`)
+	assert.Contains(t, body, `"search_enabled":true`)
+}
+
+// OCTO_SEARCH_BACKEND=disabled → messages_search_on 与 search_enabled 均为
+// false，前端据此隐藏 ChannelSearch 入口。
+func TestGetAppConfig_MessagesSearchOn_Disabled(t *testing.T) {
+	t.Setenv("OCTO_SEARCH_BACKEND", "disabled")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"messages_search_on":false`)
+	assert.Contains(t, body, `"search_enabled":false`)
+}
+
+// version 短路分支同样要下发 messages_search_on：老客户端命中版本短路也必须
+// 拿到当前开关，否则被缓存住失去实时性（与 search_enabled / disable_user_create_space
+// 同样的「与 app_config.version 解耦」约束）。
+func TestGetAppConfig_MessagesSearchOn_OnVersionShortCircuit(t *testing.T) {
+	t.Setenv("OCTO_SEARCH_BACKEND", "es")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"messages_search_on":true`)
+	assert.Contains(t, body, `"search_enabled":true`)
+}
+
+// appconfig 必须下发 disable_user_create_space：默认 0（缺 system_setting 行且
+// env 未设置）。客户端据此显示/隐藏「创建空间」入口；缺省必须保持开放。
+func TestGetAppConfig_DisableUserCreateSpace_DefaultsZero(t *testing.T) {
+	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"disable_user_create_space":0`)
+}
+
+// DB 写入 disable_user_create=1 时 appconfig 必须下发 1，admin 在管理台切换
+// 后客户端下次拉配置即可看到入口隐藏 —— 系统级 KV + Reload 路径的实时性保证。
+func TestGetAppConfig_DisableUserCreateSpace_DBOverride(t *testing.T) {
+	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+
+	settings := EnsureSystemSettings(ctx)
+	assert.NoError(t, settings.db.upsert("space", "disable_user_create", "1", settingTypeBool, ""))
+	assert.NoError(t, settings.Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"disable_user_create_space":1`)
+}
+
+// version 短路分支同样要下发 disable_user_create_space：老客户端命中版本
+// 短路也必须看到当前开关，否则被缓存住失去"实时调整"的能力（与 LocalLoginOff
+// 同样的"system_setting 与 app_config.version 解耦"约束）。
+func TestGetAppConfig_DisableUserCreateSpace_OnVersionShortCircuit(t *testing.T) {
+	t.Setenv("DM_SPACE_DISABLE_USER_CREATE", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+
+	settings := EnsureSystemSettings(ctx)
+	assert.NoError(t, settings.db.upsert("space", "disable_user_create", "1", settingTypeBool, ""))
+	assert.NoError(t, settings.Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"disable_user_create_space":1`)
+}
+
+// appconfig 必须下发 local_login_off：默认 0（缺 system_setting 行）。
+func TestGetAppConfig_LocalLoginOff_DefaultsZero(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"local_login_off":0`)
+}
+
+// system_setting login.local_off=1 + 第三方登录配置齐备时，appconfig 必须
+// 下发 local_login_off=1。OIDC 启用满足"第三方登录已配置"前置条件 —— 没有
+// 这一步 LocalLoginOff() 会触发安全回退强行返回 false,前端会继续渲染本地
+// 登录卡片。这条用例对齐"admin 在配齐 SSO 后才开关本地登录"的运维路径。
+func TestGetAppConfig_LocalLoginOff_DBOverride(t *testing.T) {
+	enableFullOIDCForTest(t)
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+
+	settings := EnsureSystemSettings(ctx)
+	assert.NoError(t, settings.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+	assert.NoError(t, settings.Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"local_login_off":1`)
+}
+
+// 版本号短路分支同样要下发 local_login_off：system_setting 与 app_config.version
+// 解耦，老客户端命中版本短路也必须看到当前开关，避免被缓存住。
+func TestGetAppConfig_LocalLoginOff_OnVersionShortCircuit(t *testing.T) {
+	enableFullOIDCForTest(t)
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+
+	settings := EnsureSystemSettings(ctx)
+	assert.NoError(t, settings.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+	assert.NoError(t, settings.Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"local_login_off":1`)
+}
+
+// PR #104 reviewer Jerry-Xin (P0 on commit 72e67c83): DM_OIDC_ENABLED 在
+// appconfig 三个 OIDC 出口(oidc_providers / oidc_account_url /
+// oidc_reset_password_url)上的解析必须与 LocalLoginOff() 安全回退完全一致,
+// 否则会出现"local_login_off=1 但 oidc_providers 为空"的前端死锁组合:
+// 前端按 local_login_off 隐藏本地登录卡片,又因 oidc_providers omitempty
+// 拿不到 SSO 入口,用户无路可走。
+//
+// 触发场景:DM_OIDC_ENABLED=T(或 True / TRUE 等 ParseBool 合法但非 "true"/
+// "1" 字面量) + 完整 OIDC + local_off=1。
+func TestGetAppConfig_OIDCProvidersHonoursParseBoolSpellings(t *testing.T) {
+	for _, spelling := range []string{"t", "T", "True", "TRUE"} {
+		t.Run(spelling, func(t *testing.T) {
+			enableFullOIDCForTest(t)
+			t.Setenv("DM_OIDC_ENABLED", spelling)
+
+			s, ctx := testutil.NewTestServer()
+			f := New(ctx)
+			cleanAllTablesAndReloadSettings(t, ctx)
+			err := f.appConfigDB.insert(&appConfigModel{})
+			assert.NoError(t, err)
+
+			settings := EnsureSystemSettings(ctx)
+			assert.NoError(t, settings.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+			assert.NoError(t, settings.Reload())
+
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+			req.Header.Set("token", testutil.Token)
+			s.GetRoute().ServeHTTP(w, req)
+			body := w.Body.String()
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.Contains(t, body, `"local_login_off":1`,
+				"DM_OIDC_ENABLED=%q + full OIDC + local_off=1 → 应下发 local_login_off=1", spelling)
+			assert.Contains(t, body, `"oidc_providers"`,
+				"同一个 DM_OIDC_ENABLED 值在 oidcEnabled() 与 isOIDCFullyConfigured() 必须解析一致,否则前端拿不到 SSO 入口")
+		})
+	}
+}
+
+// 安全回退在 appconfig 层同样要体现:DB 写了 local_off=1 但部署没配置任何
+// SSO 时,下发的 local_login_off 必须为 0,否则前端会隐藏本地登录卡片导致
+// 所有人都进不来。这条用例锁定"appconfig 返回的是 effective 值而不是 DB
+// 原始值"这个语义,与 LocalLoginOff() getter 的安全回退一致。
+func TestGetAppConfig_LocalLoginOff_SafetyOverrideWithoutSSO(t *testing.T) {
+	clearOIDCEnvForTest(t)
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	disableThirdPartyLoginForTest(t, ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+
+	settings := EnsureSystemSettings(ctx)
+	assert.NoError(t, settings.db.upsert("login", "local_off", "1", settingTypeBool, ""))
+	assert.NoError(t, settings.Reload())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"local_login_off":0`,
+		"无第三方登录配置 → 自动回退,前端继续显示本地登录")
+}
+
+func TestGetAppConfig_OIDCURLsExplicit(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	t.Setenv("DM_OIDC_ACCOUNT_URL", "https://accounts.example.com/")
+	t.Setenv("DM_OIDC_RESET_PASSWORD_URL", "https://accounts.example.com/reset")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, body, `"oidc_account_url":"https://accounts.example.com/"`)
+	assert.Contains(t, body, `"oidc_reset_password_url":"https://accounts.example.com/reset"`)
+}
+
+// 未显式配置 DM_OIDC_ACCOUNT_URL 时，回退到 issuer，避免重复维护两份 URL。
+func TestGetAppConfig_OIDCAccountURLFallsBackToIssuer(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	t.Setenv("DM_OIDC_ACCOUNT_URL", "")
+	t.Setenv("DM_OIDC_AEGIS_ISSUER", "https://accounts.imocto.cn")
+	t.Setenv("DM_OIDC_RESET_PASSWORD_URL", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, body, `"oidc_account_url":"https://accounts.imocto.cn"`)
+	assert.NotContains(t, body, "oidc_reset_password_url")
+}
+
+// 单 OIDC provider 元数据下发: provider id/name/authorize_path 让前端不再硬编码,
+// 接入新 IdP（Aegis/Google/...）时只改部署 env 即可,前端无需改代码。
+func TestGetAppConfig_OIDCProvidersWithCustomID(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	t.Setenv("DM_OIDC_PROVIDER_ID", "google")
+	t.Setenv("DM_OIDC_PROVIDER_NAME", "Google")
+	t.Setenv("DM_OIDC_ACCOUNT_URL", "https://accounts.google.com/")
+	t.Setenv("DM_OIDC_RESET_PASSWORD_URL", "https://accounts.google.com/signin/recovery")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, body, `"oidc_providers":[`)
+	assert.Contains(t, body, `"id":"google"`)
+	assert.Contains(t, body, `"name":"Google"`)
+	assert.Contains(t, body, `"authorize_path":"/v1/auth/oidc/google/authorize"`)
+	assert.Contains(t, body, `"account_url":"https://accounts.google.com/"`)
+	assert.Contains(t, body, `"reset_password_url":"https://accounts.google.com/signin/recovery"`)
+}
+
+// 未配置 PROVIDER_ID/NAME 时 provider 元数据回退到默认值,保证基础部署即可工作。
+func TestGetAppConfig_OIDCProvidersDefaults(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	t.Setenv("DM_OIDC_PROVIDER_ID", "")
+	t.Setenv("DM_OIDC_PROVIDER_NAME", "")
+	t.Setenv("DM_OIDC_AEGIS_ISSUER", "https://accounts.imocto.cn")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, body, `"id":"oidc"`)
+	assert.Contains(t, body, `"name":"SSO"`)
+	assert.Contains(t, body, `"authorize_path":"/v1/auth/oidc/oidc/authorize"`)
+}
+
+// account_url 仅配 PROVIDER_ISSUER (新 key,无 ACCOUNT_URL/AEGIS_ISSUER) 时也要回退,
+// 防止迁移到新 env 名后 account_url 变空。
+func TestGetAppConfig_OIDCAccountURLFallsBackToProviderIssuer(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	t.Setenv("DM_OIDC_ACCOUNT_URL", "")
+	t.Setenv("DM_OIDC_PROVIDER_ISSUER", "https://accounts.example.com")
+	t.Setenv("DM_OIDC_AEGIS_ISSUER", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, body, `"oidc_account_url":"https://accounts.example.com"`)
+	assert.Contains(t, body, `"account_url":"https://accounts.example.com"`)
+}
+
+// 畸形 PROVIDER_ID 不应进 authorize_path,common 模块独立校验确保即便
+// oidc 模块 LoadConfig 失败/未运行,appconfig 也不会下发坏值。
+func TestGetAppConfig_OIDCProvidersInvalidIDFallsBackToDefault(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "true")
+	t.Setenv("DM_OIDC_PROVIDER_ID", "bad/id")
+	t.Setenv("DM_OIDC_PROVIDER_NAME", "Bad")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, body, `"id":"oidc"`)
+	assert.NotContains(t, body, "bad/id")
+	assert.Contains(t, body, `"authorize_path":"/v1/auth/oidc/oidc/authorize"`)
+}
+
+// OIDC 关闭时 oidc_providers 整个不下发,与已有 oidc_account_url/reset 保持一致行为。
+func TestGetAppConfig_OIDCProvidersDisabledOmitted(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "false")
+	t.Setenv("DM_OIDC_PROVIDER_ID", "google")
+	t.Setenv("DM_OIDC_ACCOUNT_URL", "https://accounts.google.com/")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NotContains(t, body, "oidc_providers")
+}
+
+// OIDC 未启用时，即使 issuer/url 已配置也不下发，避免误导前端。
+func TestGetAppConfig_OIDCDisabledOmitsAll(t *testing.T) {
+	t.Setenv("DM_OIDC_ENABLED", "false")
+	t.Setenv("DM_OIDC_ACCOUNT_URL", "https://accounts.example.com/")
+	t.Setenv("DM_OIDC_AEGIS_ISSUER", "https://accounts.imocto.cn")
+	t.Setenv("DM_OIDC_RESET_PASSWORD_URL", "https://accounts.example.com/reset")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NotContains(t, body, "oidc_account_url")
+	assert.NotContains(t, body, "oidc_reset_password_url")
+}
+
+// YUJ-219-A / GH#1283 (analysis-report.md §4.2)：
+// appconfig 下发 system_bot_uids，三端以后端 pkg/space.SystemBots 为单一真源，
+// 替代各端硬编码（Android 只有 "botfather"、iOS 只有 botfatherUID）。
+func TestGetAppConfig_SystemBotUIDsDownstreamed(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	body := w.Body.String()
+	assert.Equal(t, http.StatusOK, w.Code)
+	// 单一真源：后端 pkg/space.SystemBots 里的三个 UID 必须全部出现。
+	assert.Contains(t, body, `"system_bot_uids":`)
+	assert.Contains(t, body, `"botfather"`)
+	assert.Contains(t, body, `"fileHelper"`)
+	assert.Contains(t, body, `"u_10000"`)
+}
+
+// appconfig 必须下发 sticker_handle_required：值来源于 system_setting
+// sticker.handle_required（SystemSettings.StickerHandleRequired），与 OCTO_MASTER_KEY
+// 能力解耦。默认（无该行）为 false，老客户端据此知道无需携带 handle。
+func TestGetAppConfig_StickerHandleRequired_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx) // wipes system_setting → handle_required absent → false
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_handle_required":false`)
+}
+
+// system_setting sticker.handle_required=true → appconfig 下发 true，客户端据此强制带 handle。
+func TestGetAppConfig_StickerHandleRequired_True(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerHandleRequiredSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_handle_required":true`)
+}
+
+// version 短路分支同样要下发 sticker_handle_required：老客户端命中版本短路也必须
+// 拿到当前策略，否则被本地缓存住失去实时性（与 messages_search_on 同样的解耦约束）。
+func TestGetAppConfig_StickerHandleRequired_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerHandleRequiredSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_handle_required":true`)
+}
+
+// appconfig 必须下发 sticker_custom_enabled：值来源于 system_setting
+// sticker.custom_enabled。默认 false,客户端据此隐藏自定义贴纸管理入口。
+func TestGetAppConfig_StickerCustomEnabled_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_custom_enabled":false`)
+}
+
+// system_setting sticker.custom_enabled=true → appconfig 下发 true，客户端展示自定义贴纸管理入口。
+func TestGetAppConfig_StickerCustomEnabled_True(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerCustomEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_custom_enabled":true`)
+}
+
+// version 短路分支同样要下发 sticker_custom_enabled：展示开关需要与
+// app_config.version 解耦，避免 admin 切换后老客户端命中版本短路而继续使用旧值。
+func TestGetAppConfig_StickerCustomEnabled_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerCustomEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"sticker_custom_enabled":true`)
+}
+
+func TestGetAppConfig_MessageReactionCapability(t *testing.T) {
+	tests := []struct {
+		name      string
+		dbRead    *bool
+		dbWrite   *bool
+		version   string
+		wantRead  bool
+		wantWrite bool
+	}{
+		{name: "unset defaults read only", wantRead: true, wantWrite: false},
+		{name: "DB overrides read and write independently", dbRead: boolPtr(false), dbWrite: boolPtr(true), wantRead: false, wantWrite: true},
+		{name: "version short circuit keeps current capability", version: "99999999", wantRead: true, wantWrite: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, ctx := testutil.NewTestServer()
+			f := New(ctx)
+			cleanAllTablesAndReloadSettings(t, ctx)
+			if tt.dbRead != nil {
+				setMessageReactionCapabilitySetting(t, ctx, "read", *tt.dbRead)
+			}
+			if tt.dbWrite != nil {
+				setMessageReactionCapabilitySetting(t, ctx, "write", *tt.dbWrite)
+			}
+			require.NoError(t, f.appConfigDB.insert(&appConfigModel{}))
+
+			path := "/v1/common/appconfig"
+			if tt.version != "" {
+				path += "?version=" + tt.version
+			}
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest(http.MethodGet, path, nil)
+			s.GetRoute().ServeHTTP(w, req)
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			var resp struct {
+				MessageReaction struct {
+					Read  bool `json:"read"`
+					Write bool `json:"write"`
+				} `json:"message_reaction"`
+			}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			assert.Equal(t, tt.wantRead, resp.MessageReaction.Read)
+			assert.Equal(t, tt.wantWrite, resp.MessageReaction.Write)
+		})
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+func setMessageReactionCapabilitySetting(t *testing.T, ctx *config.Context, key string, enabled bool) {
+	t.Helper()
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values("message_reaction", key, v, settingTypeBool).Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
+// appconfig 必须下发 docs_on：值来源于 system_setting docs.enabled。默认 false，
+// 客户端据此隐藏 docs 模块入口（octo-docs-backend 上线前）。
+func TestGetAppConfig_DocsOn_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"docs_on":false`)
+}
+
+// system_setting docs.enabled=true → appconfig 下发 true，客户端展示 docs 模块入口。
+func TestGetAppConfig_DocsOn_True(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setDocsEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"docs_on":true`)
+}
+
+// version 短路分支同样要下发 docs_on：展示开关需与 app_config.version 解耦，
+// 避免 admin 切换后老客户端命中版本短路而继续使用旧值。
+func TestGetAppConfig_DocsOn_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setDocsEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"docs_on":true`)
+}
+
+// appconfig 必须下发 docs_search_on：值来源于 system_setting docs.search_enabled。
+// 默认 false，与 docs_on 解耦，客户端据此隐藏云文档搜索 tab（搜索端点就绪前）。
+func TestGetAppConfig_DocsSearchOn_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"docs_search_on":false`)
+}
+
+// system_setting docs.search_enabled=true → appconfig 下发 true。与 docs.enabled 解耦：
+// 只开 docs.search_enabled 不开 docs.enabled 时，docs_search_on=true 而 docs_on=false。
+func TestGetAppConfig_DocsSearchOn_True_Independent(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setDocsSearchEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"docs_search_on":true`)
+	assert.Contains(t, w.Body.String(), `"docs_on":false`)
+}
+
+// version 短路分支同样要下发 docs_search_on（展示开关与 app_config.version 解耦）。
+func TestGetAppConfig_DocsSearchOn_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setDocsSearchEnabledSetting(t, ctx, true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"docs_search_on":true`)
+}
+
+// reloads the shared snapshot. Generic sibling of setDocsEnabledSetting for the
+// dmloop / dmpersonal launch flags. Call AFTER cleanAllTablesAndReloadSettings.
+func setModuleEnabledSetting(t *testing.T, ctx *config.Context, category string, enabled bool) {
+	t.Helper()
+	v := "0"
+	if enabled {
+		v = "1"
+	}
+	_, err := ctx.DB().InsertInto("system_setting").
+		Columns("category", "key_name", "value", "value_type").
+		Values(category, "enabled", v, "bool").Exec()
+	require.NoError(t, err)
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
+// appconfig 必须下发 dmloop_on / dmpersonal_on:值来源于 system_setting dmloop.enabled /
+// dmpersonal.enabled。默认 false,客户端据此隐藏「回路」「我的/运行时」入口(后端服务上线前)。
+func TestGetAppConfig_LoopFlags_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"dmloop_on":false`)
+	assert.Contains(t, w.Body.String(), `"dmpersonal_on":false`)
+}
+
+// 两个开关独立:dmloop.enabled=true 只放开「回路」,dmpersonal 保持默认关。
+func TestGetAppConfig_DmloopOn_TrueIndependentOfPersonal(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "dmloop", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"dmloop_on":true`)
+	assert.Contains(t, w.Body.String(), `"dmpersonal_on":false`)
+}
+
+// dmpersonal.enabled=true 只放开「我的/运行时」,dmloop 保持默认关(证明两开关解耦)。
+func TestGetAppConfig_DmpersonalOn_TrueIndependentOfLoop(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "dmpersonal", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"dmpersonal_on":true`)
+	assert.Contains(t, w.Body.String(), `"dmloop_on":false`)
+}
+
+// version 短路分支同样下发两开关:展示开关须与 app_config.version 解耦,避免 admin 切换后
+// 老客户端命中版本短路而继续用旧值(同 docs_on)。
+func TestGetAppConfig_LoopFlags_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "dmloop", true)
+	setModuleEnabledSetting(t, ctx, "dmpersonal", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"dmloop_on":true`)
+	assert.Contains(t, w.Body.String(), `"dmpersonal_on":true`)
+}
+
+// appconfig 必须下发 tracking_enabled:值来源于 system_setting tracking.enabled。默认 false,
+// 埋点层随发布上线但静默(fail-closed),octo-web 只有拿到此字段为真才开始采集。
+func TestGetAppConfig_TrackingEnabled_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"tracking_enabled":false`)
+}
+
+// system_setting tracking.enabled=true → appconfig 下发 true,客户端开始埋点采集。
+func TestGetAppConfig_TrackingEnabled_True(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "tracking", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"tracking_enabled":true`)
+}
+
+// version 短路分支同样要下发 tracking_enabled:采集开关须与 app_config.version 解耦,
+// 避免运维切换后老客户端命中版本短路而继续用旧值(同 docs_on)。
+func TestGetAppConfig_TrackingEnabled_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "tracking", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"tracking_enabled":true`)
+}
+
+// 客户端据此隐藏网盘(drive)模块入口（独立部署的 octo-drive 上线前）。
+func TestGetAppConfig_DriveOn_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"drive_on":false`)
+}
+
+// system_setting drive.enabled=true → appconfig 下发 true，客户端展示网盘入口；
+// docs_on 保持默认关，证明两个模块开关互不派生。
+func TestGetAppConfig_DriveOn_TrueIndependentOfDocs(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "drive", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"drive_on":true`)
+	assert.Contains(t, w.Body.String(), `"docs_on":false`)
+}
+
+// version 短路分支同样下发 drive_on：展示开关须与 app_config.version 解耦，避免 admin
+// 切换后老客户端命中版本短路而继续用旧值(同 docs_on)。
+func TestGetAppConfig_DriveOn_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "drive", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"drive_on":true`)
+}
+
+// Agent Mail 展示开关默认关闭，客户端据此隐藏邮件入口。
+func TestGetAppConfig_MailOn_DefaultFalse(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"mail_on":false`)
+}
+
+// system_setting mail.enabled=true 后，appconfig 下发 mail_on=true。
+func TestGetAppConfig_MailOn_True(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "mail", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"mail_on":true`)
+}
+
+// version 短路分支也必须下发实时 mail_on，避免 app_config.version 缓存阻止开关生效。
+func TestGetAppConfig_MailOn_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setModuleEnabledSetting(t, ctx, "mail", true)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"mail_on":true`)
+}
+
+// setStickerUploadLimitsSettings upserts the three sticker upload knobs
+// (size KB / max dim / allowed formats CSV) and reloads the shared snapshot.
+// Passing "" for any of them skips writing that row so tests can exercise the
+// "default when unset" branch selectively. Call AFTER cleanAllTablesAndReloadSettings.
+func setStickerUploadLimitsSettings(t *testing.T, ctx *config.Context, sizeKB, maxDim, allowedCSV string) {
+	t.Helper()
+	if sizeKB != "" {
+		_, err := ctx.DB().InsertInto("system_setting").
+			Columns("category", "key_name", "value", "value_type").
+			Values("sticker", "upload_max_size_kb", sizeKB, "int").Exec()
+		require.NoError(t, err)
+	}
+	if maxDim != "" {
+		_, err := ctx.DB().InsertInto("system_setting").
+			Columns("category", "key_name", "value", "value_type").
+			Values("sticker", "upload_max_dimension", maxDim, "int").Exec()
+		require.NoError(t, err)
+	}
+	if allowedCSV != "" {
+		_, err := ctx.DB().InsertInto("system_setting").
+			Columns("category", "key_name", "value", "value_type").
+			Values("sticker", "upload_allowed_formats", allowedCSV, "string").Exec()
+		require.NoError(t, err)
+	}
+	require.NoError(t, EnsureSystemSettings(ctx).Reload())
+}
+
+// appconfig 必须下发 sticker_upload_* 上限。未配置时 = SystemSettings 侧默认
+// (1024 KB / 512 px / 全 5 位图),与 PR #544 之前的历史硬编码严格等价。客户端
+// 据此做本地预校验,失败时提示用户"最大 X MB / X px / 支持 gif/png/..."。
+func TestGetAppConfig_StickerUploadLimits_DefaultsMatchHistoricalHardcoded(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx) // wipes system_setting → 3 keys absent → defaults served
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	// 嵌套 struct 序列化顺序 = 定义顺序(max_size_kb → max_dimension → allowed_formats),
+	// 因此可以整段字符串匹配。allowed_formats 未配置回退默认 5 位图,顺序 =
+	// stickerUploadRasterAllowlist 定义顺序。
+	assert.Contains(t, body, `"sticker_upload_limits":{"max_size_kb":1024,"max_dimension":512,"allowed_formats":[".gif",".png",".jpg",".jpeg",".webp"]}`)
+}
+
+// 运营在管理台把 3 个上限都放宽/收窄 → appconfig 下发新值(客户端本地预校验
+// 立刻跟随)。同时验证 allowed_formats CSV 归一化(小写、加点、去空格、去重、
+// 非位图丢弃、按输入 CSV 顺序保留)在下发字段里成立。
+func TestGetAppConfig_StickerUploadLimits_DBOverrideServed(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerUploadLimitsSettings(t, ctx, "3072", "900", "PNG, gif , mp4") // mp4 非位图会被读侧丢弃
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	// 归一化:PNG→.png,gif→.gif,mp4 丢弃;顺序按输入 CSV 保留(稳定,便于
+	// 客户端展示/日志用),下发就是 [".png",".gif"]。
+	assert.Contains(t, body, `"sticker_upload_limits":{"max_size_kb":3072,"max_dimension":900,"allowed_formats":[".png",".gif"]}`)
+}
+
+// version 短路分支同样要下发 sticker_upload_limits:运维在管理台调整后老客户端
+// 命中版本短路也必须拿到最新值,否则被本地缓存住失去实时性(与 StickerHandleRequired
+// / DocsOn 同样的解耦约束)。
+func TestGetAppConfig_StickerUploadLimits_OnVersionShortCircuit(t *testing.T) {
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	setStickerUploadLimitsSettings(t, ctx, "3072", "900", "png,jpg")
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"sticker_upload_limits":{"max_size_kb":3072,"max_dimension":900,"allowed_formats":[".png",".jpg"]}`)
+}
+
+// appconfig 必须下发 octo_assistant_uids:env 未设时返回空数组(不是 null,前端
+// Array.isArray 判断一致)。前端据此判别 octo_assistant_opened vs app_opened。
+func TestGetAppConfig_OctoAssistantUIDs_DefaultEmpty(t *testing.T) {
+	t.Setenv("DM_OCTO_ASSISTANT_UIDS", "")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"octo_assistant_uids":[]`)
+}
+
+// env DM_OCTO_ASSISTANT_UIDS 设值后 appconfig 下发解析后的 UID 数组。
+func TestGetAppConfig_OctoAssistantUIDs_EnvSet(t *testing.T) {
+	t.Setenv("DM_OCTO_ASSISTANT_UIDS", "uid-octo-1,uid-octo-2")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"octo_assistant_uids":["uid-octo-1","uid-octo-2"]`)
+}
+
+// env 含空串(连续逗号/前后空格)时过滤掉空串,只下发有效 UID。
+func TestGetAppConfig_OctoAssistantUIDs_FiltersEmpty(t *testing.T) {
+	t.Setenv("DM_OCTO_ASSISTANT_UIDS", "uid-1,, uid-2 ,")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	body := w.Body.String()
+	assert.Contains(t, body, `"octo_assistant_uids":["uid-1","uid-2"]`)
+}
+
+// version 短路分支同样要下发 octo_assistant_uids:UID 列表需与 app_config.version
+// 解耦,避免运维调整后老客户端命中版本短路而继续用旧值(同 tracking_enabled)。
+func TestGetAppConfig_OctoAssistantUIDs_OnVersionShortCircuit(t *testing.T) {
+	t.Setenv("DM_OCTO_ASSISTANT_UIDS", "uid-octo-1")
+	s, ctx := testutil.NewTestServer()
+	f := New(ctx)
+	cleanAllTablesAndReloadSettings(t, ctx)
+	err := f.appConfigDB.insert(&appConfigModel{})
+	assert.NoError(t, err)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/common/appconfig?version=99999999", nil)
+	req.Header.Set("token", testutil.Token)
+	s.GetRoute().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"octo_assistant_uids":["uid-octo-1"]`)
+}

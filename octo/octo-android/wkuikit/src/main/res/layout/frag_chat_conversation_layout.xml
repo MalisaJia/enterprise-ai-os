@@ -1,0 +1,246 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   · 根节点从 LinearLayout 升级为 FrameLayout，支持在会话列表之上叠加
+  Space 切换 Loading Overlay（对照 iOS `pendingSpaceSwitchLoad` + spinner 行为）。
+  原 LinearLayout 结构整体作为 FrameLayout 第一个子节点保留，内部 id 一律不变，
+  ViewBinding 生成的字段访问保持向后兼容。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@drawable/title_bg"
+        android:orientation="vertical"
+        android:paddingTop="40dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:gravity="center_vertical">
+
+        <LinearLayout
+            android:id="@+id/spaceHeaderLayout"
+            android:layout_width="wrap_content"
+            android:layout_height="40dp"
+            android:layout_marginStart="15dp"
+            android:background="@drawable/bg_space_capsule"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="4dp"
+            android:paddingEnd="12dp">
+
+            <TextView
+                android:id="@+id/spaceAvatarTv"
+                android:layout_width="32dp"
+                android:layout_height="32dp"
+                android:background="@drawable/bg_space_avatar"
+                android:gravity="center"
+                android:textColor="@color/white"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <TextSwitcher
+                android:id="@+id/textSwitcher"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:measureAllChildren="false"
+                android:inAnimation="@anim/ts_in_anim"
+                android:outAnimation="@anim/ts_out_anim"
+                android:tag="-1" />
+
+            <ImageView
+                android:id="@+id/spaceChevronIv"
+                android:layout_width="14dp"
+                android:layout_height="14dp"
+                android:layout_marginStart="4dp"
+                android:src="@drawable/ic_chevron_down"
+                android:visibility="gone" />
+
+        </LinearLayout>
+
+        <View
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1" />
+
+        <LinearLayout
+            android:id="@+id/signalLayout"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="16dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <ImageView
+                android:id="@+id/signalIv"
+                android:layout_width="16dp"
+                android:layout_height="14dp"
+                android:src="@drawable/ic_signal_bars" />
+
+            <TextView
+                android:id="@+id/latencyTv"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="4dp"
+                android:textColor="@color/popupTextColor"
+                android:textSize="11sp" />
+
+        </LinearLayout>
+
+        <FrameLayout
+            android:id="@+id/deviceLayout"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:layout_marginEnd="16dp"
+            android:visibility="gone">
+
+            <androidx.appcompat.widget.AppCompatImageView
+                android:id="@+id/deviceIv"
+                android:layout_width="24dp"
+                android:layout_height="24dp"
+                android:layout_gravity="center"
+                android:src="@drawable/ic_monitor_online" />
+
+            <View
+                android:id="@+id/deviceOnlineDot"
+                android:layout_width="8dp"
+                android:layout_height="8dp"
+                android:layout_gravity="top|end"
+                android:layout_marginTop="-1dp"
+                android:layout_marginEnd="-1dp"
+                android:background="@drawable/bg_online_dot" />
+        </FrameLayout>
+
+        <androidx.appcompat.widget.AppCompatImageView
+            android:id="@+id/rightIv"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:layout_marginEnd="15dp"
+            android:src="@mipmap/msg_add"
+            android:tint="@color/popupTextColor" />
+    </LinearLayout>
+
+    <FrameLayout
+        android:id="@+id/chatSearchBarLayout"
+        android:layout_width="match_parent"
+        android:layout_height="36dp"
+        android:layout_marginStart="15dp"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="15dp"
+        android:layout_marginBottom="4dp"
+        android:background="@drawable/bg_contacts_search_bar">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_vertical"
+            android:layout_marginStart="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <ImageView
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:src="@mipmap/ic_ab_search"
+                android:tint="#999999" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:text="@string/str_search"
+                android:textColor="#999999"
+                android:textSize="14sp" />
+        </LinearLayout>
+    </FrameLayout>
+
+    <FrameLayout
+        android:id="@+id/segmentTabContainer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="15dp"
+        android:paddingEnd="15dp"
+        android:paddingTop="2dp"
+        android:paddingBottom="2dp"
+        android:background="@color/homeColor" />
+
+    <androidx.viewpager2.widget.ViewPager2
+        android:id="@+id/conversationPager"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/homeColor" />
+
+    </LinearLayout>
+
+    <!--
+       · Space 切换 Loading Overlay。仅在 performSpaceSwitch 期间显示，
+      半透明遮挡列表旧内容（避免空列表 + 闪烁）。sync 完成 / 首帧 sortMsg 回来立即
+      隐藏；5s 仍未回来则显示 fallback 文案，提示用户不是 App 卡死。
+
+       Phase 2 调整：
+        - 按 Yu 授权在 overlay 主位置显示「正在同步 [Space Name]…」主文案（spaceSwitchOverlayPrimaryTv）
+          代替原先 5s 前纯 spinner 的视觉，让用户立刻知道切换已触发且在同步。
+        - 非阻塞（clickable=false / focusable=false）：Yu 明确要求 UX 不锁输入；
+          注意 performSpaceSwitch 执行期间底下列表已 setList(empty)，空列表无可误触的行，
+          tab / header 等控件允许用户继续交互（含再次切 Space，由 SpaceSyncCoordinator debounce 兜底）。
+        - 背景从 #99000000 降到 #4D000000（30% 黑），强化「提示而非阻断」的视觉语义。
+    -->
+    <FrameLayout
+        android:id="@+id/spaceSwitchOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#4D000000"
+        android:clickable="false"
+        android:focusable="false"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:gravity="center"
+            android:orientation="vertical">
+
+            <ProgressBar
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:indeterminate="true"
+                android:indeterminateTint="@color/white" />
+
+            <!--  Phase 2 · 主文案：始终显示「正在同步「<space name>」…」 -->
+            <TextView
+                android:id="@+id/spaceSwitchOverlayPrimaryTv"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:gravity="center"
+                android:maxWidth="260dp"
+                android:textColor="@color/white"
+                android:textSize="14sp"
+                tools:text="正在同步「测试空间」…" />
+
+            <!--  · 5s 兜底补充文案：仅当 5s 未完成时才出现，提示网络慢 -->
+            <TextView
+                android:id="@+id/spaceSwitchOverlayFallbackTv"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:gravity="center"
+                android:maxWidth="260dp"
+                android:text="@string/yuj_318_space_switch_slow_hint"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:alpha="0.8"
+                android:visibility="gone" />
+        </LinearLayout>
+    </FrameLayout>
+
+</FrameLayout>

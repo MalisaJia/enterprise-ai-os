@@ -1,0 +1,76 @@
+title = "Gitleaks config for octo-server"
+
+[extend]
+useDefault = true
+
+# ── Custom rules: detect project-specific token formats ──────────────────────
+#
+# These keep gitleaks aware of OCTO's bespoke credential shapes (the default
+# ruleset does not know them). Test fixtures that use these shapes are exempted
+# by the global allowlist below, so the rules stay fully armed against any real
+# token that lands in production code or config.
+
+[[rules]]
+  id = "octo-bot-token"
+  description = "OCTO bot token (bf_ + 32 hex chars)"
+  regex = '''\bbf_[A-Fa-f0-9]{32}\b'''
+  tags = ["token", "bot"]
+
+[[rules]]
+  id = "octo-user-api-key"
+  description = "OCTO user API key (uk_ + 32 hex chars)"
+  regex = '''\buk_[A-Fa-f0-9]{32}\b'''
+  tags = ["token", "api-key"]
+
+[[rules]]
+  id = "octo-app-bot-token"
+  description = "OCTO App Bot token (app_ + 32 hex chars)"
+  regex = '''\bapp_[A-Fa-f0-9]{32}\b'''
+  tags = ["token", "app-bot"]
+
+# ── Global allowlist ─────────────────────────────────────────────────────────
+#
+# Why path allowlisting for test code (the fix for the "secret-scan 常驻红" debt):
+# every prior finding was a synthetic fixture in a *_test.go file or the tests/
+# harness. The old config allowlisted each fixture by exact content marker, so
+# every new test that introduced a fresh fixture re-broke the scan — the gate
+# cried wolf on every push/PR until a real leak would be lost in the noise.
+# Allowlisting the test *paths* fixes this durably: new fixtures are covered
+# automatically, while generic-api-key (and every other rule) stays fully active
+# for production code, configs, and infra. A planted secret in any non-test file
+# is still reported (verified with a planted key in a production .go and .yaml).
+#
+# Single `[allowlist]` table on purpose: only the legacy singular table is
+# honored by gitleaks 8.21.x (the version the local git hook may run); the
+# `[[allowlists]]` array form is silently ignored there and only takes effect on
+# 8.30.x (CI). `paths` and `regexes` here are pure OR — a path OR content match
+# exempts a finding — which is exactly the intended test-fixture suppression.
+
+[allowlist]
+  description = "Test fixtures (by path) plus doc placeholders / RFC vectors / removed dev creds (by content)"
+  regexTarget = "match"
+  paths = [
+    # Go unit / integration / e2e test files — synthetic fixtures only.
+    '''_test\.go$''',
+    # Shell + k6 load-test harness under tests/ — synthetic bot tokens/dev creds.
+    '''(^|/)tests/''',
+  ]
+  regexes = [
+    # Well-known 32-char test master key (OCTO_MASTER_KEY): CI service env in
+    # .github/workflows/ci.yml and the default in test setup. CI/test-only.
+    '''0123456789abcdef0123456789abcdef''',
+    # Test-only user-api-key secret (OCTO_USER_API_KEY_SECRET) in CI/test setup.
+    '''fedcba9876543210fedcba9876543210''',
+    # Documentation placeholders (Botfather SKILL / README samples).
+    '''YOUR_BOT_TOKEN''',
+    '''uk_YOUR_API_KEY''',
+    # RFC 6455 WebSocket test vector (scripts/smoke-test.sh).
+    '''dGhlIHNhbXBsZSBub25jZQ==''',
+    # Historical MinIO dev defaults in the long-removed docker-compose.yaml
+    # (deleted 2023; only reachable via full-history scans on push).
+    '''l0D97QHu1rmOojyWQBtkHdjOCongRyWiwY8FSsBXmIM''',
+    '''p0D97Qou1rmOojyWQbtkHdjOCWngRyliwY8FSsBXmIU''',
+    # Empty PEM placeholder ("// xxxx" between BEGIN/END markers) in a 2023 doc
+    # comment, pkg/wkrsa/rsa.go — not a key; flagged only by older gitleaks.
+    '''BEGIN RSA PRIVATE KEY-----\n// xxxx''',
+  ]

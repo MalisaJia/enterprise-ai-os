@@ -1,0 +1,875 @@
+package message
+
+// card-message-interaction P2 D3/D4/D5/D11（spec: .octospec/tasks/
+// card-message-interaction/brief.md，round-3 修订后形状）：卡片动作上行通道。
+//
+// POST /v1/message/card/action —— 挂在 /v1/message 组（AuthMiddleware +
+// SharedUIDRateLimiter + SpaceMiddleware 已在组上，满足 D3 的挂载序要求），本
+// 路由额外挂 64KiB pre-decode 上限（round-3 P1-3：带用户输入 map 的路由与 P1
+// 发送路由同享 body-cap 纪律）。端点本身不改写任何卡片状态（状态权威在卡片
+// 内容，由 bot 经 botMessageEdit 重写）：只做 校验 → 幂等 claim → 给消息发送方
+// bot 的事件队列投递 card_action → confirm。
+//
+// 校验顺序（D3，round-3 修订；P1-4 PR#548 review 调整幂等位次）：存储行定位 + 频道
+// 绑定（anti-IDOR：消息按「请求声明的频道」定位 —— 分表按 channel_id 路由，WHERE
+// 同时钉 channel_id+message_id，查得到 ⟺ 声明频道与存储行一致；此后所有授权判定一律
+// 以存储行为准）→ 操作者对存储频道的成员资格 → 消息为 type=17 且 sender 是 bot 身份
+// （信任模型 layer (c)；iwh_ webhook 发送者无事件消费端，D7 一并在此拒绝）→ 撤回/删除
+// 门禁（已撤回 / 全局删除 / 操作者本地删除的卡片不可再触发动作，与单条读同口径）→
+// D4 幂等 claim（已存在 claim 即 replay —— **先于生效帧校验**：已受理的动作在按钮被
+// 重写移除后被重试时必须回 replay，而非撞 stale-frame 误判 400，P1-4）→ action_id
+// 存在于「生效卡片」（content_edit 优先 —— 被重写移除按钮的**首次**迟到点击 fail-closed）
+// → D11 inputs 校验 → 入队 + confirm。首次 claim 后任一校验失败均补偿释放 claim（纠正后
+// 可重试）。防枚举：除成员资格（403 语义）外全部归并到单一 400 invalid，具体原因只进日志。
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/Mininglamp-OSS/octo-lib/common"
+	"github.com/Mininglamp-OSS/octo-lib/pkg/wkhttp"
+	"github.com/Mininglamp-OSS/octo-server/internal/cardactiondispatch"
+	"github.com/Mininglamp-OSS/octo-server/internal/carddispatch"
+	"github.com/Mininglamp-OSS/octo-server/modules/group"
+	"github.com/Mininglamp-OSS/octo-server/modules/thread"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardmsg"
+	"github.com/Mininglamp-OSS/octo-server/pkg/cardtmpl"
+	"github.com/Mininglamp-OSS/octo-server/pkg/errcode"
+	"github.com/Mininglamp-OSS/octo-server/pkg/httperr"
+	"github.com/Mininglamp-OSS/octo-server/pkg/i18n/codes"
+	"go.uber.org/zap"
+)
+
+// cardActionMaxBodyBytes D3（round-3 P1-3）：pre-decode body 上限。请求体只有
+// 定位字段 + inputs（D11 序列化上限 16KiB），64KiB 余量充足。
+const cardActionMaxBodyBytes = 64 << 10
+
+// cardActionReq 刻意不含 data 字段：Action.Submit.data 是作者静态上下文，服务端
+// 从生效帧提取（D11 anti-forgery），请求携带的任何 data 一律被忽略（不绑定）。
+type cardActionReq struct {
+	MessageID   string                 `json:"message_id"`
+	ChannelID   string                 `json:"channel_id"`
+	ChannelType uint8                  `json:"channel_type"`
+	ActionID    string                 `json:"action_id"`
+	Inputs      map[string]interface{} `json:"inputs"`
+	ClientToken string                 `json:"client_token"`
+}
+
+// cardAction handles POST /v1/message/card/action.
+func (m *Message) cardAction(c *wkhttp.Context) {
+	loginUID := c.GetLoginUID()
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cardActionMaxBodyBytes)
+	var req cardActionReq
+	if err := c.BindJSON(&req); err != nil {
+		respondMessageRequestInvalid(c, "")
+		return
+	}
+	// 必填字段按固定顺序校验（有序 slice 而非 map —— map 迭代随机会让上报/日志的
+	// 字段名非确定，妨碍排障）。缺任一均归并到同一 invalid（防枚举）。
+	for _, f := range []struct{ name, val string }{
+		{"message_id", req.MessageID}, {"channel_id", req.ChannelID},
+		{"action_id", req.ActionID}, {"client_token", req.ClientToken},
+	} {
+		if strings.TrimSpace(f.val) == "" {
+			respondMessageRequestInvalid(c, f.name)
+			return
+		}
+	}
+	if !cardmsg.Enabled() {
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
+	// D3 ①②：anti-IDOR 频道绑定 + 存储频道成员资格（抽为共享门禁，与卡片修订查询
+	// 复用同一口径，避免两端授权漂移）。
+	msgM, handled := m.authorizeCardChannelMember(c, loginUID, req.MessageID, req.ChannelID, req.ChannelType,
+		errcode.ErrMessageCardActionInvalid, errcode.ErrMessageCardActionDenied)
+	if handled {
+		return
+	}
+
+	// D5 频道语义：event 里的 channel_id 是**消费方（卡片 sender）视角**的 API 层
+	// 频道标识，与 /v1/bot/sendMessage 的 channel_id 同义 —— DM 取对端用户 UID。
+	// 请求里的 channel_id 是**操作者视角**的对端（= bot 自己），直接回显会把 bot
+	// 自己的 UID 当成会话标识发回给 bot，令按 channel_id 认卡的消费方判定 mismatch
+	// 而丢弃点击。group/community topic 的标识与视角无关，原样透传。存储行沿用 fake
+	// id 编码，此处不泄漏。
+	//
+	// 位置：紧跟 ①②（频道绑定 + 成员资格）—— 这是纯投影而非校验，输入只有存储行、
+	// 请求频道、操作者，三者到此已全部定型。放在 D4 claim 之前，是因为它的拒绝完全
+	// 由请求决定（重试必然同样拒），压在 claim 后会让每次重试白付一次 Redis
+	// claim + 补偿释放。
+	eventChannelID, resolved := cardActionConsumerChannelID(msgM, req.ChannelID, loginUID)
+	if !resolved {
+		// 存储行自相矛盾（person 频道的 sender 不是会话双方之一）：没有正确的对端可
+		// 报，宁可拒绝也不编一个。归并到单一 invalid（防枚举），真实原因只进日志。
+		m.Error("person 卡片存储行的 sender 不属于会话双方,无法解析对端",
+			zap.String("messageID", req.MessageID), zap.String("fromUID", msgM.FromUID),
+			zap.String("channelID", req.ChannelID), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
+	// D3 ③sender 必须是当前有效 bot 身份（layer (c)）：robot.status=1 或
+	// app_bot.status=1。这里每次首击都实时解析，不使用展示缓存，确保 App Bot
+	// unpublish/revoke 立即阻止副作用。iwh_ webhook 没有事件消费端、人类发送者也
+	// 没有权威 bot 行，均 fail-closed。
+	if m.botIdentity == nil {
+		m.Error("bot identity resolver 未初始化", zap.String("fromUID", msgM.FromUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+	senderIdentity, err := m.botIdentity.Resolve(msgM.FromUID)
+	if err != nil {
+		m.Error("查询发送者 bot 身份失败", zap.Error(err), zap.String("fromUID", msgM.FromUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+	if senderIdentity == nil {
+		m.Warn("卡片动作目标消息 sender 非 bot,拒绝", zap.String("fromUID", msgM.FromUID), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
+	// D3 ④action_id 必须存在于「生效卡片」：content_edit（最新帧）优先于原始
+	// payload —— 重写移除的按钮迟到点击在此 400，过期交互天然 fail-closed。同时
+	// 取回匹配动作的静态 data（D11：服务端从生效帧提取，绝不取请求里的 data）。
+	// D3 ④撤回/删除门禁 + 生效帧。已撤回(revoke)或全局删除(is_deleted)的卡片不可
+	// 再触发动作 —— 与单条读 api_message_get.go 同口径（extra.Revoke/IsDeleted、
+	// userExtra.MessageIsDeleted 均按「不存在」处理），防止 stale client 点击已从
+	// 可见消息面回收的卡片、触发 bot 副作用。归并到单一 invalid（防枚举）。
+	extra, err := m.messageExtraDB.queryWithMessageID(req.MessageID)
+	if err != nil {
+		m.Error("查询消息扩展失败", zap.Error(err), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	}
+	if extra != nil && (extra.Revoke == 1 || extra.IsDeleted == 1) {
+		m.Warn("卡片动作目标消息已撤回/删除,拒绝", zap.String("messageID", req.MessageID),
+			zap.Int("revoke", extra.Revoke), zap.Int("isDeleted", extra.IsDeleted))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+	// 操作者本地删除（单条可见性对齐）：该用户已把这张卡从自己视图删除 → 不可再操作。
+	if userExtras, uerr := m.messageUserExtraDB.queryWithMessageIDsAndUID([]string{req.MessageID}, loginUID); uerr != nil {
+		m.Error("查询消息用户扩展失败", zap.Error(uerr), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	} else if len(userExtras) > 0 && userExtras[0].MessageIsDeleted == 1 {
+		m.Warn("卡片动作目标消息已被操作者本地删除,拒绝", zap.String("messageID", req.MessageID), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
+	// D3 ④ canonical 可见性对齐（PR#548 review P1）：card/action 必须与单条读
+	// respondSingleMessage 同口径 —— 否则被 visibles 排除 / 已清理历史的成员，虽过了
+	// 成员+sender+revoke/删除门禁，仍能枚举可读的 message_id 触发不可见卡片的 bot
+	// 副作用。上面已覆盖 revoke/is_deleted + 操作者本地删除；这里补 visibles 白名单
+	// + 消息过期 + 用户清理偏移 + 频道偏移（抽为 cardCanonicalVisibleToViewer，与
+	// card/revisions 共用同一口径）。查询失败 fail-closed 回 500；不可见归并单一 invalid
+	// （防枚举）。
+	if visible, verr := m.cardCanonicalVisibleToViewer(msgM, loginUID); verr != nil {
+		m.Error("查询卡片动作目标消息可见性失败", zap.Error(verr), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return
+	} else if !visible {
+		m.Warn("卡片动作目标消息对操作者不可见,拒绝", zap.String("messageID", req.MessageID), zap.String("uid", loginUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
+	// D4 ⑤幂等 claim —— **先于生效帧 / inputs 校验**（P1-4, PR#548 review）。业务
+	// 身份键（不含 client_token —— 新 token 重试不得二次触发）。已存在 claim（pending
+	// 或已 confirm）→ 直接回 replay,绝不产生第二个事件。这必须先于下方 stale-frame
+	// 校验:否则「已受理的动作在 bot 重写移除该按钮后被重试」会撞 stale-frame 而误判
+	// 400，违反 D4「任何已 claim 的请求 → replay」承诺（D8 兜底假设「超时后 re-tap」,
+	// 但按钮已随帧消失、无可再点）。首次 claim 成功后继续跑校验,任一失败都补偿释放
+	// claim（releaseCardClaim），使纠正后的重试仍可重新 claim。
+	// 边角(属 D4「200 ack 不保证已入队」既有语义)：并发下请求 B 撞上 A 尚未释放的首次
+	// claim 时会先回 replay:true,而 A 因校验失败 400、未入队 —— 无虚假事件,靠 D8 超时
+	// re-tap 自愈。
+	idemKey := cardActionClaimKey(req.MessageID, req.ActionID, loginUID)
+	claimed, err := m.cardClaims.Claim(idemKey)
+	if err != nil {
+		m.Error("卡片动作幂等 claim 失败", zap.Error(err))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		return
+	}
+	if !claimed {
+		// 已 confirm → replay（事件确已入队）；仅 pending → 首请求尚在处理、未确认入队，
+		// 回可重试 409 而非虚假成功（PR#548 review P2：避免 A 校验失败释放后 B 拿着 A 的
+		// pending 得到成功 ack 却无事件入队而丢有效动作 —— 客户端按 D8 超时重试自愈）。
+		// Redis 读失败 → 保守当 replay（fail-safe：绝不因读失败重复入队，退化回旧行为）。
+		confirmed, cerr := m.cardClaims.Confirmed(idemKey)
+		if cerr != nil {
+			m.Warn("card_action claim 状态读取失败,按 replay 处理", zap.Error(cerr), zap.String("messageID", req.MessageID))
+			c.Response(map[string]interface{}{"accepted": true, "replay": true})
+			return
+		}
+		if confirmed {
+			c.Response(map[string]interface{}{"accepted": true, "replay": true})
+			return
+		}
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInProgress, nil, nil)
+		return
+	}
+
+	// D3 ⑥action_id 必须存在于「生效卡片」：content_edit（最新帧）优先于原始 payload
+	// —— 重写移除按钮的**首次**迟到点击在此 400（过期交互 fail-closed）；已 claim 的
+	// 重试已在上方回了 replay,不会到这里。同时取回匹配动作的静态 data（D11：服务端从
+	// 生效帧提取，绝不取请求里的 data）。首次校验失败释放 claim（纠正后可重试）。
+	effective := msgM.Payload
+	if extra != nil && extra.ContentEdit.Valid && extra.ContentEdit.String != "" {
+		effective = []byte(extra.ContentEdit.String)
+	}
+	actionData, found := cardmsg.SubmitAction(effective, req.ActionID)
+	if !found {
+		m.releaseCardClaim(idemKey)
+		m.Warn("action_id 不在生效卡片中,拒绝", zap.String("actionID", req.ActionID), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
+	// D11 ⑦inputs 信任边界（round-3 P1-3）：只放行生效帧声明过的 Input.* id，逐
+	// 类型校验 + 尺寸上限 —— event_data.inputs 从此形状可信（内容仍是不可信用户
+	// 文本，bot 侧照常转义）。首次校验失败释放 claim。
+	if err := cardmsg.ValidateInputs(effective, req.Inputs); err != nil {
+		m.releaseCardClaim(idemKey)
+		m.Warn("卡片动作 inputs 校验失败,拒绝", zap.Error(err), zap.String("messageID", req.MessageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+	cardSpaceID, cardSpaceKnown := m.resolveCardOriginSpaceID(msgM)
+	// PR-C D3：principal 从生效帧的 stored provenance 恢复并校验（sender/
+	// producer 绑定/Space 一致性都在 resolveRegistryCardContext 内 fail-close）；
+	// 无标记的 legacy 帧沿用 sender 派生的 bot principal（static 兼容）。
+	cardContext, err := resolveRegistryCardContext(c.Request.Context(), cardActionFrameOrigin{
+		SenderUID:  msgM.FromUID,
+		SpaceID:    cardSpaceID,
+		SpaceKnown: cardSpaceKnown,
+		ProducerBinding: func(producerID string) (string, bool) {
+			return carddispatch.ProducerBindingFromContext(m.ctx, carddispatch.ProducerID(producerID))
+		},
+	}, effective, req.ActionID, actionData)
+	if err != nil {
+		m.releaseCardClaim(idemKey)
+		if errors.Is(err, errCardOriginSpaceUnavailable) {
+			// The click is well formed and the frame may be perfectly valid; we
+			// simply could not read the card's Space to check it against. That
+			// is an outage on our side, and answering 400 would both mislead
+			// the operator and tell the client not to retry.
+			m.Error("卡片来源 Space 不可用,无法校验 stored provenance",
+				zap.Error(err), zap.String("messageID", req.MessageID))
+			httperr.ResponseErrorL(c, errcode.ErrSharedInternal, nil, nil)
+			return
+		}
+		m.Warn("registry 卡片 action 与已发布交互契约不一致,拒绝",
+			zap.Error(err), zap.String("messageID", req.MessageID), zap.String("actionID", req.ActionID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+		return
+	}
+
+	// D5 投递 card_action（event_data 形状由 brief 冻结：只许增字段）。
+	//   - data：匹配 Action.Submit 的作者静态对象，从生效帧提取（D11，仅当声明了
+	//     data 才置键）—— trusted-as-authored，不可伪造。
+	//   - inputs：D11 已 shape-checked 的用户输入（内容仍不可信）。
+	//   - client_token：D4 关联 ID —— 消费方不得当作幂等身份，bot 侧幂等按 event_id。
+	//   - channel_type 回显请求值 —— D3 ①已证明与存储行一致。
+	eventData := map[string]interface{}{
+		"message_id":   req.MessageID,
+		"channel_id":   eventChannelID,
+		"channel_type": req.ChannelType,
+		"action_id":    req.ActionID,
+		"inputs":       req.Inputs,
+		"operator_uid": loginUID,
+		"client_token": req.ClientToken,
+		"acted_at":     time.Now().Unix(),
+	}
+	// P1-3（PR#548 review）：space_id 取卡片的**权威来源 Space**（存储行/群表），
+	// 不取操作者请求上下文的 Space —— 后者仅经成员校验,可能与卡片来源 Space 不同
+	// (操作者同属 A、B 两 Space 时可用 X-Space-ID: B 点 A 的卡)。与 send 出口
+	// "服务端权威、无权威值即 strip"同口径:取不到则省略键(fail-closed),绝不回退到
+	// 客户端可影响的上下文 Space。
+	if cardSpaceID != "" {
+		eventData["space_id"] = cardSpaceID
+	}
+	if actionData != nil {
+		eventData["data"] = actionData
+	}
+	owner, actionType := cardActionRouteMetadata(actionData)
+	eventID, err := m.enqueueCardAction(msgM.FromUID, owner, actionType, eventData, cardactiondispatch.Event{
+		SenderUID:  msgM.FromUID,
+		Owner:      owner,
+		ActionType: actionType,
+		MessageID:  req.MessageID,
+		// 两个出口（bot 拉取队列的 event_data、内部 HMAC 回调的 Event）必须报同一个
+		// 频道标识。这里直接用上面那个已定型的 eventChannelID,而不是从 event_data
+		// 里回捞:同一个变量、编译期有类型,改 key 名或改类型都不会静默变成空串——
+		// RedisQueue.Enqueue 只校验 EventID/SenderUID/Owner/ActionType,空 channel
+		// 会一路送进 HMAC 回调。两条路径不分叉由测试来保:
+		// internal/cardactiondispatch/dm_channel_id_e2e_test.go 里 DM 断的是 bot
+		// 队列的 event_data,内部路由那条断的是真正入队的 Event.ChannelID,任一处
+		// 改回 req.ChannelID 都会红。
+		// （space_id 仍走 event_data,因为那个键是有条件写入的。）
+		ChannelID:   eventChannelID,
+		ChannelType: req.ChannelType,
+		SpaceID:     stringEventField(eventData, "space_id"),
+		ActionID:    req.ActionID,
+		OperatorUID: loginUID,
+		ClientToken: req.ClientToken,
+		ActedAt:     eventData["acted_at"].(int64),
+		Inputs:      req.Inputs,
+		Data:        actionData,
+		Card:        cardContext,
+	})
+	if err != nil {
+		m.releaseCardClaim(idemKey)
+		if errors.Is(err, errInternalCardActionRouteRejected) {
+			m.Warn("内部 card_action 路由未注册,拒绝", zap.String("sender_uid", msgM.FromUID),
+				zap.String("owner", owner), zap.String("action_type", actionType))
+			httperr.ResponseErrorL(c, errcode.ErrMessageCardActionInvalid, nil, nil)
+			return
+		}
+		m.Error("card_action 事件入队失败,已释放幂等 claim", zap.Error(err), zap.String("botUID", msgM.FromUID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageStoreFailed, nil, nil)
+		return
+	}
+	if ok, err := m.cardClaims.Confirm(idemKey, eventID); err != nil || !ok {
+		// 事件已入队（at-least-once，bot 按 event_id 幂等）；confirm 失败只影响
+		// replay 窗口长度，记日志即可，不回滚。
+		m.Warn("卡片动作幂等 confirm 未生效", zap.Bool("ok", ok), zap.Error(err), zap.String("key", idemKey))
+	}
+	c.Response(map[string]interface{}{"accepted": true, "replay": false})
+}
+
+// cardActionFrameOrigin carries the server-side facts a stored frame's
+// provenance is validated against: the stored sender, the card's
+// authoritative origin Space, and the read-only producer-binding resolver.
+// None of these values comes from the click request.
+type cardActionFrameOrigin struct {
+	SenderUID string
+	SpaceID   string
+	// SpaceKnown reports that SpaceID is a determined fact. False means the
+	// origin lookup did not answer, which is not the same as "this card is in
+	// no Space" — see resolveCardOriginSpaceID. A frame's provenance can only
+	// be validated against a Space that was actually established.
+	SpaceKnown      bool
+	ProducerBinding func(producerID string) (senderUID string, ok bool)
+}
+
+// resolveRegistryCardContext binds callback context to metadata and interaction
+// reports from the effective server-authored frame. Cards without octo-card
+// template metadata retain the legacy zero context.
+//
+// PR-C D3：帧携带 catalog_provenance 时，它是 principal 的唯一来源 —— 先证明
+// 与 stored sender（bot：principal_id==FromUID；internal producer：注册的
+// binding SenderUID==FromUID）及权威 Space 一致，才进入 catalog access 与
+// durable CardContext；任何畸形/不一致 fail-close。无 provenance 的帧（含
+// pre-PR-C 的 template_ref-only Bot 帧）保留 sender 派生的 legacy bot
+// principal，且绝不给 CardContext 发明 validated principal 字段。
+func resolveRegistryCardContext(
+	ctx context.Context,
+	origin cardActionFrameOrigin,
+	effective []byte,
+	actionID string,
+	actionData map[string]interface{},
+) (cardactiondispatch.CardContext, error) {
+	ref, ok := cardmsg.CardTemplateContext(effective)
+	if !ok {
+		if cardmsg.HasCardTemplateMetadata(effective) {
+			return cardactiondispatch.CardContext{}, errors.New("message: card template metadata is incomplete")
+		}
+		return cardactiondispatch.CardContext{}, nil
+	}
+	markers, err := cardmsg.CatalogFrameMarkers(effective)
+	if err != nil {
+		return cardactiondispatch.CardContext{}, err
+	}
+	access := cardtmpl.CatalogAccess{
+		Purpose: cardtmpl.CatalogPurposeActionContext,
+		Principal: cardtmpl.CatalogPrincipal{
+			Kind: cardtmpl.CatalogPrincipalBot, ID: origin.SenderUID, SpaceID: origin.SpaceID,
+		},
+	}
+	var validated *cardactiondispatch.CardContext
+	if markers.HasProvenance {
+		principal, err := validatedFramePrincipal(origin, markers.Provenance)
+		if err != nil {
+			return cardactiondispatch.CardContext{}, err
+		}
+		access.Principal = principal
+		validated = &cardactiondispatch.CardContext{
+			PrincipalType: markers.Provenance.PrincipalType,
+			PrincipalID:   principal.ID,
+			SpaceID:       principal.SpaceID,
+		}
+	} else if !frozenRegistryKnows(cardtmpl.ID(ref.ID), ref.Version) {
+		// D3 fail-close for a markerless frame that names a *dynamic* version.
+		//
+		// The identity above comes from `card.metadata.octo.template`, which
+		// lives inside the card body a raw caller controls; raw ingress rejects
+		// the two server-only *top-level* keys, not this. Without this branch a
+		// frame carrying no server-authored provenance is authorized against
+		// the sender-derived Bot principal — which is the sending Bot's own
+		// grant identity — and `Allows(action_context)` reads `edit`. So a Bot
+		// holding only `discover+edit` could fabricate a frame naming an active
+		// dynamic version and drive its action route, with `edit` standing in
+		// for the `send` grant the frame never had.
+		//
+		// Markerless compatibility exists for one population: cards delivered
+		// before PR-C, every one of which names a version the frozen Registry
+		// knows. Scoping the fallback to exactly that population keeps invariant
+		// 7 intact and closes the substitution.
+		return cardactiondispatch.CardContext{}, fmt.Errorf(
+			"%w: %s@%s", errMarkerlessDynamicFrame, ref.ID, ref.Version)
+	}
+	catalog := cardtmpl.DefaultCatalog()
+	if catalog == nil {
+		return cardactiondispatch.CardContext{}, errors.New("message: cardtmpl catalog unavailable")
+	}
+	resolved, err := catalog.ActionContext(ctx, cardtmpl.CatalogActionRequest{
+		CatalogExactRequest: cardtmpl.CatalogExactRequest{
+			Access: access, ID: cardtmpl.ID(ref.ID), Version: ref.Version,
+		},
+		ActionID: actionID,
+	})
+	if err != nil {
+		return cardactiondispatch.CardContext{}, err
+	}
+	// 交叉校验(PR#641 review P2):envelope 携带的模板身份(metadata.octo)必须与该
+	// 动作实际选路的 owner 一致。route owner 取自生效帧 Action.Submit.data.owner
+	// (cardActionRouteMetadata 据此选路)。对 Registry.Render 产的卡,
+	// assertActionContract 已强制 data.owner==template owner,故此断言只挡手工构造的
+	// 错配卡:防止一张 metadata 声明 docs 模板、data.owner 却指向别的已注册路由的卡,
+	// 把带 docs 身份的 octo-card-v1 信封投递到错误路由。
+	if contract := resolved.Meta.ActionContract; contract != nil {
+		routeOwner, _ := actionData["owner"].(string)
+		if strings.TrimSpace(routeOwner) != contract.Owner {
+			return cardactiondispatch.CardContext{}, errors.New("message: card template owner does not match action route owner")
+		}
+	}
+	cardContext := cardactiondispatch.CardContext{
+		TemplateID: ref.ID, TemplateVersion: ref.Version, View: string(resolved.View),
+	}
+	if validated != nil {
+		cardContext.PrincipalType = validated.PrincipalType
+		cardContext.PrincipalID = validated.PrincipalID
+		cardContext.SpaceID = validated.SpaceID
+	}
+	return cardContext, nil
+}
+
+// validatedFramePrincipal 证明 stored provenance 与服务端事实一致后，返回
+// catalog principal。失败即篡改/配置漂移信号，一律 fail-close：
+//   - bot principal 必须等于存储行 FromUID（IM 连接鉴权绑定，不可伪造）；
+//   - internal producer 必须在 carddispatch 注册表中绑定到 FromUID；
+//   - provenance 声明的 Space 非空且权威来源 Space 非空时必须一致。
+func validatedFramePrincipal(origin cardActionFrameOrigin, provenance cardmsg.CatalogProvenance) (cardtmpl.CatalogPrincipal, error) {
+	principal, err := cardtmpl.CatalogPrincipalFromProvenance(provenance)
+	if err != nil {
+		return cardtmpl.CatalogPrincipal{}, err
+	}
+	switch principal.Kind {
+	case cardtmpl.CatalogPrincipalBot:
+		if principal.ID != origin.SenderUID {
+			return cardtmpl.CatalogPrincipal{}, errors.New("message: stored bot provenance does not match message sender")
+		}
+	case cardtmpl.CatalogPrincipalInternalProducer:
+		if origin.ProducerBinding == nil {
+			return cardtmpl.CatalogPrincipal{}, errors.New("message: producer binding resolver unavailable")
+		}
+		boundSender, ok := origin.ProducerBinding(principal.ID)
+		if !ok || boundSender != origin.SenderUID {
+			return cardtmpl.CatalogPrincipal{}, errors.New("message: stored producer provenance does not match registered sender")
+		}
+	default:
+		return cardtmpl.CatalogPrincipal{}, errors.New("message: unsupported stored principal kind")
+	}
+	// A frame that names a Space is only trustworthy once that claim has been
+	// checked against the server's own answer. Skipping the check when the
+	// origin could not be determined would leave principal.SpaceID set to
+	// whatever the frame said, and that value becomes the grant scope for the
+	// action_context authorization — so a frame that reached storage without
+	// passing a trusted boundary could name any Space it liked. The bot branch
+	// above pins the principal *id* to the stored sender; nothing pins the
+	// Space but this.
+	// Refuse whenever the origin Space is unknown, whether or not the frame
+	// names one. The empty-Space branch looks harmless and is not: assigning an
+	// unknown origin leaves principal.SpaceID == "", which loadGrantDecision
+	// resolves against the *global* row alone. A principal holding an active
+	// global grant plus an exact tombstone for the card's real Space would then
+	// be allowed — defeating invariant 11, which exists precisely so an exact
+	// tombstone can shadow a live global grant. A transient group-row read is
+	// enough to reach it, so the unknown case has to fail closed on both sides.
+	if !origin.SpaceKnown {
+		return cardtmpl.CatalogPrincipal{}, fmt.Errorf(
+			"%w: card origin space is unavailable, cannot resolve the grant scope",
+			errCardOriginSpaceUnavailable)
+	}
+	if principal.SpaceID != "" && principal.SpaceID != origin.SpaceID {
+		return cardtmpl.CatalogPrincipal{}, errors.New("message: stored provenance space does not match card origin space")
+	}
+	if principal.SpaceID == "" {
+		principal.SpaceID = origin.SpaceID
+	}
+	return principal, nil
+}
+
+// errCardOriginSpaceUnavailable separates "the card's Space could not be read
+// right now" from "this click is malformed". Both refuse the action, but only
+// the first is worth retrying, and reporting it as a client error would tell an
+// operator to go looking at the payload instead of at the group table.
+var errCardOriginSpaceUnavailable = errors.New("message: card origin space unavailable")
+
+// errMarkerlessDynamicFrame is the refusal for a frame that names a template
+// the frozen Registry does not know and carries no server-authored provenance.
+// It is deliberately not merged into the generic invalid-action error class at
+// the source so the reason survives into the logs; the handler still collapses
+// it onto the one client-visible 400, because telling a caller *which* of the
+// action rejections it hit is an enumeration aid.
+var errMarkerlessDynamicFrame = errors.New("message: dynamic frame carries no server-authored provenance")
+
+// frozenRegistryKnows reports whether the process Registry holds this exact
+// version. It is the test for "this card predates the dynamic catalog", not a
+// permission check — a static template being known here says nothing about who
+// may act on it, which is still decided by the authorizer downstream.
+func frozenRegistryKnows(id cardtmpl.ID, version string) bool {
+	registry := cardtmpl.DefaultRegistry()
+	if registry == nil {
+		return false
+	}
+	_, err := registry.Lookup(id, version)
+	return err == nil
+}
+
+var errInternalCardActionRouteRejected = errors.New("internal card action route rejected")
+
+func (m *Message) enqueueCardAction(senderUID, owner, actionType string, botEventData map[string]interface{}, internalEvent cardactiondispatch.Event) (int64, error) {
+	service, installed := cardactiondispatch.FromContext(m.ctx)
+	if !installed {
+		return m.robotService.EnqueueBotTypedEvent(senderUID, cardmsg.EventTypeCardAction, botEventData)
+	}
+	resolution := service.Resolve(senderUID, owner, actionType)
+	switch resolution.Kind {
+	case cardactiondispatch.ResolutionCallback:
+		return service.Enqueue(internalEvent)
+	case cardactiondispatch.ResolutionReject:
+		return 0, errInternalCardActionRouteRejected
+	default:
+		return m.robotService.EnqueueBotTypedEvent(senderUID, cardmsg.EventTypeCardAction, botEventData)
+	}
+}
+
+func cardActionRouteMetadata(data map[string]interface{}) (string, string) {
+	if data == nil {
+		return "", ""
+	}
+	owner, _ := data["owner"].(string)
+	actionType, _ := data["action_type"].(string)
+	return strings.TrimSpace(owner), strings.TrimSpace(actionType)
+}
+
+func stringEventField(data map[string]interface{}, key string) string {
+	value, _ := data[key].(string)
+	return value
+}
+
+// releaseCardClaim 补偿释放首次校验失败 / 入队失败的幂等 claim（P1-4：首次 claim
+// 后任一失败都要释放，否则纠正后的重试会撞残留 claim 误判 replay）。删不掉只是残留
+// 至多 60s pending，不影响正确性，记日志便于发现系统性 Redis 故障。
+func (m *Message) releaseCardClaim(idemKey string) {
+	if relErr := m.cardClaims.Release(idemKey); relErr != nil {
+		m.Error("释放卡片动作幂等 claim 失败(残留至多 60s pending)", zap.Error(relErr), zap.String("key", idemKey))
+	}
+}
+
+// fakeChannelContainsUID 校验 person 频道存储行的 fake channel id（"a@b"）是否
+// 包含给定 uid —— 成员资格以存储行为准（D3 anti-IDOR）。
+func fakeChannelContainsUID(fakeChannelID, uid string) bool {
+	parts := strings.SplitN(fakeChannelID, "@", 2)
+	return len(parts) == 2 && (parts[0] == uid || parts[1] == uid)
+}
+
+// cardActionConsumerChannelID projects the click's channel identity into the
+// frame of reference of the event's consumer — the bot that sent the card.
+//
+// `channel_id` on the wire always names "the other end of this conversation, as
+// the holder of this identifier sees it". In a DM the two ends disagree about
+// what that string is: the clicking user sends the bot's UID because the bot is
+// *their* peer, while the bot needs the user's UID — the very value it passed to
+// `/v1/bot/sendMessage` when it sent the card. Echoing the request value shipped
+// the bot its own UID, so a consumer that recognizes its card by channel (the
+// OpenClaw plugin compares the callback against the channel it registered the
+// card session under) saw a mismatch and dropped every DM click.
+//
+// Group and community-topic ids name the channel itself rather than a peer, so
+// both ends already agree and the request value passes through untouched.
+//
+// The person branch reads only facts authorizeCardChannelMember already
+// established: the stored row was located by
+// GetFakeChannelIDWith(operatorUID, requestChannelID), so the conversation is
+// exactly that pair of UIDs, and the card's sender is one of the two. A sender
+// outside the pair means the stored row contradicts its own channel — there is
+// no correct peer to report, so it fails closed rather than inventing one
+// (`ok=false`). Deriving the peer from the pair rather than parsing the stored
+// fake id also keeps the internal `a@b` encoding out of the wire contract.
+//
+// This deliberately does not reuse common.GetToChannelIDWithFakeChannelID, the
+// flip used on the read paths. That helper fails open twice over: a uid outside
+// the pair returns the *first* half regardless, and a fake id that does not
+// split returns the whole `a@b` string. Both outcomes are acceptable when the
+// answer only decorates a response, and neither is here — the first would hand
+// a bot a conversation partner it never addressed, and the second would publish
+// the internal encoding as a channel id. What the wire contract needs is a
+// refusal, which only an (id, ok) shape can express.
+func cardActionConsumerChannelID(msgM *messageModel, requestChannelID, operatorUID string) (string, bool) {
+	if msgM.ChannelType != common.ChannelTypePerson.Uint8() {
+		return requestChannelID, true
+	}
+	switch msgM.FromUID {
+	case requestChannelID:
+		// The ordinary DM: the operator clicked a card the bot they are talking
+		// to had sent, so the bot's peer is the operator.
+		return operatorUID, true
+	case operatorUID:
+		// A self-note DM (both ends are the same UID) also lands here, and
+		// returning the request value is right for it: the peer of the sender
+		// is the sender.
+		return requestChannelID, true
+	default:
+		return "", false
+	}
+}
+
+// authorizeCardChannelMember 执行卡片消息端点共享的 D3 ①②：anti-IDOR 频道绑定
+// （按请求声明的频道查存储消息 —— 查得到即证明「声明频道 == 存储行的频道」）+ 存储
+// 频道成员资格（person：会话双方之一；group/topic：ExistMemberActive 白名单单点查）。
+// 成功返回存储消息；失败已写好 i18n 错误响应（绑定/不存在/非卡片 → invalidCode，
+// 非成员 → deniedCode，防枚举）并返回 (nil, true=已处理)。cardAction 与卡片修订查询
+// 共用本门禁，保证两端授权口径不漂移（PR-C brief 要求）。
+func (m *Message) authorizeCardChannelMember(c *wkhttp.Context, loginUID, messageID, channelID string, channelType uint8, invalidCode, deniedCode codes.Code) (*messageModel, bool) {
+	lookupChannelID := channelID
+	switch channelType {
+	case common.ChannelTypePerson.Uint8():
+		lookupChannelID = common.GetFakeChannelIDWith(loginUID, channelID)
+	case common.ChannelTypeGroup.Uint8(), common.ChannelTypeCommunityTopic.Uint8():
+		// group / topic：消息就存于声明频道本身。
+	default:
+		respondMessageRequestInvalid(c, "channel_type")
+		return nil, true
+	}
+	msgM, err := m.db.queryMessageByID(lookupChannelID, channelType, messageID)
+	if err != nil {
+		m.Error("查询卡片消息失败", zap.Error(err), zap.String("messageID", messageID))
+		httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+		return nil, true
+	}
+	if msgM == nil || len(msgM.Payload) == 0 || !cardmsg.IsCardRawPayload(msgM.Payload) {
+		httperr.ResponseErrorL(c, invalidCode, nil, nil)
+		return nil, true
+	}
+	switch msgM.ChannelType {
+	case common.ChannelTypePerson.Uint8():
+		if !fakeChannelContainsUID(msgM.ChannelID, loginUID) {
+			httperr.ResponseErrorL(c, deniedCode, nil, nil)
+			return nil, true
+		}
+	default:
+		groupNo := msgM.ChannelID
+		var threadShortID string
+		if msgM.ChannelType == common.ChannelTypeCommunityTopic.Uint8() {
+			parent, shortID, perr := thread.ParseChannelID(msgM.ChannelID)
+			if perr != nil {
+				respondMessageRequestInvalid(c, "channel_id")
+				return nil, true
+			}
+			groupNo = parent
+			threadShortID = shortID
+		}
+		// D3 ②群状态门禁(PR#548 review H1/P1-a)：复刻单条读 requireGroupMember
+		// (api_message_get.go:184) —— 仅 GroupStatusNormal + Disband 可见,Disabled
+		// (管理员禁用)及未来非正常状态 fail closed。只查成员资格会漏群状态：禁用群置
+		// group.Status=Disabled 但成员行仍 status=Normal、ExistMemberActive 照样为 true
+		// —— 于是被禁用群里的成员读路径已 404,却仍能枚举 message_id 触发副作用。归并单一
+		// invalid(防枚举)。Disband 与读路径同口径放行。
+		statusVisible, serr := m.groupStatusVisibleForAction(groupNo)
+		if serr != nil {
+			m.Error("查询群状态失败", zap.Error(serr), zap.String("groupNo", groupNo))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return nil, true
+		}
+		if !statusVisible {
+			m.Warn("卡片目标群非可见状态,拒绝", zap.String("groupNo", groupNo))
+			httperr.ResponseErrorL(c, invalidCode, nil, nil)
+			return nil, true
+		}
+		// D3 ②子区状态门禁(PR#548 review P2-a)：复刻单条读 getThreadMessage
+		// (api_message_get.go:139) —— 已删除子区(ThreadStatusDeleted)按不存在处理;
+		// 归档子区允许(读历史,与读路径同口径)。
+		if threadShortID != "" {
+			t, terr := m.threadDB.QueryByGroupNoAndShortID(groupNo, threadShortID)
+			if terr != nil {
+				m.Error("查询子区失败", zap.Error(terr), zap.String("groupNo", groupNo), zap.String("shortID", threadShortID))
+				httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+				return nil, true
+			}
+			if t == nil || t.Status == thread.ThreadStatusDeleted {
+				m.Warn("卡片目标子区已删除,拒绝", zap.String("groupNo", groupNo), zap.String("shortID", threadShortID))
+				httperr.ResponseErrorL(c, invalidCode, nil, nil)
+				return nil, true
+			}
+		}
+		isMember, merr := m.groupService.ExistMemberActive(groupNo, loginUID)
+		if merr != nil {
+			m.Error("查询群成员失败", zap.Error(merr), zap.String("groupNo", groupNo))
+			httperr.ResponseErrorL(c, errcode.ErrMessageQueryFailed, nil, nil)
+			return nil, true
+		}
+		if !isMember {
+			httperr.ResponseErrorL(c, deniedCode, nil, nil)
+			return nil, true
+		}
+	}
+	return msgM, false
+}
+
+// resolveCardOriginSpaceID 解析卡片的**权威来源 Space**（P1-3, PR#548 review）。
+// card_action 事件的 space_id 必须来自卡片自身的存储权威,而非操作者请求上下文的
+// Space —— SpaceMiddleware 只证明操作者是所声明 Space 的成员,不证明卡片属于该
+// Space(操作者同属 A、B 两 Space 时可用 X-Space-ID: B 点 A 群/DM 的卡)。与 send
+// 出口 enrichPayloadWithSpaceID 同口径:
+//   - GROUP           → 群表 SpaceID
+//   - COMMUNITY_TOPIC → 父群 SpaceID
+//   - PERSONAL        → 发送时服务端注入进 payload 顶层的权威 space_id（DM 无 Space
+//     路由,payload 是收端唯一可信信号源;见 enrich*PayloadWithSpaceID）
+//
+// 任一步取不到 → 返回 ""(fail-closed:调用方省略 event_data.space_id,与 send 路径
+// 无权威值时 strip 客户端 space 的行为对齐;绝不回退到客户端可影响的上下文 Space)。
+//
+// The second return value separates two outcomes that used to share one empty
+// string. `known=true, spaceID=""` is a determined fact — a DM outside any
+// Space. `known=false` means the lookup itself did not answer: a group row that
+// could not be read, a malformed thread channel, an unparseable payload. The
+// distinction is load-bearing downstream: a frame's provenance can only be
+// checked against an origin Space that was actually established, and treating
+// "could not determine" as "there is none" both skips that check and turns
+// transient outages into permanent-looking rejections.
+func (m *Message) resolveCardOriginSpaceID(msgM *messageModel) (string, bool) {
+	switch msgM.ChannelType {
+	case common.ChannelTypeGroup.Uint8():
+		return m.groupSpaceIDOrEmpty(msgM.ChannelID)
+	case common.ChannelTypeCommunityTopic.Uint8():
+		parent, err := m.resolveParentGroupNo(msgM.ChannelID)
+		if err != nil || parent == "" {
+			return "", false
+		}
+		return m.groupSpaceIDOrEmpty(parent)
+	case common.ChannelTypePerson.Uint8():
+		var env struct {
+			SpaceID string `json:"space_id"`
+		}
+		if err := json.Unmarshal(msgM.Payload, &env); err != nil {
+			return "", false
+		}
+		// A DM payload legitimately carries no Space when the sender had none
+		// to stamp, so an absent value here is an answer rather than a failure.
+		return env.SpaceID, true
+	default:
+		return "", false
+	}
+}
+
+// groupSpaceIDOrEmpty 查群的权威 SpaceID。查询失败 / 群不存在 → ("", false):
+// 未能判定。群存在但没有 SpaceID → ("", true):判定为「不属于任何 Space」。
+func (m *Message) groupSpaceIDOrEmpty(groupNo string) (string, bool) {
+	g, err := m.groupService.GetGroupWithGroupNo(groupNo)
+	if err != nil || g == nil {
+		return "", false
+	}
+	return g.SpaceID, true
+}
+
+// cardCanonicalVisibleToViewer 复刻单条读 respondSingleMessage 的「内容可见性」层
+// (api_message_get.go)——成员资格 + 生命周期(revoke/删除)之外的第四类门禁:
+// visibles 白名单 / 消息过期(Expire 秒 TTL) / 用户清理偏移 / 频道偏移。card/action
+// 与 card/revisions 共用本 helper,防止两端可见性口径漂移(与 authorizeCardChannelMember
+// 同理:被 visibles 排除或历史已清理的成员,虽过成员+生命周期门禁,仍不得读到不可见卡片
+// 的内容/触发其副作用)。person 频道跳过偏移(单条读不经 respondSingleMessage、偏移语义
+// 未确立;2 方 DM visibles 恒过,已由成员+生命周期兜住;也避免对已是 fake id 的 person
+// 频道二次 fake 化)。返回 (true,nil)=可见;(false,nil)=对该 viewer 不可见(调用方决定
+// invalid / 空列表);(false,err)=偏移查询失败(调用方 fail-closed 回 500)。
+func (m *Message) cardCanonicalVisibleToViewer(msgM *messageModel, loginUID string) (bool, error) {
+	if !visiblesAllows(msgM.Payload, loginUID) {
+		return false, nil
+	}
+	if msgM.Expire > 0 && time.Now().Unix()-int64(msgM.Expire) >= int64(msgM.Timestamp) {
+		return false, nil
+	}
+	if msgM.ChannelType == common.ChannelTypePerson.Uint8() {
+		return true, nil
+	}
+	userOffset, oerr := m.channelOffsetDB.queryWithUIDAndChannel(loginUID, msgM.ChannelID, msgM.ChannelType)
+	if oerr != nil {
+		return false, oerr
+	}
+	if userOffset != nil && msgM.MessageSeq <= userOffset.MessageSeq {
+		return false, nil
+	}
+	channelOffsetSeq, cerr := m.lookupChannelOffsetSeq(msgM.ChannelID, msgM.ChannelType, loginUID)
+	if cerr != nil {
+		return false, cerr
+	}
+	if channelOffsetSeq != 0 && msgM.MessageSeq <= channelOffsetSeq {
+		return false, nil
+	}
+	return true, nil
+}
+
+// groupStatusVisibleForAction 复刻单条读 requireGroupMember 的群状态门禁
+// (api_message_get.go:184)：仅 GroupStatusNormal + GroupStatusDisband 可见,
+// Disabled(管理员禁用)及未来非正常状态 fail closed。刻意用 groupDB.QueryWithGroupNo
+// (与 requireGroupMember 同一读法)而非 groupService.GetGroupWithGroupNo：后者把「群不存在」
+// 也返回成 error,会被误判成 ErrMessageQueryFailed;QueryWithGroupNo 群不存在返回 (nil,nil)
+// → 判不可见(归并 invalid,与读路径 g==nil→NotFound 同口径),仅真实 DB 错误才 (false,err)
+// → 调用方回 ErrMessageQueryFailed(fail-closed:安全门禁查询失败绝不放行)。
+func (m *Message) groupStatusVisibleForAction(groupNo string) (bool, error) {
+	g, err := m.groupDB.QueryWithGroupNo(groupNo)
+	if err != nil {
+		return false, err
+	}
+	if g == nil || (g.Status != group.GroupStatusNormal && g.Status != group.GroupStatusDisband) {
+		return false, nil
+	}
+	return true, nil
+}
+
+// isCardMessageWithdrawn 报告一张卡片是否已从可见消息面回收 —— 已撤回
+// (message_extra.revoke) / 全局删除 (message_extra.is_deleted) / 操作者本地删除
+// (message_user_extra.message_is_deleted)。与单条读 api_message_get.go:241 同口径。
+//
+// 动作端点(cardAction ④)内联了同一三项检查(那里顺带复用已查出的 extra 取生效帧,
+// 避免二次查询);查询端点(getCardRevisions)调用本 helper 做可见性兜底 —— 两处必须
+// 保持同步:动作与历史内容都不得在卡片被回收后仍可达(D10「revoked message leaves
+// no queryable content history」;且不依赖 revoke 时 best-effort 删除是否成功)。
+func (m *Message) isCardMessageWithdrawn(messageID, loginUID string) (bool, error) {
+	extra, err := m.messageExtraDB.queryWithMessageID(messageID)
+	if err != nil {
+		return false, err
+	}
+	if extra != nil && (extra.Revoke == 1 || extra.IsDeleted == 1) {
+		return true, nil
+	}
+	userExtras, err := m.messageUserExtraDB.queryWithMessageIDsAndUID([]string{messageID}, loginUID)
+	if err != nil {
+		return false, err
+	}
+	if len(userExtras) > 0 && userExtras[0].MessageIsDeleted == 1 {
+		return true, nil
+	}
+	return false, nil
+}
