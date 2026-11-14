@@ -1013,10 +1013,10 @@ func TestAddBotFatherFriend_Bidirectional(t *testing.T) {
 	const botFatherUID = "botfather"
 	testUID := "test_user_" + fmt.Sprintf("%d", time.Now().UnixNano())
 
-	// 创建 BotFather 用户（模拟系统初始化）
+	// 创建 BotStudio 用户（模拟系统初始化；uid 仍是历史值 botfather）
 	err = u.db.Insert(&Model{
 		UID:      botFatherUID,
-		Name:     "BotFather",
+		Name:     "BotStudio",
 		Username: "botfather",
 		ShortNo:  "bf001",
 		Status:   1,

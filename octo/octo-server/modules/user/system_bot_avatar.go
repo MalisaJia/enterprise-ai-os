@@ -9,8 +9,8 @@ var systemBotAvatarFS embed.FS
 //
 // 这些系统 Bot 的头像是固定静态图，既不走 13 色随机默认头像
 // （shouldUseBotDefaultAvatar 用 !IsSystemBot 已把系统 Bot 排除在外），
-// 也不走 #346 引入的昵称首字母渲染——否则像 botfather 会被渲染成昵称后两字
-// （"BotFather" → "er"），观感不专业。
+// 也不走 #346 引入的昵称首字母渲染——否则像 botfather（显示名 BotStudio）
+// 会被渲染成昵称后两字（"BotStudio" → "io"），观感不专业。
 //
 // 键必须是 pkg/space.SystemBots 里的系统 Bot（由 TestSystemBotAvatarAssets 约束）。
 // 未配专属图的系统 Bot（如 notification）不在此表，仍回退到默认头像逻辑——

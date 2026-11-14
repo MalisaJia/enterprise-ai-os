@@ -30,7 +30,7 @@ export async function runBind(opts: BindOptions): Promise<void> {
 
   // 2. Validate params
   if (!isValidBotTokenPrefix(opts.botToken)) {
-    console.error("Error: Bot token must start with 'bf_' (BotFather /newbot) or 'app_' (Admin App Bot).");
+    console.error("Error: Bot token must start with 'bf_' (BotStudio /newbot) or 'app_' (Admin App Bot).");
     process.exit(1);
   }
   if (!validateAccountId(opts.accountId)) {

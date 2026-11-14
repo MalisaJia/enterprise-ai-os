@@ -50,14 +50,33 @@ export class WKLayout extends Component<WKLayoutProps, WKLayoutState>{
     private dragStartWidth = 0
     private lastWidth = SPLITTER_DEFAULT_WIDTH
     private preferredWidth: number | null = null
+    // Optional max-width/ratio override requested via "wk:layout-left-width"
+    // (e.g. the workspace page). null → default clamp (chat behavior unchanged).
+    private leftMaxOverride: { maxWidth: number; ratio: number } | null = null
     private lastNavRailWidth = NAV_RAIL_DEFAULT_WIDTH
     private activeDraggingTarget?: "nav" | "content"
     private cachedContainerWidth = 1200  // updated in mount + resize
     private cachedLayoutWidth = 1200
+    private clampLeftWidth(width: number): number {
+        if (this.leftMaxOverride) {
+            return clampWidth(width, this.cachedContainerWidth, SPLITTER_MIN_WIDTH, this.leftMaxOverride.maxWidth, this.leftMaxOverride.ratio)
+        }
+        return clampWidth(width, this.cachedContainerWidth)
+    }
     private preferredWidthListener = (event: Event) => {
-        const requested = (event as CustomEvent<{ width?: number | null }>).detail?.width
+        const detail = (event as CustomEvent<{ width?: number | null; maxWidth?: number; ratio?: number }>).detail
+        const requested = detail?.width
+        // Optional max-width/ratio override; only accepted when both are valid.
+        const requestedMax = detail?.maxWidth
+        const requestedRatio = detail?.ratio
+        if (
+            typeof requestedMax === "number" && Number.isFinite(requestedMax) && requestedMax > 0
+            && typeof requestedRatio === "number" && Number.isFinite(requestedRatio) && requestedRatio > 0 && requestedRatio < 1
+        ) {
+            this.leftMaxOverride = { maxWidth: requestedMax, ratio: requestedRatio }
+        }
         if (typeof requested === "number" && Number.isFinite(requested)) {
-            const width = clampWidth(requested, this.cachedContainerWidth)
+            const width = this.clampLeftWidth(requested)
             this.preferredWidth = width
             this.lastWidth = width
             this.setState({ leftWidth: width })
@@ -65,6 +84,7 @@ export class WKLayout extends Component<WKLayoutProps, WKLayoutState>{
         }
         const width = restoreWidth()
         this.preferredWidth = null
+        this.leftMaxOverride = null
         this.lastWidth = width
         this.setState({ leftWidth: width })
     }
@@ -121,6 +141,16 @@ export class WKLayout extends Component<WKLayoutProps, WKLayoutState>{
     }
 
     private onContentDoubleClick = () => {
+        if (this.leftMaxOverride) {
+            // Override active (workspace): reset to a balanced preferred width
+            // instead of the chat default; persistence stays suppressed while
+            // preferredWidth is set (see onDragEnd).
+            const preferred = this.clampLeftWidth(Math.floor(this.cachedContainerWidth * 0.5))
+            this.preferredWidth = preferred
+            this.lastWidth = preferred
+            this.setState({ leftWidth: preferred })
+            return
+        }
         this.lastWidth = SPLITTER_DEFAULT_WIDTH
         this.setState({ leftWidth: SPLITTER_DEFAULT_WIDTH })
         persistWidth(SPLITTER_DEFAULT_WIDTH)
@@ -181,8 +211,7 @@ export class WKLayout extends Component<WKLayoutProps, WKLayoutState>{
             return
         }
 
-        const containerWidth = this.cachedContainerWidth
-        const newWidth = clampWidth(this.dragStartWidth + delta, containerWidth)
+        const newWidth = this.clampLeftWidth(this.dragStartWidth + delta)
         this.lastWidth = newWidth
 
         // Write CSS variables directly — skip React re-render during drag
@@ -249,7 +278,7 @@ export class WKLayout extends Component<WKLayoutProps, WKLayoutState>{
         </div>
 
         // Clamp against cached container width so window resize doesn't break layout
-        const clampedWidth = clampWidth(leftWidth, this.cachedContainerWidth)
+        const clampedWidth = this.clampLeftWidth(leftWidth)
 
         const widthPx = `${clampedWidth}px`
 

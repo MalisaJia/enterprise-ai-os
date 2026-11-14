@@ -664,7 +664,7 @@ export default class ContactsList extends Component<any, ContactsState> {
                     <WKAvatar channel={new Channel("botfather", ChannelTypePerson)} />
                 </div>
                 <div className="wk-contacts-botfather-info">
-                    <div className="wk-contacts-botfather-name">BotFather</div>
+                    <div className="wk-contacts-botfather-name">BotStudio</div>
                     <div className="wk-contacts-botfather-desc">{t("contacts.botFather.desc")}</div>
                 </div>
                 <ChevronRight size={16} color="rgba(255,255,255,0.6)" />

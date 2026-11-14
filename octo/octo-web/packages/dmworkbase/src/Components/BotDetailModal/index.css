@@ -384,6 +384,20 @@
     height: var(--wk-profile-detail-action-height, var(--wk-sp-10));
 }
 
+/* 「发消息 + 打开工作区」并排时的行容器：两个按钮均分宽度。 */
+.wk-bot-detail-actions-row {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: var(--wk-sp-2, 8px);
+}
+
+.wk-bot-detail-actions-row .wk-btn {
+    width: auto;
+    flex: 1 1 0;
+    min-width: 0;
+}
+
 .wk-bot-detail-apply {
     display: flex;
     width: 100%;

@@ -13,7 +13,7 @@ import (
 
 func TestBotFatherConstants(t *testing.T) {
 	assert.Equal(t, "botfather", BotFatherUID)
-	assert.Equal(t, "BotFather", BotFatherName)
+	assert.Equal(t, "BotStudio", BotFatherName)
 	assert.Equal(t, "bf_", BotTokenPrefix)
 	assert.Equal(t, "_bot", BotUsernameSuffix)
 }

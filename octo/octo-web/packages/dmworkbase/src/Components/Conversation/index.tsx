@@ -81,7 +81,8 @@ import WKAvatar from "../WKAvatar";
 import AiBadge from "../AiBadge";
 import { IconClose, IconEdit, IconReply } from "@douyinfe/semi-icons";
 import { Toast, Spin } from "@douyinfe/semi-ui";
-import { AtSign, UserRound } from "lucide-react";
+import { AtSign, LayoutDashboard, UserRound } from "lucide-react";
+import { openWorkspaceUrl } from "../../features/workspace/workspaceNavigation";
 import { wkConfirm } from "../WKModal";
 import { FlameMessageCell } from "../../Messages/Flame";
 import FoldSessionCard, { FoldSessionCardParticipant } from "./FoldSessionCard";
@@ -1414,6 +1415,9 @@ export class Conversation
       return;
     }
     this.vm.selectUID = uid;
+    // 头像菜单按 selectUID 动态计算条目（如 bot 专属「进入工作区」），
+    // 先触发一次重渲染，确保 show() 量取的菜单 DOM 是最新条目集合。
+    this.setState({});
     let trigger: ContextMenusTrigger = event;
     // Enter / Space 触发的原生 button click 没有指针坐标，改用按钮右下角定位。
     if (event.detail === 0) {
@@ -1425,6 +1429,30 @@ export class Conversation
       };
     }
     this.avatarMenusContext.show(trigger);
+  }
+
+  /**
+   * 头像菜单「进入工作区」条目可见性判定：当前选中的发送者是否为机器人。
+   * 与 WorkspaceEntryButton / BotDetailModal 同源（`orgData.robot === 1`）：
+   * 群聊优先读群成员 orgData；1v1（或成员表未命中）回退读该用户 person 频道缓存。
+   */
+  private isSelectedUserBot(): boolean {
+    const uid = this.vm.selectUID;
+    if (!uid) {
+      return false;
+    }
+    const subscriber = this.vm.subscriberWithUID(uid);
+    if ((subscriber?.orgData as { robot?: number } | undefined)?.robot === 1) {
+      return true;
+    }
+    const personInfo = getImChannelInfo(
+      WKSDK.shared(),
+      new Channel(uid, ChannelTypePerson)
+    );
+    return (
+      (personInfo as { orgData?: { robot?: number } } | undefined)?.orgData
+        ?.robot === 1
+    );
   }
 
   // 定位消息
@@ -3538,6 +3566,24 @@ export class Conversation
                       );
                     },
                   },
+                  // 仅 bot 可见：进入该机器人的工作区。
+                  // ContextMenus 叶子项点击时先 hide() 再执行 onClick，弹层自动关闭。
+                  ...(this.isSelectedUserBot()
+                    ? [
+                        {
+                          title: t(
+                            "base.conversation.avatarMenu.enterWorkspace"
+                          ),
+                          icon: LayoutDashboard,
+                          onClick: () => {
+                            if (!this.vm.selectUID) {
+                              return;
+                            }
+                            openWorkspaceUrl(this.vm.selectUID);
+                          },
+                        },
+                      ]
+                    : []),
                 ]}
               />
             </>

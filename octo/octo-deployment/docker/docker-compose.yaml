@@ -866,6 +866,11 @@ services:
       # 28443 (see .env.example). See docker/certs/README.md for the
       # full procedure.
       # - "${OCTO_HTTPS_PORT:-28443}:443"
+    # Resolve host.docker.internal to the Docker host — required by the
+    # /workbench/ route in nginx/conf.d/octo.conf.template, which proxies
+    # to the host-side workbench process on port 28090.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/conf.d:/etc/nginx/templates:ro

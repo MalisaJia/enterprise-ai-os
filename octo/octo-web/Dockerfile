@@ -1,8 +1,14 @@
 FROM node:22.16.0-bookworm AS builder
 WORKDIR /app
 RUN npm install -g pnpm@10
+
 COPY . .
+
 RUN git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/" && git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile
+
 ARG VITE_DOCS_DEFAULT_SPACE
 ENV VITE_DOCS_DEFAULT_SPACE=${VITE_DOCS_DEFAULT_SPACE}
 ARG VITE_DOCS_DEFAULT_FOLDER
@@ -21,7 +27,9 @@ ARG VITE_ENTERPRISE_HTML_HEAD_PATH
 ENV VITE_ENTERPRISE_HTML_HEAD_PATH=${VITE_ENTERPRISE_HTML_HEAD_PATH}
 ARG VITE_ENTERPRISE_FS_ALLOW
 ENV VITE_ENTERPRISE_FS_ALLOW=${VITE_ENTERPRISE_FS_ALLOW}
-RUN pnpm install --frozen-lockfile && pnpm turbo run build --filter=@octo/web
+
+RUN --mount=type=cache,id=turbo,target=/app/node_modules/.cache/turbo \
+    pnpm turbo run build --filter=@octo/web
 
 FROM nginx:alpine
 COPY --from=builder /app/docker-entrypoint.sh /docker-entrypoint2.sh 

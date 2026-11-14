@@ -14,6 +14,13 @@ export const SPLITTER_MAX_WIDTH = 360
 export const SPLITTER_DEFAULT_WIDTH = 300
 export const SPLITTER_STORAGE_KEY = 'wk-layout-left-width'
 
+// ── Left panel override for the workspace (workbench iframe) page ──
+// The conversation-list max (SPLITTER_MAX_WIDTH=360) is too narrow for the
+// workbench view; consumers request these limits via the preferred-width
+// event (see WKLayout.preferredWidthListener). Chat behavior is untouched.
+export const WORKSPACE_SPLITTER_MAX_WIDTH = 1600
+export const WORKSPACE_SPLITTER_RATIO = 0.7
+
 // ── Global NavRail ──
 export const NAV_RAIL_COLLAPSED_WIDTH = 56
 export const NAV_RAIL_MIN_WIDTH = 56

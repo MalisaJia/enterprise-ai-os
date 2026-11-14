@@ -39,9 +39,9 @@ const translations: Record<string, string> = {
   "app.onboarding.sections.createBot.label": "Create your Bot",
   "app.onboarding.sections.createBot.title": "Create your Bot",
   "app.onboarding.sections.createBot.description":
-    "Create your first Bot in BotFather and start using Octo.",
+    "Create your first Bot in BotStudio and start using Octo.",
   "app.onboarding.sections.createBot.imageAlt":
-    "Cursor hovering over the BotFather entry",
+    "Cursor hovering over the BotStudio entry",
   "app.onboarding.actions.finish": "Finish",
   "app.onboarding.actions.completed": "Completed",
   "app.onboarding.actions.closeAria": "Close",
@@ -190,7 +190,7 @@ describe("Onboarding", () => {
     expect(preloadedSources).toEqual(["https://example.test/onboarding-2.png"]);
   });
 
-  it("uses the BotFather image page as the final directory section", () => {
+  it("uses the BotStudio image page as the final directory section", () => {
     render(<Onboarding forceVisible skipIntro />);
 
     fireEvent.click(screen.getByRole("button", { name: /Create your Bot/ }));
@@ -200,12 +200,12 @@ describe("Onboarding", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("img", {
-        name: "Cursor hovering over the BotFather entry",
+        name: "Cursor hovering over the BotStudio entry",
       })
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Create your first Bot in BotFather and start using Octo."
+        "Create your first Bot in BotStudio and start using Octo."
       )
     ).toHaveClass("wk-onboarding-description-lead");
     expect(screen.getByRole("button", { name: "Finish" })).toBeInTheDocument();

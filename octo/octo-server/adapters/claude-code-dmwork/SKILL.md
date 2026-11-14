@@ -12,7 +12,7 @@ openclaw plugins install octo
 
 ### 2. Get a Bot Token
 
-In DMWork, find **BotFather** in your contacts and send:
+In DMWork, find **BotStudio** in your contacts and send:
 1. `/newbot` — create a new bot
 2. Set bot name and username
 3. Copy the bot token (starts with `bf_`)
@@ -48,7 +48,7 @@ Your bot is now online and will:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `botToken` | required | Bot token from BotFather |
+| `botToken` | required | Bot token from BotStudio |
 | `apiUrl` | required | DMWork API URL |
 | `wsUrl` | required | WuKongIM WebSocket URL |
 | `requireMention` | `true` | Group chat: only respond when @mentioned |

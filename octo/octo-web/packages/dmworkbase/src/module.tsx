@@ -15,13 +15,19 @@ import {
   WKSDK,
   ConnectStatus,
 } from "wukongimjssdk";
-import React, { ElementType } from "react";
-import { Smile, Scissors, ImagePlus, Paperclip, AtSign } from "lucide-react";
+import React, { ElementType, Suspense } from "react";
+import { Smile, Scissors, ImagePlus, Paperclip, AtSign, LayoutDashboard } from "lucide-react";
 import { Howl, Howler } from "howler";
 import WKApp, { FriendApply, FriendApplyState, ThemeMode } from "./App";
 import { isChannelSearchEnabled } from "./features/channelSearch/feature";
 import { voiceSettingsStore } from "./Service/VoiceSettingsStore";
 import ChatSearchEntryButton from "./features/channelSearch/ChatSearchEntryButton";
+import WorkspaceEntryButton from "./features/workspace/WorkspaceEntryButton";
+import {
+  getLastWorkspaceUrl,
+  WORKSPACE_MENU_ID,
+} from "./features/workspace/workspaceNavigation";
+import { Menus } from "./Service/Menus";
 import { isElectronPowered } from "./electron/desktopBridge";
 import { ChannelSettingRouteData } from "./Components/ChannelSetting/context";
 import { InputEdit } from "./Components/InputEdit";
@@ -179,6 +185,23 @@ import {
   buildThreadActionsSection,
   buildThreadOverviewSection,
 } from "./features/channelSetting/channelSettingThreadSections";
+
+// 工作区双栏页懒加载组件：避免进入首屏 chunk，仅在命中 /workspace 时拉取。
+const WorkspacePageLazy = React.lazy(() => import("./Pages/Workspace"));
+
+/**
+ * 工作区 NavRail 菜单图标。与 mail / dmworkmcp 的菜单图标同构：
+ * active 态用品牌色，非 active 用 currentColor 跟随 NavRail 配色。
+ */
+function WorkspaceMenuIcon({ active }: { active?: boolean }) {
+  return (
+    <LayoutDashboard
+      size={22}
+      strokeWidth={1.8}
+      color={active ? "var(--wk-brand-primary)" : "currentColor"}
+    />
+  );
+}
 
 /** execCommand 降级复制，用于 navigator.clipboard 不可用的场景 */
 function fallbackCopy(text: string) {
@@ -711,6 +734,65 @@ export default class BaseModule implements IModule {
 
     this.registerChatToolbars(); // 注册聊天工具栏
     this.registerChannelHeaderRightItems(); // 注册频道头部右侧入口按钮
+    this.registerWorkspaceRoute(); // 注册 /workspace 工作区双栏页（懒加载，不进首屏 chunk）
+  }
+
+  /**
+   * `/workspace` 工作区页。精确注册 `/workspace` 即可 ——
+   * `normalizeRoutePath` 会剥掉 query，`/workspace?bot=...` 仍命中本路由；
+   * 页面内部自行消费 `window.location.search`（bot/session/path）。
+   *
+   * 用 `React.lazy` 懒加载，使工作区页不进入首屏 chunk。
+   *
+   * ⚠️ 只注册路由不够：宿主（apps/web Main）只挂载「NavRail 菜单注册表」
+   * 能解析的路由 —— MainVM.findMenuForRoute 把 URL 解析成菜单，菜单的
+   * routePath 才进 historyRoutePaths，MainContentLeft 才调 route.get() 挂载；
+   * 而 route.push()/renderCurrentPath 的产出只写 restContent 槽位，当前宿主
+   * 无消费者（这正是「注册代码在、运行时不渲染」的根因）。因此下面补注册
+   * workspace 菜单，与 mail `/mail`、dmworkmcp `/mcp-market*` 的生效先例同构。
+   */
+  registerWorkspaceRoute() {
+    WKApp.route.register("/workspace", () => {
+      return (
+        <Suspense fallback={null}>
+          <WorkspacePageLazy />
+        </Suspense>
+      );
+    });
+
+    // NavRail 菜单：让宿主能把 /workspace 解析进 historyRoutePaths 并渲染。
+    // sort=2000 紧跟 chat(1000)、在 contacts(4000) 之前。
+    WKApp.menus.register(
+      WORKSPACE_MENU_ID,
+      () => {
+        const m = new Menus(
+          WORKSPACE_MENU_ID,
+          "/workspace",
+          t("base.workspace.title"),
+          <WorkspaceMenuIcon />,
+          <WorkspaceMenuIcon active />
+        );
+        // 宿主 onMenuClick 在 onPress 存在时跳过默认分支，左侧栈由我们自己清。
+        // 右侧会话栏由 WorkspacePage 挂载时自行 replaceToRoot（单一事实源，
+        // 覆盖冷加载 / NavRail 点击 / 头部按钮三条路径）。
+        m.onPress = (_reentry?: boolean) => {
+          WKApp.routeLeft.popToRoot();
+          // onMenuClick 先于 onPress 执行 syncPath("/workspace")，pushState 的裸路径
+          // 会把 ?bot=... 冲掉；这里把最近一次带参 URL 补回地址栏，
+          // 保证刷新/复制链接/后退仍落在同一个工作区。
+          const lastUrl = getLastWorkspaceUrl();
+          if (lastUrl !== "/workspace") {
+            try {
+              window.history.replaceState({}, "title", lastUrl);
+            } catch {
+              // best-effort
+            }
+          }
+        };
+        return m;
+      },
+      2000
+    );
   }
 
   /**
@@ -726,6 +808,15 @@ export default class BaseModule implements IModule {
         return <ChatSearchEntryButton channel={channel} />;
       },
       4900 // 排在 summary (5100) 之前
+    );
+
+    // 工作区入口：仅 1v1 且对端为机器人时显示（组件内部异步判定，非机器人返回 null）。
+    WKApp.endpoints.registerChannelHeaderRightItem(
+      "channelheader.workspace",
+      ({ channel }) => {
+        return <WorkspaceEntryButton channel={channel} />;
+      },
+      5200
     );
   }
 

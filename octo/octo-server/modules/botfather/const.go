@@ -3,12 +3,15 @@ package botfather
 import "github.com/Mininglamp-OSS/octo-server/modules/botfather/cmdmenu"
 
 const (
-	// BotFatherUID BotFather的用户UID。真相源在 cmdmenu 叶子包（#335）——
-	// 读路径模块（user/channel/robot）需要匹配该 UID 却不能 import 本包
-	//（botfather → user 会成环），这里保留别名供包内调用点使用。
+	// BotFatherUID 系统Bot的用户UID（历史名 botfather，内部标识保持不变——
+	// 动它会断掉好友关系/消息历史/已签发 token；显示名见 BotFatherName）。
+	// 真相源在 cmdmenu 叶子包（#335）——读路径模块（user/channel/robot）需要
+	// 匹配该 UID 却不能 import 本包（botfather → user 会成环），这里保留别名
+	// 供包内调用点使用。
 	BotFatherUID = cmdmenu.BotFatherUID
-	// BotFatherName BotFather的显示名称
-	BotFatherName = "BotFather"
+	// BotFatherName 系统Bot的显示名称（原 BotFather，2026-09 去爹味改名 BotStudio。
+	// 常量名保留 BotFatherName 不改，避免大面积无意义重命名）。
+	BotFatherName = "BotStudio"
 	// System UIDs excluded from bot-related batch operations
 	systemUIDAdmin      = "u_10000"
 	systemUIDFileHelper = "fileHelper"

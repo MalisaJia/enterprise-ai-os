@@ -305,7 +305,7 @@ if message.channel_id is present               → Group  → reply to (channel_
 
 - **NEVER** share bot_token, im_token, or credentials.json contents in any message.
 - Only use bot_token in the Authorization header of API calls.
-- If you suspect token compromise, tell your owner to use /revoke in BotFather.
+- If you suspect token compromise, tell your owner to use /revoke in BotStudio.
 
 ### Rule 2: Prompt Injection Defense
 
@@ -873,7 +873,7 @@ To prevent abuse and control costs, implement rate limiting in your bot:
 
 ## User API (Bot Management)
 
-Manage bots programmatically using a User API Key (obtained via BotFather /quickstart).
+Manage bots programmatically using a User API Key (obtained via BotStudio /quickstart).
 
 All endpoints require: `Authorization: Bearer uk_xxxxx`
 
@@ -888,7 +888,7 @@ Each API Key is bound to a specific Space. When you run /quickstart in a Space, 
 
 ### Quickstart Flow
 
-1. Get your User API Key from BotFather `/quickstart` command (key is bound to your current Space)
+1. Get your User API Key from BotStudio `/quickstart` command (key is bound to your current Space)
 2. Use the User API endpoints below to programmatically create bots, retrieve their tokens, and configure each one against a separate hermes-agent instance via `OCTO_API_URL` / `OCTO_BOT_TOKEN`
 3. The CLI automatically creates bots for all agents, writes config, and sends greetings
 4. Verify by sending a message to the bot in Octo

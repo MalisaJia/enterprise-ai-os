@@ -33,31 +33,31 @@ const { chromium } = require('@playwright/test');
   await page.screenshot({ path: '/tmp/e2e-01-main.png' });
   console.log('📸 主界面截图: /tmp/e2e-01-main.png');
   
-  // 2. 找到 BotFather 会话
-  console.log('\n=== 2. 找 BotFather ===');
+  // 2. 找到 BotStudio（uid 仍为 botfather）会话
+  console.log('\n=== 2. 找 BotStudio ===');
   // 搜索 botfather
   const searchInput = await page.$('input[placeholder*="搜索"]');
   if (searchInput) {
-    await searchInput.fill('BotFather');
+    await searchInput.fill('BotStudio');
     await page.waitForTimeout(2000);
     await page.screenshot({ path: '/tmp/e2e-02-search.png' });
     console.log('📸 搜索截图: /tmp/e2e-02-search.png');
     
     // 点击搜索结果
-    const result = await page.$('text=BotFather');
+    const result = await page.$('text=BotStudio');
     if (result) {
       await result.click();
       await page.waitForTimeout(2000);
-      console.log('✅ 找到 BotFather');
+      console.log('✅ 找到 BotStudio');
     } else {
-      console.log('❌ 搜索结果中没找到 BotFather');
+      console.log('❌ 搜索结果中没找到 BotStudio');
     }
   } else {
     console.log('⚠️ 没找到搜索框，尝试直接找会话列表');
   }
   
-  await page.screenshot({ path: '/tmp/e2e-03-botfather.png' });
-  console.log('📸 BotFather 截图: /tmp/e2e-03-botfather.png');
+  await page.screenshot({ path: '/tmp/e2e-03-botstudio.png' });
+  console.log('📸 BotStudio 截图: /tmp/e2e-03-botstudio.png');
   
   // 3. 发送 /newbot
   console.log('\n=== 3. 发送 /newbot ===');

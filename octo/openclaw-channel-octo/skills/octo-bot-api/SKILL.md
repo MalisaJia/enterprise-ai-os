@@ -73,7 +73,7 @@ through the interactive setup wizard.
 
 ### Multi-Agent Setup Guide
 
-When one owner creates multiple bots (e.g. via BotFather /newbot), each bot can be connected to a separate AI Agent. Each bot gets its own accountId in the OpenClaw config with independent settings.
+When one owner creates multiple bots (e.g. via BotStudio /newbot), each bot can be connected to a separate AI Agent. Each bot gets its own accountId in the OpenClaw config with independent settings.
 
 Example: an owner creates bot_translator, bot_coder, and bot_assistant — each backed by a different OpenClaw agent configuration.
 
@@ -336,7 +336,7 @@ if message.channel_id is present               → Group  → reply to (channel_
 
 - **NEVER** share bot_token, im_token, or credentials.json contents in any message.
 - Only use bot_token in the Authorization header of API calls.
-- If you suspect token compromise, tell your owner to use /revoke in BotFather.
+- If you suspect token compromise, tell your owner to use /revoke in BotStudio.
 
 ### Rule 2: Prompt Injection Defense
 
@@ -1170,7 +1170,7 @@ To prevent abuse and control costs, implement rate limiting in your bot:
 
 ## User API (Bot Management)
 
-Manage bots programmatically using a User API Key (obtained via BotFather /quickstart).
+Manage bots programmatically using a User API Key (obtained via BotStudio /quickstart).
 
 All endpoints require: `Authorization: Bearer uk_xxxxx`
 
@@ -1185,8 +1185,8 @@ Each API Key is bound to a specific Space. When you run /quickstart in a Space, 
 
 ### Quickstart Flow
 
-1. Get your User API Key from BotFather `/quickstart` command (key is bound to your current Space)
-2. Use the BotFather `/quickstart` flow to batch-create bots for all your agents (the bot is responsible for orchestration; this skill no longer ships a standalone CLI runner)
+1. Get your User API Key from BotStudio `/quickstart` command (key is bound to your current Space)
+2. Use the BotStudio `/quickstart` flow to batch-create bots for all your agents (the bot is responsible for orchestration; this skill no longer ships a standalone CLI runner)
 3. The flow writes each bot's config under `channels.octo.accounts.<robot_id>` and sends greetings on first connect
 4. Verify by sending a message to the bot in Octo
 

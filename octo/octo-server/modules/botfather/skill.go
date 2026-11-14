@@ -76,12 +76,12 @@ npx -y create-openclaw-octo quickstart --api-key <uk_key> --api-url <url>
 func generateSetupNewbotMD(_ string) string {
 	return `---
 name: octo-setup-newbot
-description: 收到 BotFather /newbot 创建的 bot 信息后，执行 bind 命令完成配置和绑定。
+description: 收到 BotStudio /newbot 创建的 bot 信息后，执行 bind 命令完成配置和绑定。
 ---
 
 # Octo Newbot 绑定流程
 
-收到 BotFather 的 bot 信息后（Bot Token、API Server、Account ID），执行以下命令：
+收到 BotStudio 的 bot 信息后（Bot Token、API Server、Account ID），执行以下命令：
 
 ` + "```" + `
 npx -y create-openclaw-octo bind --bot-token <Bot Token> --api-url <API Server> --account-id <Account ID> --agent <agent标识>
@@ -120,12 +120,12 @@ https://github.com/Mininglamp-OSS/openclaw-channel-octo/blob/main/skills/octo-bo
 func generateSetupQuickstartMD(_ string) string {
 	return `---
 name: octo-setup-quickstart
-description: 收到 BotFather /quickstart 的 API Key 后，执行 quickstart 命令为所有 agent 批量创建并绑定 bot。
+description: 收到 BotStudio /quickstart 的 API Key 后，执行 quickstart 命令为所有 agent 批量创建并绑定 bot。
 ---
 
 # Octo Quickstart 流程
 
-收到 BotFather 的 User API Key 和 API Server 后，执行以下命令：
+收到 BotStudio 的 User API Key 和 API Server 后，执行以下命令：
 
 ` + "```" + `
 npx -y create-openclaw-octo quickstart --api-key <User API Key> --api-url <API Server>

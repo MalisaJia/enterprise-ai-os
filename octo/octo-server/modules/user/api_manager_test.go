@@ -355,7 +355,7 @@ func TestUserListBotAndSystemFlags(t *testing.T) {
 		UID:      "botfather",
 		ShortNo:  util.GenerUUID(),
 		Username: "botfather",
-		Name:     "BotFather",
+		Name:     "BotStudio",
 		Status:   1,
 		Robot:    1,
 		Password: util.MD5(util.MD5("444")),

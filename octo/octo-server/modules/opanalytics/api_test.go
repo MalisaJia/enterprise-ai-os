@@ -1183,7 +1183,7 @@ func TestOpanalyticsETLExclusion(t *testing.T) {
 	fc := seedScenario(t, ctx)
 
 	// 注入排除账号：botfather(系统bot，agent) + u_test(category=system，human)。
-	seedUserCat(t, ctx, "botfather", "BotFather", 1, "")
+	seedUserCat(t, ctx, "botfather", "BotStudio", 1, "")
 	seedUserCat(t, ctx, "u_test", "Tester", 0, "system")
 	seedGroupMember(t, ctx, "g1", "botfather", 1) // 系统bot 是群成员，但不应计入成员数
 

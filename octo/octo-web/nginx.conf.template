@@ -379,6 +379,12 @@ server {
             client_max_body_size 10m;
         }
 
+        # Vite 哈希产物（/assets/*）内容指纹入名，可长期强缓存，命中即免回源。
+        location /assets/ {
+            root   /usr/share/nginx/html;
+            add_header Cache-Control "public, max-age=31536000, immutable";
+        }
+
         location / {
             root   /usr/share/nginx/html;
             index  index.html index.htm;

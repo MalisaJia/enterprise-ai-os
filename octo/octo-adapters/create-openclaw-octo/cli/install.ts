@@ -355,7 +355,7 @@ export async function runInstall(opts: InstallOptions): Promise<void> {
     console.log("Warning: Gateway restart failed. Run 'openclaw gateway restart' manually.");
   }
 
-  console.log("\nOcto plugin ready! Use BotFather /newbot or /quickstart to configure bots.");
+  console.log("\nOcto plugin ready! Use BotStudio /newbot or /quickstart to configure bots.");
 }
 
 // ---------------------------------------------------------------------------

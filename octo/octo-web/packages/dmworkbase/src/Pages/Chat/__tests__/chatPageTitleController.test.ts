@@ -29,12 +29,12 @@ describe("ChatPageTitleController", () => {
 
   it("uses the actual conversation page opened outside the sidebar", () => {
     const botFather = new Channel("botfather", ChannelTypePerson);
-    infos.set(botFather.getChannelKey(), channelInfo(botFather, "BotFather"));
+    infos.set(botFather.getChannelKey(), channelInfo(botFather, "BotStudio"));
 
     controller.activate(botFather, Symbol("contacts-entry"));
 
     expect(contexts.get("chat")).toEqual({
-      primaryTitle: "BotFather",
+      primaryTitle: "BotStudio",
       parentTitle: undefined,
     });
   });

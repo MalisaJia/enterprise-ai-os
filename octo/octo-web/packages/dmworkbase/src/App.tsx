@@ -75,6 +75,12 @@ export type MittEvents = {
   'wk:nav-menu-activated': { menuId: string };
   /** The canonical active top-level page changed (including boot, history and config reconciliation). */
   'wk:active-menu-changed': { menuId?: string };
+  /**
+   * openWorkspaceUrl 已进入（或重入）工作区且带参 URL 已写回地址栏。
+   * WorkspacePage 据此重读 location.search 并重建右侧会话，覆盖「已在工作区时
+   * 再次打开另一个入口」这种不触发菜单切换的重入场景。
+   */
+  'wk:workspace-activated': { url: string };
   /** Login, logout or account replacement changed the identity that owns page-level state. */
   'wk:auth-state-changed': undefined;
   /**

@@ -515,14 +515,14 @@ const meta = {
 const ACCOUNT_ID_RE = /^[A-Za-z0-9_]+$/;
 
 // Two token prefixes bind through this channel:
-//   bf_*  — User Bot (BotFather /newbot): full group + thread + OBO access.
+//   bf_*  — User Bot (BotStudio /newbot): full group + thread + OBO access.
 //   app_* — App Bot (Admin 后台「应用 Bot」): DM-only, server-enforced.
 // The CLI's job is to let either bind; the capability boundary is enforced
 // server-side (octo-server bot_api rejects App Bot group/thread/OBO calls),
 // so we must not reject app_ here just because it can't do everything bf_ can.
 const BOT_TOKEN_PREFIXES = ["bf_", "app_"] as const;
 const BOT_TOKEN_ERROR =
-  "Bot token must start with 'bf_' (BotFather /newbot) or 'app_' (Admin App Bot) and be longer than 13 chars.";
+  "Bot token must start with 'bf_' (BotStudio /newbot) or 'app_' (Admin App Bot) and be longer than 13 chars.";
 
 function isValidBotToken(v: unknown): v is string {
   return (

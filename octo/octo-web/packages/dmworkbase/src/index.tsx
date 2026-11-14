@@ -19,6 +19,8 @@ export * from './Service/RoutePath'
 export * from './Service/deviceFlags'
 export * from './Service/DataSource/DataProvider'
 export { default as ChatPage } from "./Pages/Chat"
+export { ChatContentPage } from "./Pages/Chat"
+export type { ChatContentPageProps } from "./Pages/Chat"
 export * from './Components/ChannelSetting/context'
 export * from './Service/DataSource/DataSource'
 export * from './Service/IncomingWebhook'

@@ -157,12 +157,12 @@ func TestSendWelcomeMessage(t *testing.T) {
 
 func TestWelcomeMessageRenders(t *testing.T) {
 	// The welcome message must render in every supported language and keep the
-	// stable anchors callers rely on (BotFather identity + the /newbot CTA).
+	// stable anchors callers rely on (BotStudio identity + the /newbot CTA).
 	for _, lang := range octoi18n.SupportedLanguages() {
 		got, err := botMessages.Render(MsgWelcome, lang, nil)
 		assert.NoError(t, err, "render welcome for %s", lang)
 		assert.NotEmpty(t, got, "welcome for %s", lang)
-		assert.Contains(t, got, "BotFather", "welcome for %s", lang)
+		assert.Contains(t, got, "BotStudio", "welcome for %s", lang)
 		assert.Contains(t, got, "/newbot", "welcome for %s", lang)
 	}
 }

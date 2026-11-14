@@ -41,6 +41,10 @@ upstream octo_minio_api {
 server {
     listen       80 default_server;
     listen       [::]:80 default_server;
+    # Emit relative Location headers on 301/302 redirects so the browser
+    # preserves the original host:port (nginx listens on 80 but is mapped
+    # to a non-standard external port such as 28080).
+    absolute_redirect off;
     server_name  ${OCTO_DOMAIN} localhost _;
 
     # ----------------------------------------------------------------------
@@ -313,6 +317,52 @@ server {
         return 301 /docs-api/;
     }
 
+    location ^~ /workbench/ {
+        # Web workbench served by a host-side process on the fixed
+        # loopback-adjacent port 28090 (upstream convention, literal
+        # port). Same octo_api zone (30r/s, 10MB) as /matter/ and
+        # /summary/ — keeps the nginx-fronted surface within the same
+        # per-IP budget as the rest of the OCTO REST API.
+        #
+        # URI handling: the upstream already routes under the
+        # `/workbench/` prefix itself (static `/workbench/`, API
+        # `/workbench/api/*`), so this is an identity transform — no
+        # `rewrite`, and the literal `proxy_pass` carries NO URI
+        # component so nginx forwards the original request URI
+        # unchanged (same pattern as `/admin/` above).
+        #
+        # The target is `host.docker.internal` — a container-scoped
+        # name mapped to the Docker host by the nginx service's
+        # `extra_hosts` entry in docker-compose.yaml (that entry writes
+        # the name into the container's /etc/hosts). A LITERAL upstream
+        # is resolved by nginx once, at config-load time, through the
+        # system resolver stack (i.e. /etc/hosts) — which is exactly
+        # what makes this route work.
+        #
+        # The earlier variable form (`set $upstream_workbench …` +
+        # location-level `resolver 127.0.0.11`) is UNUSABLE here and
+        # was removed: at request time it resolves ONLY against
+        # Docker's embedded DNS, and that resolver does NOT serve
+        # `extra_hosts` (/etc/hosts) entries — so on Linux every
+        # /workbench/* request NXDOMAIN'd and returned 502.
+        #
+        # Accepted trade-off: if `host.docker.internal` does not
+        # resolve when nginx loads this config (e.g. someone removed
+        # the `extra_hosts` entry from the nginx service in
+        # docker-compose.yaml), nginx refuses to start with an emerg
+        # "host not found in upstream". That is intentional —
+        # `extra_hosts` is a hard prerequisite, and failing at startup
+        # is better than a silently dead route. `^~` makes the prefix
+        # match win over any regex location (same as `^~ /v1/`).
+        limit_req zone=octo_api burst=20 nodelay;
+        proxy_pass         http://host.docker.internal:28090;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+
     location /docs-ws/ {
         # Hocuspocus WebSocket relay — upgrade semantics must be preserved.
         # Variable proxy_pass + Docker DNS defers resolution so nginx starts
@@ -555,6 +605,26 @@ to reach it (<code>ssh -L 28088:127.0.0.1:28088 user@host</code>).</p>
 #
 #     location = /docs-api {
 #         return 301 /docs-api/;
+#     }
+#
+#     location ^~ /workbench/ {
+#         # Web workbench — host-side process on port 28090. Identity
+#         # transform (no rewrite): the upstream already routes under
+#         # `/workbench/` itself. LITERAL upstream: resolved once at
+#         # config-load time via /etc/hosts (entry provided by the
+#         # nginx service's `extra_hosts` in docker-compose.yaml); the
+#         # variable+resolver form is unusable because Docker's
+#         # embedded DNS does not serve extra_hosts entries. If the
+#         # name is missing at load time nginx refuses to start
+#         # (emerg) — intended: extra_hosts is a hard prerequisite.
+#         # See the HTTP server block above for the full rationale.
+#         limit_req zone=octo_api burst=20 nodelay;
+#         proxy_pass         http://host.docker.internal:28090;
+#         proxy_http_version 1.1;
+#         proxy_set_header   Host              $host;
+#         proxy_set_header   X-Real-IP         $remote_addr;
+#         proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+#         proxy_set_header   X-Forwarded-Proto $scheme;
 #     }
 #
 #     location /docs-ws/ {

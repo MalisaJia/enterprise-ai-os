@@ -17,7 +17,7 @@ Repository: https://github.com/Mininglamp-OSS/octo-adapters
 
 - Node.js >= 18
 - OpenClaw installed and configured (`npm i -g openclaw`)
-- A bot created via BotFather in Octo (send `/newbot` to BotFather)
+- A bot created via BotStudio in Octo (send `/newbot` to BotStudio)
 
 ## Install
 
@@ -105,7 +105,7 @@ Bot accounts are stored in `~/.openclaw/openclaw.json` under `channels.octo.acco
 
 Configuration fields per account:
 
-- `botToken` (required): Bot token. Either a User Bot token from BotFather (`bf_` prefix, full group + thread access) or an App Bot token from the Octo admin console (`app_` prefix, direct-message only — server-enforced).
+- `botToken` (required): Bot token. Either a User Bot token from BotStudio (`bf_` prefix, full group + thread access) or an App Bot token from the Octo admin console (`app_` prefix, direct-message only — server-enforced).
 - `apiUrl` (required): Octo server API URL
 - `wsUrl` (optional): WuKongIM WebSocket URL. Auto-detected if omitted.
 - `requireMention` (optional): Only respond when @mentioned in groups

@@ -288,6 +288,11 @@ func (bf *BotFather) initBotFatherUser() {
 	// 确保 BotFather auto_approve=1（修复已有部署）
 	_, _ = bf.db.session.UpdateBySql("UPDATE robot SET auto_approve=1 WHERE robot_id=? AND auto_approve=0", BotFatherUID).Exec()
 
+	// 确保存量部署显示名自愈：老库 user.name 仍是旧名（"BotFather"）时统一改为
+	// 当前 BotFatherName（"BotStudio"，2026-09 改名）。只钉旧值，不覆盖用户侧
+	// 手动改过的名字之外的其他值；幂等，重启无副作用。
+	_, _ = bf.db.session.UpdateBySql("UPDATE user SET name=? WHERE uid=? AND name=?", BotFatherName, BotFatherUID, "BotFather").Exec()
+
 	// 修复孤儿 Bot — user 表有 robot=1 但 robot 表无记录（#234 遗留数据）
 	bf.repairOrphanBots()
 

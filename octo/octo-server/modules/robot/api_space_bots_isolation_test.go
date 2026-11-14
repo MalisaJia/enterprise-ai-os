@@ -154,7 +154,7 @@ func TestSpaceBots_MemberUnaffected(t *testing.T) {
 	// 无法证伪——而这两件正是本用例声称要钉住的。补第二个 bot（created_at 更晚，
 	// 因此必须排在前面）和一条 botfather 记录，让断言真的能失败。
 	seedIsolationBot(t, ctx, spaceID, "sb_iso_bot_newer", "Newer Bot")
-	seedIsolationBot(t, ctx, spaceID, "botfather", "BotFather")
+	seedIsolationBot(t, ctx, spaceID, "botfather", "BotStudio")
 	// 显式拉开 created_at：两行同秒插入时 ORDER BY u.created_at DESC 的结果不确定，
 	// 断言会随机翻车。把时间钉死，排序断言才真正在验证排序而不是碰运气。
 	for uid, at := range map[string]string{

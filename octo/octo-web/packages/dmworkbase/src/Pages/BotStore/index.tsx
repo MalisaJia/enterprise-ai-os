@@ -150,7 +150,7 @@ export default class BotStore extends Component<{}, BotStoreState> {
                 <div className="wk-bot-father" onClick={this.handleBotFatherChat}>
                     <div className="wk-bot-father-avatar">⚙️</div>
                     <div className="wk-bot-father-info">
-                        <div className="wk-bot-father-name">BotFather</div>
+                        <div className="wk-bot-father-name">BotStudio</div>
                         <div className="wk-bot-father-desc">
                             {t("base.botStore.botFatherDesc")}
                         </div>

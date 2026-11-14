@@ -9,6 +9,7 @@ import { WKAvatarUploadPreview } from "../WKAvatarUploadPreview";
 import WKAvatarPreviewImage from "../WKAvatarPreviewImage";
 import ClawInfoModal from "../ClawInfoModal/ClawInfoModal";
 import BotManageModal from "../BotManage";
+import { openWorkspaceUrl } from "../../features/workspace/workspaceNavigation";
 import { I18nContext, t } from "../../i18n";
 import { canvasToPngFile, isAvatarFileTooLarge, isGifImageFile } from "../avatarUpload";
 import type { ReplaceMode, SelectionRange } from "../VoiceInputButton";
@@ -114,6 +115,14 @@ export default class BotDetailModal extends Component<BotDetailModalProps> {
     handleClose = () => {
         this.vm.resetTransientState();
         this.props.onClose();
+    };
+
+    // 仅 owner 才有此入口：关闭当前资料弹层后跳转到该 bot 的工作区。
+    // 统一走 openWorkspaceUrl（菜单激活 + 带参 URL）；route.push 的 restContent
+    // 槽位在宿主无渲染消费者，直接推路由会出现「URL 变了、页面不动」。
+    handleOpenWorkspace = () => {
+        this.handleClose();
+        openWorkspaceUrl(this.props.uid);
     };
 
     // === Owner 头像编辑 ===
@@ -379,6 +388,7 @@ export default class BotDetailModal extends Component<BotDetailModalProps> {
                         applySend: t("base.botDetail.apply.send"),
                         save: t("base.botDetail.save"),
                         cancel: t("base.common.cancel"),
+                        openWorkspace: t("base.botDetail.openWorkspace"),
                     }}
                     onClose={this.handleClose}
                     onAvatarClick={this.handleAvatarClick}
@@ -400,6 +410,7 @@ export default class BotDetailModal extends Component<BotDetailModalProps> {
                     onOpenBotManage={this.handleOpenBotManage}
                     onViewClawInfo={this.handleViewClawInfo}
                     onChat={this.handleChat}
+                    onOpenWorkspace={isOwner ? this.handleOpenWorkspace : undefined}
                     onShowApply={this.handleShowApply}
                     onApplyRemarkChange={(value) => this.vm.setApplyRemark(value)}
                     onSubmitApply={this.handleSubmitApply}

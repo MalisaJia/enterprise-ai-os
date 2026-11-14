@@ -55,6 +55,8 @@ export interface BotDetailViewLabels {
   applySend: string;
   save: string;
   cancel: string;
+  /** 打开工作区（可选，仅提供时才渲染次级按钮）。 */
+  openWorkspace?: string;
 }
 
 export interface BotDetailViewProps {
@@ -111,6 +113,8 @@ export interface BotDetailViewProps {
   onOpenBotManage: (event?: React.MouseEvent) => void;
   onViewClawInfo: () => void;
   onChat: () => void;
+  /** 打开工作区（可选）。提供且 isFriend 时在「发消息」旁渲染次级按钮；不传则零回归。 */
+  onOpenWorkspace?: () => void;
   onShowApply: () => void;
   onApplyRemarkChange: (value: string) => void;
   onSubmitApply: () => void;
@@ -164,6 +168,7 @@ export function BotDetailView({
   onOpenBotManage,
   onViewClawInfo,
   onChat,
+  onOpenWorkspace,
   onShowApply,
   onApplyRemarkChange,
   onSubmitApply,
@@ -183,14 +188,26 @@ export function BotDetailView({
           actionClassName="wk-bot-detail-actions"
           action={
             isFriend ? (
-              <WKButton
-                className="wk-bot-detail-primary-action"
-                type="button"
-                variant="primary"
-                onClick={onChat}
-              >
-                {labels.sendMessage}
-              </WKButton>
+              <div className="wk-bot-detail-actions-row">
+                {onOpenWorkspace && (
+                  <WKButton
+                    className="wk-bot-detail-secondary-action"
+                    type="button"
+                    variant="secondary"
+                    onClick={onOpenWorkspace}
+                  >
+                    {labels.openWorkspace}
+                  </WKButton>
+                )}
+                <WKButton
+                  className="wk-bot-detail-primary-action"
+                  type="button"
+                  variant="primary"
+                  onClick={onChat}
+                >
+                  {labels.sendMessage}
+                </WKButton>
+              </div>
             ) : showApplyInput ? (
               <div className="wk-bot-detail-apply">
                 <div className="wk-bot-detail-apply-label">
