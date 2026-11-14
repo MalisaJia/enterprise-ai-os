@@ -14,3 +14,6 @@
 # Windows scripts keep CRLF in the working tree.
 *.ps1 text eol=crlf
 *.bat text eol=crlf
+
+# upstream mirrors / vendored snapshots: keep bytes as-is, do not normalize
+codex-main/** -text
