@@ -1,0 +1,200 @@
+/*
+ * 工作区页（宿主 WKLayout 左栏）。复用全局 `--wk-*` 设计令牌，保证深浅主题一致；
+ * 顶栏用一条底部高光线营造「工作台」的分区感。右侧会话栏由宿主右栏承载，
+ * 本页不再自绘第二列。
+ */
+
+.wk-workspace {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--wk-bg-base);
+  color: var(--wk-text-primary);
+}
+
+/* ---- 顶栏 ---- */
+.wk-workspace-topbar {
+  height: 48px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  box-sizing: border-box;
+  background: var(--wk-bg-base);
+  border-bottom: 1px solid var(--wk-border-default);
+}
+
+.wk-workspace-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--wk-r-sm, 6px);
+  background: transparent;
+  color: var(--wk-text-secondary, var(--wk-text-tertiary));
+  font-size: 13px;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.wk-workspace-back:hover {
+  background: var(--wk-bg-hover);
+  color: var(--wk-text-primary);
+}
+
+.wk-workspace-title {
+  font-size: 14px;
+  font-weight: var(--wk-font-semibold, 600);
+  letter-spacing: 0.2px;
+  color: var(--wk-text-primary);
+}
+
+.wk-workspace-topbar-spacer {
+  flex: 1;
+}
+
+/* ---- 顶栏右侧：面板折叠切换按钮 ---- */
+.wk-workspace-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.wk-workspace-panel-toggle {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--wk-r-sm, 6px);
+  background: transparent;
+  color: var(--wk-text-secondary, var(--wk-text-tertiary));
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.wk-workspace-panel-toggle:hover {
+  background: var(--wk-bg-hover);
+  color: var(--wk-text-primary);
+}
+
+.wk-workspace-panel-toggle[aria-pressed="true"] {
+  color: var(--wk-brand-primary);
+  background: var(
+    --wk-brand-primary-subtle,
+    color-mix(in srgb, var(--wk-brand-primary) 8%, transparent)
+  );
+}
+
+/*
+ * ---- 折叠编排：写在宿主 .wk-layout 根上的 class ----
+ * 右栏（.wk-layout-content-right）是经 routeRight 挂载的宿主面板，
+ * 只隐藏不 unmount，保留聊天状态；左栏宽度用 !important 压过
+ * WKLayout 的内联 width。折叠时连同分隔条一起隐藏，避免悬浮拖拽手柄。
+ */
+.wk-layout.wk-workspace-right-collapsed .wk-layout-content-right,
+.wk-layout.wk-workspace-right-collapsed .wk-layout-splitter {
+  display: none;
+}
+
+.wk-layout.wk-workspace-right-collapsed .wk-layout-content-left {
+  width: 100% !important;
+}
+
+.wk-layout.wk-workspace-navrail-collapsed .wk-layout-tab {
+  width: 0 !important;
+  overflow: hidden;
+}
+
+.wk-layout.wk-workspace-navrail-collapsed .wk-layout-nav-splitter {
+  display: none;
+}
+
+/* ---- 主体分栏 ---- */
+.wk-workspace-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+.wk-workspace-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+}
+
+.wk-workspace-frame {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: var(--wk-bg-base);
+  display: block;
+}
+
+/* ---- 空态 ---- */
+.wk-workspace--empty {
+  align-items: center;
+  justify-content: center;
+}
+
+.wk-workspace-empty-card {
+  max-width: 360px;
+  padding: 40px 32px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.wk-workspace-empty-glyph {
+  width: 72px;
+  height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--wk-r-circle, 999px);
+  background: var(--wk-bg-hover);
+  color: var(--wk-text-tertiary);
+  margin-bottom: 6px;
+}
+
+.wk-workspace-empty-title {
+  font-size: 16px;
+  font-weight: var(--wk-font-semibold, 600);
+  color: var(--wk-text-primary);
+}
+
+.wk-workspace-empty-desc {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--wk-text-tertiary);
+}
+
+.wk-workspace-empty-action {
+  margin-top: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 16px;
+  border: 1px solid var(--wk-border-default);
+  border-radius: var(--wk-r-sm, 6px);
+  background: var(--wk-bg-base);
+  color: var(--wk-text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.wk-workspace-empty-action:hover {
+  background: var(--wk-bg-hover);
+  border-color: var(--wk-border-strong, var(--wk-border-default));
+}
