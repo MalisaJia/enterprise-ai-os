@@ -2,14 +2,19 @@
 
 本目录提供把桥接器接到 **GLM-5.2** 所需的两个配置文件模板。
 模板已按实测调整:实际接入方式**不是**智谱官方端点,而是**自建
-new-api 网关** `https://ai.wuguhub.com/v1`——已实测其 `POST /v1/responses`
+new-api 网关** `https://<your-gateway-host>/v1`——已实测其 `POST /v1/responses`
 返回标准 Responses 协议响应(`status = "completed"`),**协议兼容 ✅**,可直接供 Codex 使用。
 网关模型列表只有 **`glm-5.2`**(推理模型,返回 `reasoning_tokens`)。
+
+> **网关地址为占位符**:模板里统一写作 `<your-gateway-host>`,
+> 请填入**你自己的**网关地址(改 `config.toml` 的 `base_url`,或执行
+> `setup-on-server.sh` 时用环境变量 `LLM_API_URL` 注入)。不要把真实
+> 网关域名硬编码后提交回仓库。
 
 | 文件 | 作用 |
 | --- | --- |
 | `models.json` | GLM 模型元数据目录,仅含 `glm-5.2` 一个模型(上下文 204800,推理档位低/高/最大) |
-| `config.toml` | Codex provider 配置:指向自建网关 `https://ai.wuguhub.com/v1`,`wire_api = "responses"` |
+| `config.toml` | Codex provider 配置:指向自建网关 `https://<your-gateway-host>/v1`(部署时替换),`wire_api = "responses"` |
 
 ## 一、拷到哪里:每个 bot 的 codex-home 目录
 
@@ -54,7 +59,7 @@ experimental_bearer_token = "REPLACE_WITH_YOUR_ZHIPU_CODING_PLAN_KEY"
 替换为你在网关上创建的 API Key(由部署方自行生成,**部署时替换**,
 模板中仅为占位符)。注意:
 
-- **不同网关/套餐的 Key 不通用**——请使用与 `https://ai.wuguhub.com/v1`
+- **不同网关/套餐的 Key 不通用**——请使用与 `https://<your-gateway-host>/v1`
   该网关配套创建的 Key,不要混用智谱官方平台或团队的 Key。
 - 每个 bot 用自己的目录、各自替换,不要把 Key 提交进仓库。
 
@@ -71,7 +76,7 @@ experimental_bearer_token = "REPLACE_WITH_YOUR_ZHIPU_CODING_PLAN_KEY"
 ## 五、octo-smart-summary 同网关复用提示
 
 - 同一网关的 `/v1/chat/completions` 端点同样可用,可直接给 **octo-smart-summary** 用:
-  `LLM_API_URL=https://ai.wuguhub.com/v1`、`LLM_MODEL=glm-5.2`(Key 同上,部署时填入)。
+  `LLM_API_URL=https://<your-gateway-host>/v1`、`LLM_MODEL=glm-5.2`(Key 同上,部署时填入)。
 - 同一套 Key/网关地址可直接复用,无需额外配置。
 
 ## 六、两点注意事项

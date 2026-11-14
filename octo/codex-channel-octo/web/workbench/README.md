@@ -33,11 +33,12 @@ scp -r dist/* <user>@<server>:<bridge部署目录>/web/workbench/dist/
 npm run dev
 ```
 
-开发服务器把 `/workbench/api` 反代到真实 bridge 实例,默认指向
-`http://8.145.50.130:28080`;可用环境变量覆盖目标:
+开发服务器把 `/workbench/api` 反代到真实 bridge 实例,默认指向本机
+`http://127.0.0.1:28080`;真实部署地址请用环境变量 `WORKBENCH_API_TARGET`
+提供(源码中不硬编码生产地址):
 
 ```powershell
-$env:WORKBENCH_API_TARGET='http://127.0.0.1:28080'; npm run dev
+$env:WORKBENCH_API_TARGET='http://<your-server-host>:28080'; npm run dev
 ```
 
 即本地调试时前端始终与"同源部署"的线上布局一致,无需 CORS 配置。

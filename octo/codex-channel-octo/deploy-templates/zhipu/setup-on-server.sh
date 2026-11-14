@@ -6,7 +6,8 @@
 #       写好两层配置、铺好 codex-home 模板文件,并打印守护进程操作命令。
 #
 # 用法:
-#   BOT_TOKEN='bf_xxx' LLM_KEY='xxx' bash setup-on-server.sh
+#   BOT_TOKEN='bf_xxx' LLM_KEY='xxx' LLM_API_URL='https://<your-gateway-host>/v1' \
+#     bash setup-on-server.sh
 #
 # 配置 schema 依据(勿凭猜测修改):
 #   - 仓库根目录 config.example.json      —— 全局配置权威示例
@@ -41,6 +42,8 @@ APP_DIR="/opt/codex-channel-octo"
 # -----------------------------------------------------------------------------
 BOT_TOKEN="${BOT_TOKEN:-}"
 LLM_KEY="${LLM_KEY:-}"
+# 自建网关地址(可选)。留空则沿用模板中的占位符,需手动改 config.toml。
+LLM_API_URL="${LLM_API_URL:-}"
 
 if [ -z "$BOT_TOKEN" ]; then
   echo "错误:未设置环境变量 BOT_TOKEN(Octo 机器人令牌,以 bf_ 开头)。" >&2
@@ -129,17 +132,30 @@ echo "[4/6] 已写入每 bot 配置:$BOT_CONFIG(已 chmod 600)"
 
 # -----------------------------------------------------------------------------
 # 5. 铺 codex-home 模板:把本目录的 models.json / config.toml 拷入,
-#    并用 sed 把占位符替换为真实网关 Key
+#    并用 sed 把占位符替换为真实网关 Key 与网关地址。
+#    分隔符统一用 '|':Key / 网关地址中常含 '/'(尤其 'https://'),
+#    用 '/' 作分隔符会使替换失败或写出错误内容。
 # -----------------------------------------------------------------------------
 cp "$SCRIPT_DIR/models.json" "$CODEX_HOME_DIR/models.json"
-sed "s/REPLACE_WITH_YOUR_ZHIPU_CODING_PLAN_KEY/$LLM_KEY/" \
+sed "s|REPLACE_WITH_YOUR_ZHIPU_CODING_PLAN_KEY|$LLM_KEY|" \
   "$SCRIPT_DIR/config.toml" > "$CODEX_HOME_DIR/config.toml"
+
+# 可选:注入网关地址(未提供 LLM_API_URL 时保留占位符,需手动修改)
+if [ -n "$LLM_API_URL" ]; then
+  sed -i "s|https://REPLACE_WITH_YOUR_GATEWAY_HOST/v1|$LLM_API_URL|" \
+    "$CODEX_HOME_DIR/config.toml"
+fi
 chmod 600 "$CODEX_HOME_DIR/config.toml"
 
 # 校验替换是否真正生效(占位符不得残留)
 if grep -q 'REPLACE_WITH_YOUR_ZHIPU_CODING_PLAN_KEY' "$CODEX_HOME_DIR/config.toml"; then
   echo "错误:config.toml 中占位符替换失败,请检查模板文件。" >&2
   exit 1
+fi
+if [ -z "$LLM_API_URL" ] && grep -q 'REPLACE_WITH_YOUR_GATEWAY_HOST' "$CODEX_HOME_DIR/config.toml"; then
+  echo "警告:config.toml 仍为网关占位符 REPLACE_WITH_YOUR_GATEWAY_HOST。" >&2
+  echo "      请重新以 LLM_API_URL='https://<your-gateway-host>/v1' 执行本脚本," >&2
+  echo "      或手动修改 $CODEX_HOME_DIR/config.toml 的 base_url。" >&2
 fi
 echo "[5/6] 已拷贝并替换:models.json / config.toml → $CODEX_HOME_DIR"
 
