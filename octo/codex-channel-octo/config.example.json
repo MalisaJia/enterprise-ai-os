@@ -35,5 +35,32 @@
   },
 
   "_comment_mention_free": "group_ids listed here process every text message without requiring an @bot mention.",
-  "mentionFreeGroups": []
+  "mentionFreeGroups": [],
+
+  "_comment_workbench": "Web workbench (#24): built-in read-only ops console served by the gateway process on 0.0.0.0:<listenPort> (upstream reaches it via the docker host-gateway bridge IP). Auth = the caller's Octo `token` header, checked against <apiUrl>/v1/user/current; a user may only access bots they own. Static UI from web/workbench/dist. Set enabled=false to turn it off.",
+  "workbench": {
+    "enabled": true,
+    "listenPort": 28090
+  },
+
+  "_comment_public_base_url": "Optional EXTERNALLY reachable base URL of the workbench web UI (absolute http/https). When set, after a turn that produced/modified files in the session sandbox the bot posts a delivery message (type-17 interactive card, plain-text fallback) to the originating conversation with deep links <publicBaseUrl>/workspace?bot=<uid>&session=<hex>&path=<file>. Omit to disable the delivery-card hook.",
+  "publicBaseUrl": "https://workbench.example.com",
+
+  "_comment_delivery_card": "Delivery-card feature flags (#32). enabled omitted = true (hook on whenever publicBaseUrl is set); set {\"enabled\": false} to keep deep links configured without auto-posting delivery messages.",
+  "deliveryCard": {
+    "enabled": true
+  },
+
+  "_comment_media_allowed_hosts": "Optional extra hosts allowed to serve INBOUND media (images/files). Normally the media CDN host is prefetched at startup from the Octo STS upload-credentials response — but that endpoint fails on Octo deployments without COS/STS configured (e.g. MinIO-backed), and then EVERY inbound image URL is rejected and the agent only sees a '[图片]' placeholder. Declare the real media host(s) here (bare host, port included if non-default, no scheme/path/wildcard) to enable inbound images without depending on that prefetch. The bridge logs the rejected host at WARN when a media URL is dropped, so you can copy the exact value from the log.",
+  "mediaAllowedHosts": [],
+
+  "_comment_runtime": "Agent runtime backend. 'codex' (default when omitted) drives OpenAI Codex via the SDK; 'lumo' drives a Lumo Work server over its HTTP SSE API. A per-bot config.json may override this per bot.",
+  "runtime": "codex",
+
+  "_comment_lumo": "Lumo Work backend settings — used ONLY when runtime='lumo'. baseUrl must be an absolute http(s) origin and passes the same loopback/SSRF policy as apiUrl (https to a non-private host, or http://localhost / http://127.0.0.1). idleTimeoutMs resets on every received stream byte (default 30000); maxTurnMs is the absolute per-turn ceiling (default 900000).",
+  "lumo": {
+    "baseUrl": "http://127.0.0.1:8080",
+    "idleTimeoutMs": 30000,
+    "maxTurnMs": 900000
+  }
 }

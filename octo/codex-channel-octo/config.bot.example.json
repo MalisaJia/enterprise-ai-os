@@ -5,6 +5,15 @@
   "_comment_overrides": "Any of these optional fields override the global config for THIS bot only:",
   "_comment_apiUrl": "apiUrl — override the Octo API base for this bot.",
 
+  "_comment_runtime": "runtime — override the agent backend for THIS bot: 'codex' (default) or 'lumo'. When set to 'lumo', this bot's lumo.baseUrl below is required and SSRF-validated at boot.",
+  "runtime": "lumo",
+  "_comment_lumo": "lumo — Lumo Work backend for this bot (used only when runtime='lumo'). baseUrl must be an absolute http(s) origin passing the same loopback/SSRF policy as apiUrl. idleTimeoutMs (default 30000) resets on every received byte; maxTurnMs (default 900000) is the absolute per-turn ceiling.",
+  "lumo": {
+    "baseUrl": "http://127.0.0.1:8080",
+    "idleTimeoutMs": 30000,
+    "maxTurnMs": 900000
+  },
+
   "sdk": {
     "_comment_model": "Override the model for this bot, e.g. 'gpt-5.5'. Omit to use the codex provider default.",
     "_comment_systemPrompt": "Inline personality string. A ./SOUL.md file next to this config overrides it. Written to the session AGENTS.md together with the security prefix.",

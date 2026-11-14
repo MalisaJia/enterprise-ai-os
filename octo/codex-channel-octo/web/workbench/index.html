@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230b0d10'/%3E%3Crect x='5' y='5' width='22' height='22' fill='none' stroke='%23ffb454' stroke-width='2'/%3E%3Crect x='11' y='11' width='10' height='10' fill='%23ffb454'/%3E%3C/svg%3E"
+    />
+    <title>CODEX · Workbench</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      /* Early theme resolution — mirrors src/theme.ts so the first paint has
+         the right background (no flash). Order: localStorage('wb-theme') >
+         follow octo-web parent (body[theme-mode] / sessionStorage) > light. */
+      (function () {
+        var t = null;
+        try {
+          var s = localStorage.getItem('wb-theme');
+          if (s === 'light' || s === 'dark') t = s;
+        } catch (e) { /* ignore */ }
+        if (!t) {
+          t = 'light';
+          try {
+            var p = window.parent;
+            if (p && p !== window && p.document && p.document.body) {
+              if (p.document.body.getAttribute('theme-mode') === 'dark') {
+                t = 'dark';
+              } else {
+                var v = null;
+                try { v = p.sessionStorage.getItem('theme-mode'); } catch (e2) { /* ignore */ }
+                if (v === '1' || v === 'dark') t = 'dark';
+              }
+            }
+          } catch (e) { /* cross-origin parent → standalone default */ }
+        }
+        try { document.documentElement.setAttribute('data-theme', t); } catch (e) { /* ignore */ }
+      })();
+    </script>
+    <style>
+      /* Instant first paint — matches the app shell so there is no flash.
+         Defaults to dark (legacy look); the light overrides apply as soon as
+         the script above sets html[data-theme="light"]. */
+      html,
+      body {
+        margin: 0;
+        background: #0b0d10;
+        color: #e8e6df;
+      }
+      html[data-theme='light'],
+      html[data-theme='light'] body {
+        background: #ffffff;
+        color: #1f2329;
+      }
+      #boot {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        align-items: center;
+        justify-content: center;
+        font-family: 'IBM Plex Mono', ui-monospace, monospace;
+        font-size: 12px;
+        letter-spacing: 0.35em;
+        color: #8b93a1;
+        text-transform: uppercase;
+      }
+      #boot::after {
+        content: '';
+        width: 120px;
+        height: 2px;
+        background: linear-gradient(90deg, transparent, #ffb454, transparent);
+        animation: boot-sweep 1.1s ease-in-out infinite;
+      }
+      @keyframes boot-sweep {
+        0% { transform: translateX(-40px); opacity: 0.2; }
+        50% { opacity: 1; }
+        100% { transform: translateX(40px); opacity: 0.2; }
+      }
+      html[data-theme='light'] #boot { color: #8f959e; }
+      html[data-theme='light'] #boot::after {
+        background: linear-gradient(90deg, transparent, #d97706, transparent);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"><div id="boot">Initializing&nbsp;Workbench</div></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

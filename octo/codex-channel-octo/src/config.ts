@@ -204,6 +204,74 @@ export interface Config {
    * the prefetch succeeds, in which case only same-apiUrl-host media is allowed.
    */
   mediaCdnHost?: string;
+  /**
+   * #86 follow-up: additional hosts allowed to serve inbound media.
+   *
+   * `mediaCdnHost` is derived at runtime from the STS upload-credentials
+   * response (`cdnBaseUrl`). Deployments whose Octo server has no COS/STS
+   * configured (e.g. self-hosted MinIO) never populate it, so EVERY inbound
+   * image URL gets rejected by `buildMediaUrl` and the agent only sees a
+   * `[图片]` placeholder. This field lets an operator declare the real media
+   * host(s) explicitly instead of depending on that prefetch succeeding.
+   *
+   * Host-only entries (no scheme, no path, no wildcard). Matching is
+   * case-insensitive and compares `URL.host` (so a port, if any, must be
+   * included). This widens the ALLOW list for media fetches only — the
+   * download path still runs `assertPublicUrl` (SSRF) and still sends the
+   * bot token only to the apiUrl host.
+   */
+  mediaAllowedHosts?: string[];
+  /**
+   * Web workbench (#24): built-in read-only ops console served INSIDE the
+   * gateway process (it needs direct BotManager access for per-bot restarts —
+   * not a separate entry process). Defaults: enabled=true, listenPort=28090.
+   * The server binds 0.0.0.0 because upstream deployments reach it through the
+   * docker host-gateway bridge IP, not loopback. See src/workbench/.
+   */
+  workbench?: {
+    /** Master switch. Omitted → enabled (true). */
+    enabled?: boolean;
+    /** HTTP listen port. Omitted → 28090. */
+    listenPort?: number;
+  };
+  /**
+   * #32 delivery card: EXTERNALLY reachable base URL of the workbench web UI
+   * (absolute http(s), e.g. https://workbench.example.com). When set, after a
+   * turn that produced/modified files in the session sandbox, the bot posts a
+   * delivery message (type-17 interactive card, plain-text fallback) to the
+   * originating conversation, with deep links pointing here:
+   *   <publicBaseUrl>/workspace?bot=<robotUid>&session=<hex>&path=<file>
+   * Unset → the delivery-card hook is off. Validated in loadConfig (must be an
+   * absolute http(s) URL — it is embedded into card Action.OpenUrl targets,
+   * which the server only accepts as absolute http/https).
+   */
+  publicBaseUrl?: string;
+  /**
+   * #32 delivery card feature flags. `enabled` omitted → true (the hook is on
+   * whenever publicBaseUrl is configured); set { enabled: false } to keep
+   * publicBaseUrl (deep links) without auto-posting delivery messages.
+   */
+  deliveryCard?: {
+    enabled?: boolean;
+  };
+  /**
+   * Agent runtime backend. `'codex'` (default, when omitted) drives OpenAI Codex
+   * via the SDK (agent-bridge); `'lumo'` drives a Lumo Work server over its HTTP
+   * SSE API (lumo-bridge). Omitted → codex, so existing configs are unaffected.
+   */
+  runtime?: 'codex' | 'lumo';
+  /**
+   * Lumo Work backend settings — only used when `runtime === 'lumo'`. `baseUrl`
+   * is the absolute http(s) origin of the Lumo server (validated with the same
+   * loopback/SSRF policy as apiUrl when runtime is lumo). The timeouts bound a
+   * single streamed turn: `idleTimeoutMs` resets on every received byte
+   * (default 30000), `maxTurnMs` is the absolute ceiling (default 900000).
+   */
+  lumo?: {
+    baseUrl: string;
+    idleTimeoutMs?: number;
+    maxTurnMs?: number;
+  };
 }
 
 /**
@@ -234,6 +302,10 @@ export interface BotOverride {
   botBlocklist?: string[];
   allowedBotUids?: string[];
   mentionFreeGroups?: string[];
+  /** #86 follow-up: extra inbound-media hosts (see Config.mediaAllowedHosts). */
+  mediaAllowedHosts?: string[];
+  runtime?: 'codex' | 'lumo';
+  lumo?: Config['lumo'];
 }
 
 type PartialConfig = {
@@ -249,6 +321,12 @@ type PartialConfig = {
   allowedBotUids?: string[];
   mentionFreeGroups?: string[];
   bots?: BotOverride[];
+  workbench?: Config['workbench'];
+  publicBaseUrl?: string;
+  deliveryCard?: Config['deliveryCard'];
+  mediaAllowedHosts?: string[];
+  runtime?: 'codex' | 'lumo';
+  lumo?: Config['lumo'];
 };
 
 function defaults(): Config {
@@ -283,6 +361,8 @@ function defaults(): Config {
     },
     maxResponseChars: 524_288, // 512 KB (Q32)
     dispatchTimeoutMs: 300_000, // 5 min (#141)
+    // #24: workbench on by default, port 28090 (see Config.workbench).
+    workbench: { enabled: true, listenPort: 28090 },
   };
 }
 
@@ -351,6 +431,13 @@ function mergeConfig(base: Config, override: PartialConfig): Config {
     allowedBotUids: override.allowedBotUids ?? base.allowedBotUids,
     mentionFreeGroups: override.mentionFreeGroups ?? base.mentionFreeGroups,
     bots: override.bots ?? base.bots,
+    workbench: override.workbench ?? base.workbench,
+    publicBaseUrl: override.publicBaseUrl ?? base.publicBaseUrl,
+    deliveryCard: override.deliveryCard ?? base.deliveryCard,
+    // #86 follow-up: operator-declared inbound-media hosts.
+    mediaAllowedHosts: override.mediaAllowedHosts ?? base.mediaAllowedHosts,
+    runtime: override.runtime ?? base.runtime,
+    lumo: override.lumo ?? base.lumo,
   };
 }
 
@@ -419,7 +506,68 @@ export function loadConfig(configPath?: string): Config {
     { label: 'groupConfigDir (trusted group instructions)', path: final.groupConfigDir },
   ]);
 
+  // #32: publicBaseUrl is embedded into delivery-card Action.OpenUrl targets;
+  // the card validator only accepts absolute http/https URLs, so fail fast at
+  // load instead of sending cards the server rejects.
+  assertPublicBaseUrl(final.publicBaseUrl);
+
+  // #86 follow-up: normalize + validate the operator-declared media hosts once
+  // at load so a malformed entry fails at boot instead of silently dropping
+  // every inbound image.
+  final.mediaAllowedHosts = normalizeMediaAllowedHosts(final.mediaAllowedHosts);
+
   return final;
+}
+
+/**
+ * Validate `mediaAllowedHosts` (Config.mediaAllowedHosts): an optional list of
+ * bare hosts (no scheme, no path, no wildcard) that may serve inbound media.
+ *
+ * Rejects anything carrying a scheme, slash, or whitespace so an entry can
+ * never widen the allow list beyond a single host (e.g. `evil.com/../` or
+ * `*@evil.com`). Returns lowercased entries, or `undefined` when the list is
+ * absent/empty.
+ */
+export function normalizeMediaAllowedHosts(hosts: string[] | undefined): string[] | undefined {
+  if (hosts === undefined) return undefined;
+  if (!Array.isArray(hosts)) {
+    throw new Error('Invalid mediaAllowedHosts: must be an array of host names (e.g. ["cdn.example.com"])');
+  }
+  const out: string[] = [];
+  for (const entry of hosts) {
+    const raw = typeof entry === 'string' ? entry.trim() : '';
+    if (raw === '') continue;
+    if (/[\s/\\]/.test(raw) || raw.includes('://') || raw.startsWith('*')) {
+      throw new Error(
+        `Invalid mediaAllowedHosts entry: ${JSON.stringify(entry)} — expected a bare host ` +
+        `(e.g. "cdn.example.com" or "127.0.0.1:9000"), with no scheme, path, or wildcard`,
+      );
+    }
+    const host = raw.toLowerCase();
+    if (!out.includes(host)) out.push(host);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * Validate `publicBaseUrl` (#32): when present it must be an absolute http(s)
+ * URL. A relative or foreign-scheme value would produce delivery-card links
+ * the server rejects (or worse, a javascript: surface), so reject at boot.
+ */
+function assertPublicBaseUrl(publicBaseUrl: string | undefined): void {
+  if (publicBaseUrl === undefined) return;
+  let ok = false;
+  try {
+    const u = new URL(publicBaseUrl);
+    ok = u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    ok = false;
+  }
+  if (!ok) {
+    throw new Error(
+      `Invalid publicBaseUrl: ${publicBaseUrl} — must be an absolute http:// or https:// URL`,
+    );
+  }
 }
 
 /**
@@ -578,6 +726,17 @@ export function resolveBotConfigs(config: Config): Config[] {
       mentionFreeGroups:
         perBotFile.mentionFreeGroups ?? bot.mentionFreeGroups ?? config.mentionFreeGroups,
       groupConfigDir: perBotFile.groupConfigDir ?? config.groupConfigDir,
+      // #32: delivery-card config — per-bot file may override the global layer.
+      publicBaseUrl: perBotFile.publicBaseUrl ?? config.publicBaseUrl,
+      deliveryCard: perBotFile.deliveryCard ?? config.deliveryCard,
+      // #86 follow-up: inbound-media hosts — per-bot file wins over the inline
+      // entry, which wins over the shared global layer.
+      mediaAllowedHosts:
+        perBotFile.mediaAllowedHosts ?? bot.mediaAllowedHosts ?? config.mediaAllowedHosts,
+      // Runtime backend + Lumo settings — per-bot file wins over the inline
+      // entry, which wins over the shared global layer.
+      runtime: perBotFile.runtime ?? bot.runtime ?? config.runtime,
+      lumo: perBotFile.lumo ?? bot.lumo ?? config.lumo,
       sdk: {
         ...config.sdk,
         ...(perBotFile.sdk ?? {}),
@@ -592,6 +751,39 @@ export function resolveBotConfigs(config: Config): Config[] {
     };
     if (!isAllowedApiUrl(resolved.apiUrl)) {
       throw new Error(`Bot "${id}": unsafe apiUrl ${resolved.apiUrl} (SSRF protection)`);
+    }
+    // Lumo runtime: only when the EFFECTIVE runtime is 'lumo' do we require and
+    // validate lumo.baseUrl. The codex path (default) is left byte-for-byte
+    // unchanged — an unset/invalid lumo block is inert unless runtime selects it.
+    if (resolved.runtime === 'lumo') {
+      const baseUrl = resolved.lumo?.baseUrl;
+      if (!baseUrl) {
+        throw new Error(
+          `Bot "${id}": runtime 'lumo' requires lumo.baseUrl (set it in ${pathJoin(botRoot, 'config.json')})`,
+        );
+      }
+      // Same loopback/SSRF policy as apiUrl: absolute http(s), no private host
+      // (isAllowedApiUrl rejects relative/foreign schemes and private IPs).
+      if (!isAllowedApiUrl(baseUrl)) {
+        throw new Error(
+          `Bot "${id}": unsafe lumo.baseUrl ${baseUrl} — must be https:// or ` +
+          `http://localhost/http://127.0.0.1 (SSRF protection)`,
+        );
+      }
+    }
+    // #32: a per-bot publicBaseUrl override bypasses loadConfig's check — re-validate.
+    try {
+      assertPublicBaseUrl(resolved.publicBaseUrl);
+    } catch (err) {
+      throw new Error(`Bot "${id}": ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // #86 follow-up: a per-bot mediaAllowedHosts override bypasses loadConfig's
+    // normalization — re-validate it here so a malformed entry fails at boot
+    // instead of silently dropping every inbound image.
+    try {
+      resolved.mediaAllowedHosts = normalizeMediaAllowedHosts(resolved.mediaAllowedHosts);
+    } catch (err) {
+      throw new Error(`Bot "${id}": ${err instanceof Error ? err.message : String(err)}`);
     }
     // per-bot sdk can override codexBaseUrl/sandboxMode — re-validate here so a
     // bad per-bot value fails at boot, not silently (loadConfig only saw the
@@ -679,8 +871,9 @@ function assertAdditionalDirectories(
     // A '..' segment resolves per-runtime to a directory the literal path does
     // not name (e.g. "/srv/bus/../../etc"), sidestepping the overlap checks
     // below. Reject rather than silently normalize, so the granted root is
-    // exactly what the operator wrote.
-    if (dir.split(sep).includes('..')) {
+    // exactly what the operator wrote. Split on BOTH separators: on Windows a
+    // slash-separated entry would otherwise slip past a sep-only split.
+    if (dir.split(/[\\/]/).includes('..')) {
       throw new Error(
         `Bot "${id}": unsafe sdk.additionalDirectories entry ${JSON.stringify(dir)} — must not contain '..' path segments.`,
       );

@@ -133,6 +133,36 @@ export async function sendMessage(params: {
 }
 
 /**
+ * Send a FREE-FORM message payload to /v1/bot/sendMessage (#32 delivery card).
+ *
+ * Unlike sendMessage (fixed Text payload), the caller supplies the entire
+ * `payload` map verbatim — e.g. an InteractiveCard(=17) envelope
+ * `{type:17, card:{...}, plain, card_version:"1.5", profile:"octo/v1"}`.
+ * Server-side contract (octo-server modules/bot_api send.go): type-17 is gated
+ * by cardmsg.BotEnabled + Validate; `render_profile` is injected by the server
+ * and MUST NOT be sent by the caller.
+ *
+ * client_msg_no dedup reuses generateClientMsgNo (WuKongIM stores only one
+ * message per identical client_msg_no).
+ */
+export async function sendPayload(params: {
+  apiUrl: string;
+  botToken: string;
+  channelId: string;
+  channelType: ChannelType;
+  payload: Record<string, unknown>;
+  clientMsgNo?: string;
+  signal?: AbortSignal;
+}): Promise<SendMessageResult | undefined> {
+  return await postJson<SendMessageResult>(params.apiUrl, params.botToken, "/v1/bot/sendMessage", {
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    payload: params.payload,
+    client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
+  }, params.signal);
+}
+
+/**
  * Get STS temporary credentials for direct COS upload.
  * GET /v1/bot/upload/credentials?filename=<encoded>
  *

@@ -322,6 +322,12 @@ export async function* queryAgent(
     groupInstructions?: string;
     onResumeFailed?: () => void;
     fallbackRetryPrompt?: string;
+    /**
+     * Accepted for signature parity with queryLumo (image attachments for the
+     * lumo runtime). The codex runtime receives images as local files in the
+     * session cwd (see media-inbound.ts), so this field is never consumed here.
+     */
+    attachments?: unknown;
   },
 ): AsyncIterable<string> {
   // Frozen system text (security prefix + SOUL + group instructions).

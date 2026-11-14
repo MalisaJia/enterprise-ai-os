@@ -16,6 +16,7 @@ import { OctoGateway } from './gateway.js';
 import { SessionRouter } from './session-router.js';
 import { GroupContext } from './group-context.js';
 import { queryAgent, isStreamInterruptError } from './agent-bridge.js';
+import { queryLumo, uploadLumoImage, type LumoAttachment } from './lumo-bridge.js';
 import { sanitizeDisplayName, escapeSectionMarkers, sanitizePromptBody } from './prompt-safety.js';
 import type { SessionCtx } from './cwd-resolver.js';
 import { cleanupExpiredCwds, resolveSessionCwd } from './cwd-resolver.js';
@@ -28,8 +29,10 @@ import { resolveContent, tryResolveFile, resolveHistoricalMessagePlaceholder } f
 import { downloadInboundImage, MAX_IMAGES_PER_MESSAGE } from './media-inbound.js';
 import { handleCommand } from './commands.js';
 import { loadGroupConfig } from './group-config.js';
+import { startWorkbenchServer, type WorkbenchServerHandle } from './workbench/server.js';
 import { buildInlinedFileBody, truncateUtf8ByBytes, assembleUserMessage, MAX_USER_LLM_BYTES } from './file-inline-wrap.js';
-import { join } from 'node:path';
+import { snapshotTree, deliverArtifacts, shouldDeliver, type TreeSnapshot } from './delivery-card.js';
+import { basename, join } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
@@ -103,6 +106,34 @@ async function main(): Promise<void> {
     console.log(`[codex-channel-octo] Ready — ${manager.size()} bot(s) running`);
   }
 
+  // #24: Web workbench HTTP server. Runs INSIDE this process (it needs direct
+  // BotManager access for per-bot remove→add restarts). Enabled by default on
+  // 0.0.0.0:28090; any failure here must NOT take down the message pipeline —
+  // the gateway keeps running without the workbench.
+  let workbench: WorkbenchServerHandle | undefined;
+  if (config.workbench?.enabled !== false) {
+    const listenPort = config.workbench?.listenPort ?? 28090;
+    try {
+      workbench = await startWorkbenchServer(
+        {
+          manager,
+          // Re-read from disk so hot-reloaded bot sets and configs are current.
+          resolveBotConfig: (configId) => resolveBotConfigById(loadConfig(), configId),
+          apiUrl: () => loadConfig().apiUrl,
+          baseDir: config.baseDir,
+        },
+        listenPort,
+      );
+      console.log(
+        `[codex-channel-octo] workbench listening on http://${workbench.host}:${workbench.port}/workbench/`,
+      );
+    } catch (err) {
+      console.error(
+        `[codex-channel-octo] workbench failed to start (continuing without it): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   // #157: watch config.json and reconcile the running set on change. loadDesired
   // re-reads + re-validates inside the watcher; an invalid/half-written config
   // keeps the current bots (see config-watcher). The directory is watched (not
@@ -124,6 +155,16 @@ async function main(): Promise<void> {
       console.log(`[codex-channel-octo] Received ${signal}, shutting down ${manager.size()} bot(s)...`);
       clearInterval(keepalive);
       watcher.close();
+      if (workbench) {
+        // Bounded close: a slow workbench drain (keep-alive sockets, an
+        // in-flight sandbox remove→add restart) must NOT eat the `cli stop`
+        // 10s grace window or block manager.shutdownAll(). Race it against a
+        // 2s deadline (unref'd so a won race never holds the event loop).
+        await Promise.race([
+          workbench.close(),
+          new Promise<void>((r) => setTimeout(r, 2000).unref()),
+        ]).catch(() => {});
+      }
       await manager.shutdownAll();
       resolve();
     };
@@ -274,7 +315,17 @@ async function startBot(config: ReturnType<typeof loadConfig>, multi: boolean): 
     // Single-bot: the gateway's own SIGINT/SIGTERM handler invokes this.
     gateway.setShutdownCallback(shutdown);
 
-    return { robotUid: gateway.botId, router, connect, shutdown };
+    return {
+      robotUid: gateway.botId,
+      router,
+      connect,
+      shutdown,
+      // #24 (workbench): the ownership uid + sandbox base the workbench API
+      // needs (auth compare + jailed file listing). register() has succeeded
+      // here, so ownerUid is populated.
+      ownerUid: gateway.ownerUid,
+      cwdBase,
+    };
   } catch (err) {
     // Release the durable resources acquired above so a failed bot doesn't leak
     // them in multi-bot mode (the surviving bots keep the process alive).
@@ -410,8 +461,41 @@ export async function handleMessage(
       // --- G1: Resolve the inbound payload into LLM-friendly text ---
       // Text messages use the router's cleanContent (with @bot stripping);
       // non-text payloads go through resolveContent for type-aware rendering.
-      const resolved = resolveContent(msg.payload, config.apiUrl, config.mediaCdnHost);
+      const resolved = resolveContent(msg.payload, config.apiUrl, config.mediaCdnHost, config.mediaAllowedHosts);
       let bodyText = result.cleanContent ?? resolved.text;
+
+      // #86 follow-up: diagnosis aid. When an inbound media URL exists but was
+      // rejected by buildMediaUrl (host not in {apiUrl host, STS-derived CDN
+      // host, config.mediaAllowedHosts}), the payload silently degrades to a
+      // bare `[图片]` placeholder and no image ever reaches the agent. Log the
+      // offending HOST only — never the full URL, which may carry presigned
+      // query params (and, on the apiUrl host, would be a token-bearing link).
+      if (!resolved.mediaUrl) {
+        const rawUrl = (msg.payload as unknown as { url?: unknown }).url;
+        if (typeof rawUrl === 'string' && rawUrl !== '') {
+          let host: string;
+          try {
+            host = new URL(rawUrl).host || '<no-host>';
+          } catch {
+            // Relative paths are resolved against apiUrl and never host-rejected.
+            host = '<relative>';
+          }
+          if (host !== '<relative>') {
+            let apiHost = config.apiUrl;
+            try {
+              apiHost = new URL(config.apiUrl).host;
+            } catch {
+              /* keep the raw value — config validation already guarantees it parses */
+            }
+            const allowed = [apiHost, config.mediaCdnHost, ...(config.mediaAllowedHosts ?? [])].filter(Boolean).join(', ');
+            console.warn(
+              `[codex-channel-octo] inbound media URL rejected (host not in media allowlist): ${host}` +
+              ` — allowed: ${allowed}` +
+              ` — add it to "mediaAllowedHosts" in config.json to enable inbound images`,
+            );
+          }
+        }
+      }
 
       // Compact history record. For File payloads we store only the metadata
       // line (not the inlined contents) so a user dropping a few text files
@@ -420,11 +504,20 @@ export async function handleMessage(
       let historyRecord = bodyText;
 
       // #86: Native image input. Octo delivers images as URLs; download them
-      // INTO this session's cwd sandbox so the agent can SEE them via the Read
-      // tool (the SDK's Read renders image files), instead of only getting a URL
-      // string. Covers single-image (Image/GIF) and RichText embedded images.
-      // History keeps the compact marker (not the local path) so it doesn't
-      // accumulate stale paths. Falls back to the URL marker on any failure.
+      // so the agent can SEE them, instead of only getting a URL string.
+      // Covers single-image (Image/GIF) and RichText embedded images. History
+      // keeps the compact marker (not the local path) so it doesn't accumulate
+      // stale paths. Falls back to the URL marker on any failure.
+      //
+      // The delivery differs per runtime:
+      //  - codex (default): download INTO this session's cwd sandbox; the SDK
+      //    agent reads the file with the Read tool. Behaviour unchanged.
+      //  - lumo: forward the bytes to Lumo's POST /api/uploads and attach the
+      //    returned {id,url,fileName,mimeType} refs to the /api/chat/stream
+      //    request — Lumo's pipeline compresses + base64-encodes them into
+      //    image_url parts for the vision model. Nothing is written to the
+      //    local cwd (Lumo couldn't read it anyway).
+      let lumoAttachments: LumoAttachment[] | undefined;
       {
         const imageUrls: string[] = [];
         if (
@@ -435,7 +528,32 @@ export async function handleMessage(
         } else if (msg.payload.type === MessageType.RichText && resolved.mediaUrls?.length) {
           imageUrls.push(...resolved.mediaUrls);
         }
-        if (imageUrls.length > 0) {
+        if (imageUrls.length > 0 && config.runtime === 'lumo') {
+          const lumoBase = (config.lumo?.baseUrl ?? '').replace(/\/+$/, '');
+          if (!lumoBase) {
+            console.error('[codex-channel-octo] runtime=lumo but lumo.baseUrl unset — skipping image forward');
+          } else {
+            const attachments: LumoAttachment[] = [];
+            for (const url of imageUrls.slice(0, MAX_IMAGES_PER_MESSAGE)) {
+              try {
+                const r = await uploadLumoImage({
+                  url,
+                  baseUrl: lumoBase,
+                  botToken: config.botToken,
+                  apiUrl: config.apiUrl,
+                });
+                if ('attachment' in r) {
+                  attachments.push(r.attachment);
+                } else {
+                  console.warn(`[codex-channel-octo] inbound image skipped: ${r.error}`);
+                }
+              } catch (err) {
+                console.error(`[codex-channel-octo] inbound image upload failed: ${String(err)}`);
+              }
+            }
+            if (attachments.length > 0) lumoAttachments = attachments;
+          }
+        } else if (imageUrls.length > 0) {
           const cwdBase = config.cwdBase ?? config.cwd;
           const cwdDir = resolveSessionCwd(cwdBase, sessionCtx);
           const localPaths: string[] = [];
@@ -717,7 +835,7 @@ export async function handleMessage(
       // queryAgent recovers by calling onResumeFailed (clear the bad id) and
       // retrying once with the pre-assembled fallbackRetryPrompt so the
       // conversation isn't lost (and assembly happens exactly once — see above).
-      let sessionOpts: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; onResumeFailed?: () => void; fallbackRetryPrompt?: string } | undefined = {
+      let sessionOpts: { resume?: string; onSessionId?: (id: string) => void; groupInstructions?: string; onResumeFailed?: () => void; fallbackRetryPrompt?: string; attachments?: LumoAttachment[] } | undefined = {
         ...(resume ? { resume } : {}),
         onSessionId: (id: string) => store.setSdkSessionId(sessionKey, id),
         ...(resume
@@ -727,6 +845,11 @@ export async function handleMessage(
             }
           : {}),
       };
+      // #86 lumo: images already forwarded to Lumo's /api/uploads ride the
+      // stream request as attachments. queryAgent ignores the extra field.
+      if (lumoAttachments) {
+        sessionOpts = { ...sessionOpts, attachments: lumoAttachments };
+      }
 
       // GROUP.md: inject operator-provided per-group instructions (from
       // config.groupConfigDir/<channelId>.md) into the system text (AGENTS.md).
@@ -738,7 +861,24 @@ export async function handleMessage(
         }
       }
 
-      const rawChunks = queryAgent(userContentForLLM, config, sessionCtx, onToolUse, sessionOpts);
+      // #32 delivery card: snapshot the session sandbox BEFORE the agent turn
+      // so the post-turn diff sees exactly what this turn produced/modified.
+      // Gate: publicBaseUrl configured + deliveryCard.enabled !== false. Any
+      // failure here degrades to an empty snapshot (nothing delivered) — the
+      // hook must never disturb the main chain.
+      let deliveryBefore: TreeSnapshot | undefined;
+      if (shouldDeliver(config)) {
+        try {
+          const cwdBase = config.cwdBase ?? config.cwd;
+          deliveryBefore = snapshotTree(cwdBase, basename(resolveSessionCwd(cwdBase, sessionCtx)));
+        } catch {
+          deliveryBefore = undefined; // pre-turn scan failed → skip delivery
+        }
+      }
+
+      const rawChunks = config.runtime === 'lumo'
+        ? queryLumo(userContentForLLM, config, sessionCtx, onToolUse, sessionOpts)
+        : queryAgent(userContentForLLM, config, sessionCtx, onToolUse, sessionOpts);
 
       // Tee the generator: collect full text while streaming to Octo
       const collected: string[] = [];
@@ -784,6 +924,29 @@ export async function handleMessage(
         // all-[new]. Only advance the cursor for a real positive seq.
         if (typeof msg.message_seq === 'number' && msg.message_seq > 0) {
           store.setLastBotReplySeq(sessionKey, msg.message_seq);
+        }
+        // #32 delivery card: fire-and-forget — re-scan the sandbox, diff against
+        // the pre-turn snapshot, and post ONE delivery message (type-17 card,
+        // text fallback) when this turn produced files. Every error path only
+        // logs; the main chain is already complete at this point.
+        if (deliveryBefore && config.publicBaseUrl) {
+          const cwdBase = config.cwdBase ?? config.cwd;
+          const sessionHex = basename(resolveSessionCwd(cwdBase, sessionCtx));
+          void deliverArtifacts({
+            apiUrl: config.apiUrl,
+            botToken: config.botToken,
+            channelId,
+            channelType,
+            cwdBase,
+            sessionHex,
+            before: deliveryBefore,
+            publicBaseUrl: config.publicBaseUrl,
+            // botId is the register-time robot uid (gateway.botId — see startBot),
+            // which is what the workbench deep link addresses.
+            robotUid: botId,
+          }).catch((err) =>
+            console.error(`[codex-channel-octo] delivery-card send failed: ${String(err)}`),
+          );
         }
       } else {
         // Agent produced no output — send a feedback message so user isn't left hanging

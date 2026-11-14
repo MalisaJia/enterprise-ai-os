@@ -22,7 +22,7 @@ vi.mock('node:dns/promises', () => ({
   }),
 }));
 
-import { downloadInboundImage, INBOUND_MEDIA_DIR, MAX_IMAGE_BYTES } from '../media-inbound.js';
+import { downloadInboundImage, fetchInboundImageBytes, INBOUND_MEDIA_DIR, MAX_IMAGE_BYTES } from '../media-inbound.js';
 
 const API_URL = 'https://api.example.com';
 const BOT_TOKEN = 'bf_secret_xyz';
@@ -107,5 +107,52 @@ describe('downloadInboundImage', () => {
     const init = fetchSpy.mock.calls[0]?.[1] as RequestInit | undefined;
     const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
     expect(auth).toBe(`Bearer ${BOT_TOKEN}`);
+  });
+});
+
+describe('fetchInboundImageBytes', () => {
+  let fetchSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    fetchSpy = vi.spyOn(globalThis, 'fetch');
+  });
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  it('returns raw bytes + mime + ext without touching the filesystem', async () => {
+    fetchSpy.mockResolvedValue(streamResponse(new Uint8Array([1, 2, 3, 4]), 'image/png'));
+    const r = await fetchInboundImageBytes({ url: `${API_URL}/file/a.png`, botToken: BOT_TOKEN, apiUrl: API_URL });
+    expect('bytes' in r).toBe(true);
+    if ('bytes' in r) {
+      expect(r.bytes.equals(Buffer.from([1, 2, 3, 4]))).toBe(true);
+      expect(r.mime).toBe('image/png');
+      expect(r.ext).toBe('png');
+    }
+  });
+
+  it('rejects an oversize image while streaming (no full download)', async () => {
+    const big = new Uint8Array(MAX_IMAGE_BYTES + 1);
+    fetchSpy.mockResolvedValue(streamResponse(big, 'image/png'));
+    const r = await fetchInboundImageBytes({ url: `${API_URL}/big.png`, botToken: BOT_TOKEN, apiUrl: API_URL });
+    expect('error' in r && /上限/.test(r.error)).toBe(true);
+  });
+
+  it('rejects a non-image content type', async () => {
+    fetchSpy.mockResolvedValue(streamResponse(new Uint8Array([1]), 'application/octet-stream'));
+    const r = await fetchInboundImageBytes({ url: `${API_URL}/x`, botToken: BOT_TOKEN, apiUrl: API_URL });
+    expect('error' in r && /不支持的图片类型/.test(r.error)).toBe(true);
+  });
+
+  it('rejects an SSRF target before fetching', async () => {
+    const r = await fetchInboundImageBytes({ url: 'https://internal.local/x.png', botToken: BOT_TOKEN, apiUrl: API_URL });
+    expect('error' in r && /拒绝下载/.test(r.error)).toBe(true);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('reports an HTTP error', async () => {
+    fetchSpy.mockResolvedValue(streamResponse(new Uint8Array(), 'image/png', 500));
+    const r = await fetchInboundImageBytes({ url: `${API_URL}/x.png`, botToken: BOT_TOKEN, apiUrl: API_URL });
+    expect('error' in r && /HTTP 500/.test(r.error)).toBe(true);
   });
 });

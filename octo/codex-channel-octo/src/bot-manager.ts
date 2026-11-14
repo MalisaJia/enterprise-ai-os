@@ -25,6 +25,19 @@ export interface ManagedBot {
   router: SessionRouter;
   connect: () => Promise<void>;
   shutdown: () => Promise<void>;
+  /**
+   * #24 (workbench): Octo owner uid of this bot (registerBot's `owner_uid`).
+   * Filled by the assembly site (index.ts startBot); undefined only when the
+   * gateway never exposed one. The workbench auth layer compares the caller's
+   * uid against this — a bot with no ownerUid 403s everyone.
+   */
+  readonly ownerUid?: string;
+  /**
+   * #24 (workbench): per-session cwd sandbox base — `<baseDir>/<id>/workspace`.
+   * Filled by the assembly site; the workbench fs API serves session trees
+   * strictly from inside this directory.
+   */
+  readonly cwdBase: string;
 }
 
 /**
@@ -107,6 +120,24 @@ export class BotManager {
 
   has(key: string): boolean {
     return this.bots.has(key);
+  }
+
+  /**
+   * #24 (workbench): read-only lookup of one running bot by configId. The
+   * workbench API uses it for the auth ownership check; callers must treat the
+   * returned ManagedBot as opaque (never mutate — lifecycle is queue-owned).
+   */
+  get(key: string): ManagedBot | undefined {
+    return this.bots.get(key);
+  }
+
+  /**
+   * #24 (workbench): read-only snapshot of all running bots keyed by configId
+   * (for GET /workbench/api/bots). Snapshot = safe to iterate without holding
+   * any internal lock; the Map itself stays private.
+   */
+  snapshot(): Array<{ configId: string; bot: ManagedBot }> {
+    return [...this.bots.entries()].map(([configId, bot]) => ({ configId, bot }));
   }
 
   /** Run a mutation on the serial queue so add/remove never interleave. */

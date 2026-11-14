@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { join } from 'node:path';
 import { mkdtempSync, writeFileSync, rmSync, chmodSync, mkdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { loadConfig, resolveBotConfigs, loadSoul, expandHome } from '../config.js';
+import { loadConfig, resolveBotConfigs, loadSoul, expandHome, normalizeMediaAllowedHosts } from '../config.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -99,9 +99,9 @@ describe('loadConfig defaults', () => {
     // Per-bot dirs are derived under <baseDir>/<botId>/… (single bot → default).
     const [bot] = resolveBotConfigs(cfg);
     expect(bot.botId).toBe('default');
-    expect(bot.dataDir).toBe(`${tmpDir}/default/data`);
-    expect(bot.cwdBase).toBe(`${tmpDir}/default/workspace`);
-    expect(bot.memoryBase).toBe(`${tmpDir}/default/memory`);
+    expect(bot.dataDir).toBe(join(tmpDir, 'default', 'data'));
+    expect(bot.cwdBase).toBe(join(tmpDir, 'default', 'workspace'));
+    expect(bot.memoryBase).toBe(join(tmpDir, 'default', 'memory'));
   });
 });
 
@@ -240,7 +240,9 @@ describe('Config file permission warning (Q12)', () => {
     warnSpy.mockRestore();
   });
 
-  it('does NOT warn when config file is owner-only (0o600)', () => {
+    // Windows fs does not honor POSIX permission bits (stat always reports
+  // world-readable), so the owner-only negative case only makes sense off-Windows.
+  it.skipIf(process.platform === 'win32')('does NOT warn when config file is owner-only (0o600)', () => {
     const cfgPath = join(tmpDir, 'config.json');
     writeFileSync(cfgPath, JSON.stringify({ botToken: 'tok', apiUrl: 'https://api' }), { mode: 0o600 });
 
@@ -458,9 +460,9 @@ describe('derived per-bot directories', () => {
   it('single bot derives <baseDir>/default/{data,workspace,memory}', () => {
     const path = writeConfig({ botToken: 'bf_t', apiUrl: 'https://a' });
     const [bot] = resolveBotConfigs(loadConfig(path));
-    expect(bot.dataDir).toBe(`${tmpDir}/default/data`);
-    expect(bot.cwdBase).toBe(`${tmpDir}/default/workspace`);
-    expect(bot.memoryBase).toBe(`${tmpDir}/default/memory`);
+    expect(bot.dataDir).toBe(join(tmpDir, 'default', 'data'));
+    expect(bot.cwdBase).toBe(join(tmpDir, 'default', 'workspace'));
+    expect(bot.memoryBase).toBe(join(tmpDir, 'default', 'memory'));
     // cwd alias stays in sync with cwdBase.
     expect(bot.cwd).toBe(bot.cwdBase);
   });
@@ -473,9 +475,9 @@ describe('derived per-bot directories', () => {
       cwdBase: '/hacker/escape', dataDir: '/hacker/data', memoryBase: '/hacker/mem',
     });
     const [bot] = resolveBotConfigs(loadConfig(path));
-    expect(bot.cwdBase).toBe(`${tmpDir}/default/workspace`);
-    expect(bot.dataDir).toBe(`${tmpDir}/default/data`);
-    expect(bot.memoryBase).toBe(`${tmpDir}/default/memory`);
+    expect(bot.cwdBase).toBe(join(tmpDir, 'default', 'workspace'));
+    expect(bot.dataDir).toBe(join(tmpDir, 'default', 'data'));
+    expect(bot.memoryBase).toBe(join(tmpDir, 'default', 'memory'));
   });
 
   it('each bot gets its own subtree under baseDir', () => {
@@ -486,9 +488,9 @@ describe('derived per-bot directories', () => {
     writeBotConfig('support', { botToken: 'bf_s' });
     writeBotConfig('ops', { botToken: 'bf_o' });
     const bots = resolveBotConfigs(loadConfig(path));
-    expect(bots[0].dataDir).toBe(`${tmpDir}/support/data`);
-    expect(bots[0].memoryBase).toBe(`${tmpDir}/support/memory`);
-    expect(bots[1].cwdBase).toBe(`${tmpDir}/ops/workspace`);
+    expect(bots[0].dataDir).toBe(join(tmpDir, 'support', 'data'));
+    expect(bots[0].memoryBase).toBe(join(tmpDir, 'support', 'memory'));
+    expect(bots[1].cwdBase).toBe(join(tmpDir, 'ops', 'workspace'));
     // fully disjoint subtrees
     expect(bots[0].dataDir).not.toBe(bots[1].dataDir);
   });
@@ -705,15 +707,16 @@ describe('v1.1: memoryBase (auto-memory root, derived)', () => {
 
   it('derives to <baseDir>/<botId>/memory for a single bot', () => {
     const cfg = loadConfig(writeConfig({ botToken: 'bf_t', apiUrl: 'https://a' }));
-    expect(resolveBotConfigs(cfg)[0].memoryBase).toBe(`${tmpDir}/default/memory`);
+    expect(resolveBotConfigs(cfg)[0].memoryBase).toBe(join(tmpDir, 'default', 'memory'));
   });
 
   it('is a sibling of workspace/data (not nested), so the cwd TTL never sweeps it', () => {
     const [bot] = resolveBotConfigs(loadConfig(writeConfig({ botToken: 'bf_t', apiUrl: 'https://a' })));
-    expect(bot.memoryBase).toBe(`${tmpDir}/default/memory`);
-    expect(bot.cwdBase).toBe(`${tmpDir}/default/workspace`);
-    // memory is NOT under workspace
-    expect(bot.memoryBase!.startsWith(bot.cwdBase! + '/')).toBe(false);
+    expect(bot.memoryBase).toBe(join(tmpDir, 'default', 'memory'));
+    expect(bot.cwdBase).toBe(join(tmpDir, 'default', 'workspace'));
+    // memory is NOT under workspace (compare separator-normalized)
+    const norm = (p: string) => p.replace(/\\/g, '/');
+    expect(norm(bot.memoryBase!).startsWith(norm(bot.cwdBase!) + '/')).toBe(false);
   });
 
   it('per-bot: each bot gets its own <baseDir>/<id>/memory', () => {
@@ -722,8 +725,8 @@ describe('v1.1: memoryBase (auto-memory root, derived)', () => {
       bots: [{ id: 'a', botToken: 'bf_1' }, { id: 'b', botToken: 'bf_2' }],
     }));
     const bots = resolveBotConfigs(cfg);
-    expect(bots[0].memoryBase).toBe(`${tmpDir}/a/memory`);
-    expect(bots[1].memoryBase).toBe(`${tmpDir}/b/memory`);
+    expect(bots[0].memoryBase).toBe(join(tmpDir, 'a', 'memory'));
+    expect(bots[1].memoryBase).toBe(join(tmpDir, 'b', 'memory'));
     expect(bots[0].memoryBase).not.toBe(bots[1].memoryBase);
   });
 });
@@ -830,5 +833,130 @@ describe('expandHome', () => {
   });
   it('does not expand a ~ that is not at the start', () => {
     expect(expandHome('/a/~/b')).toBe('/a/~/b');
+  });
+});
+
+// ─── Lumo runtime validation ────────────────────────────────────────────────
+
+describe('resolveBotConfigs lumo runtime', () => {
+  beforeEach(setup);
+  afterEach(teardown);
+
+  it("throws (with the bot id) when runtime='lumo' but lumo.baseUrl is missing", () => {
+    const path = writeConfig({
+      apiUrl: 'https://api.test',
+      runtime: 'lumo',
+      bots: [{ id: 'l1', botToken: 'bf_l1' }],
+    });
+    expect(() => resolveBotConfigs(loadConfig(path))).toThrow(/Bot "l1"/);
+    expect(() => resolveBotConfigs(loadConfig(path))).toThrow(/lumo\.baseUrl/);
+  });
+
+  it("throws when lumo.baseUrl is non-loopback / otherwise unsafe", () => {
+    // http to a private, non-loopback host fails the same SSRF policy as apiUrl.
+    const path = writeConfig({
+      apiUrl: 'https://api.test',
+      runtime: 'lumo',
+      lumo: { baseUrl: 'http://192.168.1.50:8080' },
+      bots: [{ id: 'l2', botToken: 'bf_l2' }],
+    });
+    expect(() => resolveBotConfigs(loadConfig(path))).toThrow(/Bot "l2"/);
+    expect(() => resolveBotConfigs(loadConfig(path))).toThrow(/unsafe lumo\.baseUrl/);
+  });
+
+  it('accepts a loopback lumo.baseUrl', () => {
+    const path = writeConfig({
+      apiUrl: 'https://api.test',
+      runtime: 'lumo',
+      lumo: { baseUrl: 'http://127.0.0.1:8080' },
+      bots: [{ id: 'l3', botToken: 'bf_l3' }],
+    });
+    const [bot] = resolveBotConfigs(loadConfig(path));
+    expect(bot.runtime).toBe('lumo');
+    expect(bot.lumo?.baseUrl).toBe('http://127.0.0.1:8080');
+  });
+
+  it('leaves the default (codex) resolveBotConfigs output field-for-field unchanged', () => {
+    // No runtime / lumo set: the codex path must resolve exactly as before.
+    const path = writeConfig({ botToken: 'bf_test', apiUrl: 'https://api.test' });
+    const [bot] = resolveBotConfigs(loadConfig(path));
+    expect(bot.botId).toBe('default');
+    expect(bot.botToken).toBe('bf_test');
+    expect(bot.apiUrl).toBe('https://api.test');
+    expect(bot.baseDir).toBe(tmpDir);
+    expect(bot.dataDir).toBe(join(tmpDir, 'default', 'data'));
+    expect(bot.cwdBase).toBe(join(tmpDir, 'default', 'workspace'));
+    expect(bot.cwd).toBe(join(tmpDir, 'default', 'workspace'));
+    expect(bot.memoryBase).toBe(join(tmpDir, 'default', 'memory'));
+    // The new fields stay undefined unless the operator opts into lumo.
+    expect(bot.runtime).toBeUndefined();
+    expect(bot.lumo).toBeUndefined();
+  });
+});
+
+// ─── #86 follow-up: mediaAllowedHosts ───────────────────────────────────────
+
+describe('normalizeMediaAllowedHosts', () => {
+  it('returns undefined when unset or empty', () => {
+    expect(normalizeMediaAllowedHosts(undefined)).toBeUndefined();
+    expect(normalizeMediaAllowedHosts([])).toBeUndefined();
+    expect(normalizeMediaAllowedHosts(['', '   '])).toBeUndefined();
+  });
+
+  it('lowercases, trims and de-duplicates entries', () => {
+    expect(normalizeMediaAllowedHosts(['  MINIO.Example.com ', 'minio.example.com', 'a.example.com']))
+      .toEqual(['minio.example.com', 'a.example.com']);
+  });
+
+  it('keeps host:port entries intact', () => {
+    expect(normalizeMediaAllowedHosts(['127.0.0.1:9000'])).toEqual(['127.0.0.1:9000']);
+  });
+
+  it('rejects entries carrying a scheme, path, backslash, space or wildcard', () => {
+    for (const bad of [
+      'https://minio.example.com',
+      'minio.example.com/octo',
+      'minio.example.com\\..',
+      '*.example.com',
+      'minio .example.com',
+    ]) {
+      expect(() => normalizeMediaAllowedHosts([bad])).toThrow(/Invalid mediaAllowedHosts entry/);
+    }
+  });
+
+  it('rejects a non-array value', () => {
+    expect(() => normalizeMediaAllowedHosts('minio.example.com' as unknown as string[]))
+      .toThrow(/must be an array/);
+  });
+});
+
+describe('mediaAllowedHosts in loadConfig', () => {
+  // writeConfig() writes into the module-level `tmpDir`, which the file's own
+  // setup() only creates for describes nested inside it. This block lives at
+  // the end of the file, so it owns its own temp dir.
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'cc-octo-media-hosts-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('normalizes the configured list', () => {
+    const path = writeConfig({
+      botToken: 'bf_test',
+      apiUrl: 'https://api.test',
+      mediaAllowedHosts: ['  MINIO.Example.com ', '127.0.0.1:9000'],
+    });
+    expect(loadConfig(path).mediaAllowedHosts).toEqual(['minio.example.com', '127.0.0.1:9000']);
+  });
+
+  it('fails fast on a malformed entry', () => {
+    const path = writeConfig({
+      botToken: 'bf_test',
+      apiUrl: 'https://api.test',
+      mediaAllowedHosts: ['https://minio.example.com'],
+    });
+    expect(() => loadConfig(path)).toThrow(/Invalid mediaAllowedHosts entry/);
   });
 });

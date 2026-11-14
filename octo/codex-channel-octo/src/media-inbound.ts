@@ -10,10 +10,15 @@
  *  - the existing 7-day cwd janitor reclaims it — no separate cleanup needed.
  *
  * Reuses the same SSRF/redirect/size hardening as the file-download path.
+ *
+ * Lumo runtime (#86 extension): the same safety-hardened fetch core
+ * (`fetchInboundImageBytes`) also serves the lumo path, which forwards the
+ * bytes to Lumo's /api/uploads endpoint instead of writing them to disk —
+ * the security envelope (SSRF, per-hop auth scoping, MIME allowlist, size
+ * cap) must be identical whichever runtime consumes the image.
  */
 
-import { createWriteStream } from 'node:fs';
-import { mkdir, unlink } from 'node:fs/promises';
+import { mkdir, unlink, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertPublicUrl, fetchWithRedirectGuard } from './url-policy.js';
@@ -48,19 +53,28 @@ export type ImageDownloadResult =
   | { localPath: string; relPath: string }
   | { error: string };
 
+/** In-memory counterpart of ImageDownloadResult: raw bytes + metadata. */
+export type ImageBytesResult =
+  | { bytes: Buffer; mime: string; ext: string }
+  | { error: string };
+
 /**
- * Download one image URL into `<cwdDir>/.cc-octo-media/`. Returns the absolute
- * path and the path relative to the cwd (what we show the agent). On any
- * problem (SSRF reject, non-image type, oversize, HTTP error) returns
+ * Safety-hardened image fetch: SSRF check, per-hop credential scoping, MIME
+ * allowlist, streaming size cap. Returns the raw image bytes in memory.
+ *
+ * Shared by BOTH runtimes:
+ *  - codex: `downloadInboundImage` calls this, then writes to the session cwd.
+ *  - lumo:  the caller forwards the bytes to Lumo's /api/uploads endpoint.
+ *
+ * On any problem (SSRF reject, non-image type, oversize, HTTP error) returns
  * `{ error }` so the caller can fall back to the URL marker.
  */
-export async function downloadInboundImage(params: {
+export async function fetchInboundImageBytes(params: {
   url: string;
-  cwdDir: string;
   botToken: string;
   apiUrl: string;
-}): Promise<ImageDownloadResult> {
-  const { url, cwdDir, botToken, apiUrl } = params;
+}): Promise<ImageBytesResult> {
+  const { url, botToken, apiUrl } = params;
 
   // SSRF defense — reject private/loopback/link-local (and re-checked per hop
   // inside fetchWithRedirectGuard).
@@ -94,25 +108,9 @@ export async function downloadInboundImage(params: {
   const body = resp.body;
   if (!body) return { error: '响应无内容' };
 
-  const dir = join(cwdDir, INBOUND_MEDIA_DIR);
-  await mkdir(dir, { recursive: true });
-  const localPath = join(dir, `${randomUUID()}.${ext}`);
-
-  // Stream to disk with a hard size cap (abort + delete on overflow).
+  // Stream into memory with a hard size cap.
   const reader = (body as unknown as { getReader: () => ReadableStreamDefaultReader<Uint8Array> }).getReader();
-  const ws = createWriteStream(localPath);
-
-  /** Tear down the write stream and remove the (possibly partial) file. */
-  const cleanup = async (): Promise<void> => {
-    await new Promise<void>((resolve) => {
-      // destroy() then wait for 'close' so the fd is released before unlink,
-      // avoiding a race where unlink runs before the file is fully created.
-      ws.once('close', () => resolve());
-      ws.destroy();
-    });
-    await unlink(localPath).catch(() => {});
-  };
-
+  const chunks: Uint8Array[] = [];
   let total = 0;
   try {
     for (;;) {
@@ -121,24 +119,49 @@ export async function downloadInboundImage(params: {
       total += value.byteLength;
       if (total > MAX_IMAGE_BYTES) {
         try { reader.cancel(); } catch { /* ignore */ }
-        await cleanup();
         return { error: `图片超过大小上限 ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB` };
       }
-      if (!ws.write(value)) await new Promise<void>((r) => ws.once('drain', r));
+      chunks.push(value);
     }
-    ws.end();
-    await new Promise<void>((resolve, reject) => {
-      ws.on('finish', () => resolve());
-      ws.on('error', reject);
-    });
   } catch (err) {
-    await cleanup();
     return { error: `下载失败: ${String(err)}` };
   }
 
-  if (total === 0) {
-    await cleanup();
-    return { error: '图片为空' };
+  if (total === 0) return { error: '图片为空' };
+
+  return { bytes: Buffer.concat(chunks.map((c) => Buffer.from(c))), mime: rawType, ext };
+}
+
+/**
+ * Download one image URL into `<cwdDir>/.cc-octo-media/`. Returns the absolute
+ * path and the path relative to the cwd (what we show the agent). On any
+ * problem (SSRF reject, non-image type, oversize, HTTP error) returns
+ * `{ error }` so the caller can fall back to the URL marker.
+ *
+ * Codex-runtime path: the bytes are materialized on disk so the SDK agent can
+ * Read them. (The lumo runtime forwards bytes to Lumo's upload API instead —
+ * see fetchInboundImageBytes.)
+ */
+export async function downloadInboundImage(params: {
+  url: string;
+  cwdDir: string;
+  botToken: string;
+  apiUrl: string;
+}): Promise<ImageDownloadResult> {
+  const { url, cwdDir, botToken, apiUrl } = params;
+
+  const r = await fetchInboundImageBytes({ url, botToken, apiUrl });
+  if ('error' in r) return { error: r.error };
+
+  const dir = join(cwdDir, INBOUND_MEDIA_DIR);
+  await mkdir(dir, { recursive: true });
+  const localPath = join(dir, `${randomUUID()}.${r.ext}`);
+
+  try {
+    await writeFile(localPath, r.bytes);
+  } catch (err) {
+    await unlink(localPath).catch(() => {});
+    return { error: `下载失败: ${String(err)}` };
   }
 
   return { localPath, relPath: relative(cwdDir, localPath) };

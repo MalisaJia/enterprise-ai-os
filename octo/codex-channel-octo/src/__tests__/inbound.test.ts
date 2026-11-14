@@ -51,6 +51,64 @@ describe('buildMediaUrl', () => {
     expect(buildMediaUrl('https://cdn.example.com/im/chat/x.png', API_URL)).toBeUndefined();
   });
 
+  // #86 follow-up: Octo deployments without COS/STS (e.g. MinIO-backed) never
+  // populate the prefetched CDN host, so every inbound image URL was rejected.
+  // Operator-declared `mediaAllowedHosts` must widen the allow list the same
+  // way, WITHOUT loosening anything else.
+  it('allows absolute URLs on operator-declared mediaAllowedHosts', () => {
+    const EXTRA = ['minio.example.com', '127.0.0.1:9000'];
+    // Declared host — allowed (both bare host and host:port)
+    expect(buildMediaUrl('http://minio.example.com/octo/chat/x.png', API_URL, undefined, EXTRA))
+      .toBe('http://minio.example.com/octo/chat/x.png');
+    expect(buildMediaUrl('http://127.0.0.1:9000/octo/chat/y.png', API_URL, undefined, EXTRA))
+      .toBe('http://127.0.0.1:9000/octo/chat/y.png');
+    // Case-insensitive match (config entries are lowercased at load)
+    expect(buildMediaUrl('http://MINIO.example.com/octo/chat/z.png', API_URL, undefined, EXTRA))
+      .toBe('http://MINIO.example.com/octo/chat/z.png');
+    // apiUrl host still allowed alongside the declared hosts
+    expect(buildMediaUrl('https://api.example.com/file/y.jpg', API_URL, undefined, EXTRA))
+      .toBe('https://api.example.com/file/y.jpg');
+    // An UNdeclared host is still rejected — the allow list is additive, never
+    // a wildcard (that would re-open the botToken-leak vector).
+    expect(buildMediaUrl('https://attacker.com/a.jpg', API_URL, undefined, EXTRA)).toBeUndefined();
+    expect(buildMediaUrl('https://evil-minio.example.com/a.jpg', API_URL, undefined, EXTRA)).toBeUndefined();
+    // Empty list / undefined behaves like the back-compat default
+    expect(buildMediaUrl('http://minio.example.com/a.png', API_URL, undefined, [])).toBeUndefined();
+    expect(buildMediaUrl('http://minio.example.com/a.png', API_URL)).toBeUndefined();
+  });
+
+  it('threads mediaAllowedHosts through resolveContent (end-to-end allowlist)', () => {
+    const EXTRA = ['minio.example.com'];
+    const payload = { type: MessageType.Image, url: 'http://minio.example.com/octo/chat/x.png' } as unknown as MessagePayload;
+    // Without the declared host the image degrades to a bare placeholder.
+    expect(resolveContent(payload, API_URL).mediaUrl).toBeUndefined();
+    expect(resolveContent(payload, API_URL).text).toBe('[图片]');
+    // With it, the URL survives and becomes a forwardable mediaUrl.
+    const r = resolveContent(payload, API_URL, undefined, EXTRA);
+    expect(r.mediaUrl).toBe('http://minio.example.com/octo/chat/x.png');
+    expect(r.text).toContain('http://minio.example.com/octo/chat/x.png');
+  });
+
+  it('threads mediaAllowedHosts through RichText + forwarded messages', () => {
+    const EXTRA = ['minio.example.com'];
+    // RichText embedded images
+    const rt = resolveRichTextContent(
+      { content: [{ type: RICH_TEXT_BLOCK_IMAGE, url: 'http://minio.example.com/rt/x.png' }] },
+      API_URL,
+      undefined,
+      EXTRA,
+    );
+    expect(rt.mediaUrls).toEqual(['http://minio.example.com/rt/x.png']);
+    // Forwarded (合并转发) inner image
+    const fwd = resolveMultipleForwardText(
+      { users: [{ uid: 'u1', name: 'alice' }], msgs: [{ from_uid: 'u1', payload: { type: MessageType.Image, url: 'http://minio.example.com/f/x.png' } }] },
+      API_URL,
+      undefined,
+      EXTRA,
+    );
+    expect(fwd).toContain('http://minio.example.com/f/x.png');
+  });
+
   it('does not pass through a non-http(s) absolute URL as-is, even on the CDN host', () => {
     // ftp:// doesn't match the http(s) absolute branch, so it's never returned
     // verbatim; it's treated as a (sanitized) relative path under apiUrl/file.
