@@ -67,3 +67,31 @@ venv/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# ---------------------------------------------------------------------------
+# Local caches, staging copies and research snapshots (never committed)
+# ---------------------------------------------------------------------------
+.npm-cache/
+.pnpm-cache/
+.pnpm-state/
+.pnpm-install.log
+.deploy-staging/
+.research-lumo/
+.research-bridge/
+.research-baseline/
+.workbuddy/
+
+# Local dev-server runtime artifacts
+*.log
+*.pid
+start-web-dev.ps1
+
+# Archives
+*.tar
+
+# Test / report artifacts
+full-test-results.json
+
+# Screenshots captured at the repo root during manual verification.
+# Root-only on purpose: nested image assets stay tracked.
+/*.png
